@@ -14,7 +14,9 @@
     "dev": "concurrently -k -n server,web \"npm run server\" \"npm run web\"",
     "electron": "electron electron/main.js",
     "dev:all": "concurrently -k -n server,web,electron \"npm run server\" \"npm run web\" \"npm run electron\"",
-    "build": "vite build"
+    "build": "vite build",
+    "dist": "electron-builder --mac dmg",
+    "dist:dir": "electron-builder --mac dir"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",
@@ -26,6 +28,30 @@
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.0",
     "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
     "vite": "^5.4.11"
+  },
+  "build": {
+    "appId": "com.codex.clone",
+    "productName": "Codex",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": ["dmg"],
+      "identity": null
+    },
+    "dmg": {
+      "title": "Codex",
+      "contents": [
+        { "x": 130, "y": 220 },
+        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+      ]
+    }
   }
 }

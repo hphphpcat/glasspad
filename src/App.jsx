@@ -4,7 +4,6 @@ import Editor from '@monaco-editor/react';
 export default function App() {
   const params = new URLSearchParams(window.location.search);
 
-  // 优先 URL 参数，其次本地上次保存的房间号，默认 1024
   const [roomId, setRoomId] = useState(
     () => params.get('room') || localStorage.getItem('pad_room') || '1024'
   );
@@ -14,28 +13,81 @@ export default function App() {
     () => params.get('user') || localStorage.getItem('pad_user') || 'Cstech Cat'
   );
 
+  // 透明度状态（默认 0.78，配合毛玻璃质感最佳）
+  const [opacity, setOpacity] = useState(
+    () => Number(localStorage.getItem('pad_opacity')) || 0.78
+  );
+
+  // Frosted Glass（毛玻璃）支持状态与开关
+  const [supportsFrost, setSupportsFrost] = useState(true);
+  const [frostedGlass, setFrostedGlass] = useState(
+    () => localStorage.getItem('pad_frost') !== 'false'
+  );
+
   const [text, setText] = useState('');
   const [language, setLanguage] = useState('python');
   const [wsConnected, setWsConnected] = useState(false);
   const [participants, setParticipants] = useState([]);
   const [copied, setCopied] = useState(false);
-  const [autoScroll, setAutoScroll] = useState(true); // 提词自动滚屏到底部
-  const [opacity, setOpacity] = useState(0.95); // 窗口透明度（桌面版生效）
+  const [autoScroll, setAutoScroll] = useState(true);
 
   const wsRef = useRef(null);
   const editorRef = useRef(null);
   const isRemote = useRef(false);
 
-  // 每次切换房间或修改名字时，建立对应的 WebSocket 房间连接
+  // 1. 初始化检测系统是否支持原生毛玻璃（Win10 自动隐藏开关并关闭）
+  useEffect(() => {
+    if (window.electronAPI?.getFrostSupport) {
+      window.electronAPI.getFrostSupport().then((res) => {
+        if (!res.supportsFrostedGlass) {
+          setSupportsFrost(false);
+          setFrostedGlass(false);
+          window.electronAPI.setFrostedGlass(false);
+        } else {
+          setSupportsFrost(true);
+          window.electronAPI.setFrostedGlass(frostedGlass);
+        }
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 2. 切换毛玻璃开关并同步给 Electron 主进程与本地存储
+  const toggleFrostedGlass = (enabled) => {
+    setFrostedGlass(enabled);
+    localStorage.setItem('pad_frost', String(enabled));
+    window.electronAPI?.setFrostedGlass?.(enabled);
+  };
+
+  // 3. 保存透明度并支持 ⌘+[ 和 ⌘+] 快捷键微调
+  useEffect(() => {
+    localStorage.setItem('pad_opacity', String(opacity));
+  }, [opacity]);
+
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.metaKey || e.ctrlKey) {
+        if (e.key === '[') {
+          e.preventDefault();
+          setOpacity((prev) => Math.max(0.08, Number((prev - 0.08).toFixed(2))));
+        } else if (e.key === ']') {
+          e.preventDefault();
+          setOpacity((prev) => Math.min(1, Number((prev + 0.08).toFixed(2))));
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // 4. WebSocket 实时同步
   useEffect(() => {
     localStorage.setItem('pad_room', roomId);
     localStorage.setItem('pad_user', userName);
 
-    // 同步更新地址栏参数（方便浏览器端直接复制 URL）
     const newUrl = `${window.location.pathname}?room=${encodeURIComponent(roomId)}&user=${encodeURIComponent(userName)}`;
     window.history.replaceState({}, '', newUrl);
 
-    // dev：走 VITE_WS_URL（.env.development 指向 ws://localhost:8080）；生产：同源 wss://
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = import.meta.env.VITE_WS_URL || `${protocol}//${window.location.host}`;
 
@@ -58,7 +110,6 @@ export default function App() {
           setText(cleanText);
           if (payload.language) setLanguage(payload.language);
 
-          // 导师打字超过一屏时，候选人界面自动平滑滚动到最后一行
           if (autoScroll && editorRef.current) {
             setTimeout(() => {
               const lineCount = editorRef.current.getModel()?.getLineCount() || 1;
@@ -96,7 +147,6 @@ export default function App() {
     };
   }, [roomId, userName, autoScroll]);
 
-  // 处理本地打字同步
   const handleTextChange = (val) => {
     if (isRemote.current) {
       isRemote.current = false;
@@ -112,7 +162,6 @@ export default function App() {
     }
   };
 
-  // 切换房间号（按回车或失焦触发）
   const applyRoomSwitch = (e) => {
     e.preventDefault();
     const trimmed = roomInput.trim();
@@ -122,7 +171,6 @@ export default function App() {
     }
   };
 
-  // 一键清空当前题目的提词板（同步清空双方屏幕）
   const clearPad = () => {
     setText('');
     if (wsRef.current?.readyState === 1) {
@@ -133,28 +181,30 @@ export default function App() {
     }
   };
 
-  // 复制导师/客户直达链接
-  const copyInvite = async () => {
+  const copyInvite = () => {
     const link = `${window.location.origin}/?room=${encodeURIComponent(roomId)}&user=Helper`;
-    try {
-      await navigator.clipboard.writeText(link);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      window.prompt('Copy the invite link:', link);
-    }
+    navigator.clipboard.writeText(link);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', height: '100vh',
-      background: `rgba(13, 13, 13, ${opacity})`, color: '#e5e5e5', fontFamily: 'monospace',
-      border: '1px solid #262626', borderRadius: '8px', overflow: 'hidden',
+      // 动态透明度底色 + CSS 毛玻璃模糊双重加持
+      background: `rgba(13, 13, 13, ${opacity})`,
+      backdropFilter: supportsFrost && frostedGlass ? 'blur(14px)' : 'none',
+      WebkitBackdropFilter: supportsFrost && frostedGlass ? 'blur(14px)' : 'none',
+      color: '#e5e5e5', fontFamily: 'monospace',
+      border: `1px solid rgba(255, 255, 255, ${Math.min(opacity * 0.18, 0.15)})`,
+      borderRadius: '8px', overflow: 'hidden',
     }}>
-      {/* 顶部栏：Run 按钮 + 动态房间切换框 + 语言选择 */}
+      {/* 顶部栏 */}
       <div style={{
         display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-        padding: '8px 14px', background: '#141414', borderBottom: '1px solid #222',
+        padding: '8px 14px',
+        background: `rgba(20, 20, 20, ${Math.min(opacity + 0.08, 1)})`,
+        borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
         WebkitAppRegion: 'drag',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', WebkitAppRegion: 'no-drag' }}>
@@ -166,9 +216,8 @@ export default function App() {
             Run <span style={{ fontSize: '11px' }}>▷</span>
           </button>
 
-          {/* 房间号快速输入框（输入 4 位房间码按回车立即切换） */}
           <form onSubmit={applyRoomSwitch} style={{
-            display: 'flex', alignItems: 'center', background: '#1f1f1f',
+            display: 'flex', alignItems: 'center', background: 'rgba(31, 31, 31, 0.7)',
             border: '1px solid #333', borderRadius: '6px', padding: '2px 8px',
           }}>
             <span style={{ fontSize: '12px', color: '#777', marginRight: '6px' }}>Room:</span>
@@ -179,17 +228,15 @@ export default function App() {
               placeholder="Room ID"
               style={{
                 background: 'transparent', border: 'none', color: '#10b981',
-                fontWeight: 600, fontSize: '13px', width: '64px', outline: 'none', fontFamily: 'monospace',
+                fontWeight: 600, fontSize: '13px', width: '56px', outline: 'none', fontFamily: 'monospace',
               }}
             />
           </form>
 
-          {/* 一键清屏按钮（切下一道题时用） */}
           <button
             onClick={clearPad}
-            title="Clear pad for next question"
             style={{
-              background: '#1f1f1f', color: '#9ca3af', border: '1px solid #333',
+              background: 'rgba(31, 31, 31, 0.7)', color: '#9ca3af', border: '1px solid #333',
               borderRadius: '6px', padding: '4px 8px', fontSize: '12px', cursor: 'pointer',
             }}
           >
@@ -197,33 +244,46 @@ export default function App() {
           </button>
         </div>
 
-        {/* 右侧：自动滚屏开关 + 透明度 + 语言选择 */}
+        {/* 右侧控制区：透明度滑块 + Frosted Glass 开关 + Auto-Scroll + 语言选择 */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', WebkitAppRegion: 'no-drag' }}>
+          {/* 透明度滑块 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#9ca3af' }} title="Shortcut: Cmd/Ctrl + [ or ]">
+            <span>Opacity: {Math.round(opacity * 100)}%</span>
+            <input
+              type="range"
+              min="0.08"
+              max="1"
+              step="0.04"
+              value={opacity}
+              onChange={(e) => setOpacity(Number(e.target.value))}
+              style={{ width: '64px', cursor: 'pointer', accentColor: '#10b981' }}
+            />
+          </div>
+
+          {/* Frosted Glass 开关（仅支持的系统显示，Win10 自动隐藏） */}
+          {supportsFrost && (
+            <label style={{
+              display: 'flex', alignItems: 'center', gap: '4px',
+              fontSize: '12px', color: frostedGlass ? '#10b981' : '#888', cursor: 'pointer',
+            }}>
+              <input
+                type="checkbox"
+                checked={frostedGlass}
+                onChange={(e) => toggleFrostedGlass(e.target.checked)}
+                style={{ accentColor: '#10b981', cursor: 'pointer' }}
+              />
+              Frosted Glass
+            </label>
+          )}
+
           <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px', color: '#888', cursor: 'pointer' }}>
             <input
               type="checkbox"
               checked={autoScroll}
               onChange={(e) => setAutoScroll(e.target.checked)}
+              style={{ accentColor: '#10b981', cursor: 'pointer' }}
             />
             Auto-Scroll
-          </label>
-
-          {/* 透明度滑块（桌面版直接调 Electron 窗口透明度） */}
-          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#888' }}>
-            Opacity
-            <input
-              type="range"
-              min="0.15"
-              max="1"
-              step="0.05"
-              value={opacity}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                setOpacity(v);
-                window.electronAPI?.setOpacity?.(v);
-              }}
-              style={{ width: '80px', accentColor: '#10b981' }}
-            />
           </label>
 
           <select
@@ -247,29 +307,31 @@ export default function App() {
         </div>
       </div>
 
-      {/* 中间打字提词主区域 */}
+      {/* 中间打字提词主区域（背景完全透明，透出外层容器的 rgba 透明度） */}
       <div style={{ flex: 1, position: 'relative', paddingTop: '8px' }}>
         <Editor
           height="100%"
-          theme="vs-dark"
+          theme="codex-transparent"
           language={language}
           value={text}
           onChange={handleTextChange}
           beforeMount={(monaco) => {
-            monaco.editor.defineTheme('pure-dark', {
+            // 将编辑器和行号栏背景设为 #00000000 全透明
+            monaco.editor.defineTheme('codex-transparent', {
               base: 'vs-dark',
               inherit: true,
               rules: [],
               colors: {
-                'editor.background': '#0d0d0d',
-                'editorGutter.background': '#0d0d0d',
-                'editor.lineHighlightBackground': '#141414',
+                'editor.background': '#00000000',
+                'editorGutter.background': '#00000000',
+                'editor.lineHighlightBackground': '#00000000',
+                'scrollbarSlider.background': '#ffffff22',
               },
             });
           }}
           onMount={(editor, monaco) => {
             editorRef.current = editor;
-            monaco.editor.setTheme('pure-dark');
+            monaco.editor.setTheme('codex-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
           }}
           options={{
@@ -285,10 +347,12 @@ export default function App() {
         />
       </div>
 
-      {/* 底部栏：+ Invite + Wss 绿灯 + 在线协作者铭牌 + 点击改名 */}
+      {/* 底部栏 */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: '12px',
-        padding: '8px 16px', background: '#141414', borderTop: '1px solid #222', fontSize: '13px',
+        padding: '8px 16px',
+        background: `rgba(20, 20, 20, ${Math.min(opacity + 0.08, 1)})`,
+        borderTop: '1px solid rgba(255, 255, 255, 0.08)', fontSize: '13px',
       }}>
         <button
           onClick={copyInvite}
@@ -300,10 +364,9 @@ export default function App() {
           <span>+</span> {copied ? 'Copied!' : 'Invite'}
         </button>
 
-        {/* Wss 状态灯 */}
         <div style={{
           display: 'flex', alignItems: 'center', gap: '6px',
-          background: '#222', padding: '3px 10px', borderRadius: '14px', fontSize: '12px', color: '#aaa',
+          background: 'rgba(34, 34, 34, 0.7)', padding: '3px 10px', borderRadius: '14px', fontSize: '12px', color: '#aaa',
         }}>
           <span>Wss:</span>
           <span style={{
@@ -312,9 +375,8 @@ export default function App() {
           }} />
         </div>
 
-        <span style={{ color: '#333' }}>|</span>
+        <span style={{ color: '#444' }}>|</span>
 
-        {/* 在线队友标签列表 */}
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
           {participants.map((p, idx) => (
             <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -327,14 +389,13 @@ export default function App() {
           ))}
         </div>
 
-        {/* 右下角：修改自己的显示昵称 */}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '4px' }}>
           <input
             value={userName}
             onChange={(e) => setUserName(e.target.value)}
             title="Click to edit your display name"
             style={{
-              background: 'transparent', border: '1px solid transparent', color: '#666',
+              background: 'transparent', border: '1px solid transparent', color: '#888',
               fontSize: '12px', width: '90px', textAlign: 'right', outline: 'none',
             }}
           />

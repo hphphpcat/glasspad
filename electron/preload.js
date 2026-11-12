@@ -2,8 +2,6 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   isDesktop: true,
-  getCapabilities: () => ipcRenderer.invoke('GET_PLATFORM_CAPABILITIES'),
+  getFrostSupport: () => ipcRenderer.invoke('GET_FROST_SUPPORT'),
   setFrostedGlass: (enabled) => ipcRenderer.send('SET_FROSTED_GLASS', enabled),
-  setOpacity: (opacity) => ipcRenderer.send('SET_OPACITY', opacity),
-  openExternalLogin: (url) => ipcRenderer.send('OPEN_EXTERNAL_LOGIN', url),
 });
