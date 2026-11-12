@@ -30,7 +30,7 @@ function applyNativeFrostedGlass(win, enabled) {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 960,
+    width: 1160,
     height: 680,
     frame: false,
     transparent: true,            // 必须为 true：开启原生透明通道

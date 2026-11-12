@@ -202,6 +202,7 @@ export default function App() {
       {/* 顶部栏 */}
       <div style={{
         display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        flexWrap: 'wrap', gap: '8px',
         padding: '8px 14px',
         background: `rgba(20, 20, 20, ${Math.min(opacity + 0.08, 1)})`,
         borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
