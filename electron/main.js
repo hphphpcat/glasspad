@@ -46,8 +46,8 @@ function createWindow() {
   mainWindow.setAlwaysOnTop(true, 'screen-saver');
   mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
-  // 加载前端地址（生产环境连你的 Railway 公网域名，不带固定房间号；房间由用户在窗口内输入）
-  const startUrl = process.env.ELECTRON_START_URL || 'http://localhost:5173/';
+  // 加载前端地址：默认连线上 Railway 公网地址（可用 ELECTRON_START_URL 覆盖）
+  const startUrl = process.env.ELECTRON_START_URL || 'https://codex-clone-production.up.railway.app/';
   let retries = 0;
   mainWindow.webContents.on('did-fail-load', (_e, code, desc) => {
     // Vite 尚未就绪时（-102 连接拒绝）自动重试，避免并行启动时白屏
@@ -74,6 +74,13 @@ ipcMain.on('SET_FROSTED_GLASS', (_e, enabled) => {
   } else if (process.platform === 'win32') {
     mainWindow.setBackgroundMaterial(enabled ? 'acrylic' : 'none');
   }
+});
+
+// 调整窗口透明度（0.15 ~ 1.0，前端滑块直接调用）
+ipcMain.on('SET_OPACITY', (_e, opacity) => {
+  if (!mainWindow) return;
+  const clamped = Math.min(1, Math.max(0.15, Number(opacity) || 1));
+  mainWindow.setOpacity(clamped);
 });
 
 // 一键调用系统浏览器登录，并通过 Deep Link (codex://) 回传 Token

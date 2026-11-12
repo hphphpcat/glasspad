@@ -20,6 +20,7 @@ export default function App() {
   const [participants, setParticipants] = useState([]);
   const [copied, setCopied] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true); // 提词自动滚屏到底部
+  const [opacity, setOpacity] = useState(0.95); // 窗口透明度（桌面版生效）
 
   const wsRef = useRef(null);
   const editorRef = useRef(null);
@@ -147,7 +148,7 @@ export default function App() {
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', height: '100vh',
-      background: '#0d0d0d', color: '#e5e5e5', fontFamily: 'monospace',
+      background: `rgba(13, 13, 13, ${opacity})`, color: '#e5e5e5', fontFamily: 'monospace',
       border: '1px solid #262626', borderRadius: '8px', overflow: 'hidden',
     }}>
       {/* 顶部栏：Run 按钮 + 动态房间切换框 + 语言选择 */}
@@ -196,7 +197,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* 右侧：自动滚屏开关 + 语言选择 */}
+        {/* 右侧：自动滚屏开关 + 透明度 + 语言选择 */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', WebkitAppRegion: 'no-drag' }}>
           <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px', color: '#888', cursor: 'pointer' }}>
             <input
@@ -205,6 +206,24 @@ export default function App() {
               onChange={(e) => setAutoScroll(e.target.checked)}
             />
             Auto-Scroll
+          </label>
+
+          {/* 透明度滑块（桌面版直接调 Electron 窗口透明度） */}
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#888' }}>
+            Opacity
+            <input
+              type="range"
+              min="0.15"
+              max="1"
+              step="0.05"
+              value={opacity}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setOpacity(v);
+                window.electronAPI?.setOpacity?.(v);
+              }}
+              style={{ width: '80px', accentColor: '#10b981' }}
+            />
           </label>
 
           <select
