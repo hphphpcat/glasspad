@@ -16,7 +16,8 @@
     "dev:all": "concurrently -k -n server,web,electron \"npm run server\" \"npm run web\" \"npm run electron\"",
     "build": "vite build",
     "dist": "electron-builder --mac dmg",
-    "dist:dir": "electron-builder --mac dir"
+    "dist:dir": "electron-builder --mac dir",
+    "dist:win": "electron-builder --win portable --x64"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",
@@ -45,6 +46,15 @@
       "category": "public.app-category.developer-tools",
       "target": ["dmg"],
       "identity": null
+    },
+    "win": {
+      "target": ["portable"],
+      "icon": null,
+      "signAndEditExecutable": false,
+      "sign": null
+    },
+    "portable": {
+      "artifactName": "Codex-${version}-portable.exe"
     },
     "dmg": {
       "title": "Codex",
