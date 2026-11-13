@@ -84,6 +84,15 @@ const httpServer = http.createServer(async (req, res) => {
   if (!abs.startsWith(DIST_DIR)) { res.writeHead(403); res.end('Forbidden'); return; }
 
   fs.readFile(abs, (err, data) => {
+    // 文件不存在且无扩展名（如 /admin）→ 回退到 index.html，交给前端路由
+    if (err && !path.extname(filePath)) {
+      fs.readFile(path.join(DIST_DIR, 'index.html'), (err2, html) => {
+        if (err2) { res.writeHead(404); res.end('Not Found'); return; }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      });
+      return;
+    }
     if (err) { res.writeHead(404); res.end('Not Found'); return; }
     const ext = path.extname(abs).toLowerCase();
     res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
