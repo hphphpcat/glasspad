@@ -245,12 +245,24 @@ export default function App() {
         borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
         WebkitAppRegion: clickThrough ? 'no-drag' : 'drag',
       }}>
+        {/* 独立拖拽手柄（无边框窗口靠这里拖动） */}
+        {/* 纯拖拽把手，不设 no-drag，鼠标按住即可拖动窗口 */}
+        <div style={{
+          WebkitAppRegion: clickThrough ? 'no-drag' : 'drag',
+          padding: '4px 10px', margin: '-4px 0', userSelect: 'none',
+          color: '#666', fontSize: '16px', lineHeight: 1, letterSpacing: '2px',
+          borderRight: '1px solid rgba(255,255,255,0.06)',
+          cursor: clickThrough ? 'default' : 'grab',
+        }} title="拖动窗口">
+          ⠿
+        </div>
+
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', WebkitAppRegion: 'no-drag' }}>
-          <button style={{
-            background: '#e5e5e5', color: '#111', border: 'none', borderRadius: '6px',
-            padding: '5px 12px', fontSize: '13px', fontWeight: 600, cursor: 'pointer',
-            display: 'flex', alignItems: 'center', gap: '6px',
-          }}>
+        <button style={{
+          background: '#e5e5e5', color: '#111', border: 'none', borderRadius: '6px',
+          padding: '5px 12px', fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: '6px',
+        }}>
             Run <span style={{ fontSize: '11px' }}>▷</span>
           </button>
 
@@ -300,6 +312,13 @@ export default function App() {
             </button>
           )}
         </div>
+
+        {/* 中间弹性拖拽区：整条顶部栏空白处都能拖动窗口 */}
+        <div style={{
+          flex: 1, minWidth: '40px', alignSelf: 'stretch',
+          WebkitAppRegion: clickThrough ? 'no-drag' : 'drag',
+          cursor: clickThrough ? 'default' : 'grab',
+        }} />
 
         {/* 右侧控制区：透明度滑块 + Frosted Glass 开关 + Auto-Scroll + 语言选择 */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', WebkitAppRegion: 'no-drag' }}>
