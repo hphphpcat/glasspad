@@ -24,6 +24,42 @@ const MIME = {
 const rooms = new Map();
 const COLORS = ['#00bcd4', '#3b82f6', '#10b981', '#f59e0b', '#ec4899'];
 
+// 持久化：房间数据写磁盘，Railway 重启/多副本也不丢 token
+const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
+const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
+
+function persistRooms() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const data = {};
+    rooms.forEach((room, roomId) => {
+      data[roomId] = { token: room.token, text: room.text, language: room.language, lastActive: room.lastActive };
+    });
+    fs.writeFileSync(ROOMS_FILE, JSON.stringify(data));
+  } catch (e) {
+    console.error('房间持久化失败：', e.message);
+  }
+}
+
+function loadRooms() {
+  try {
+    if (!fs.existsSync(ROOMS_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(ROOMS_FILE, 'utf8'));
+    Object.entries(data).forEach(([roomId, r]) => {
+      rooms.set(roomId, {
+        token: r.token,
+        text: r.text || '',
+        language: r.language || 'python',
+        clients: new Map(),
+        lastActive: r.lastActive || Date.now(),
+      });
+    });
+    console.log(`已从磁盘恢复 ${rooms.size} 个房间`);
+  } catch (e) {
+    console.error('房间加载失败：', e.message);
+  }
+}
+
 function randomToken() {
   return crypto.randomBytes(6).toString('hex'); // 12 位十六进制，足够难猜
 }
@@ -71,6 +107,7 @@ const httpServer = http.createServer(async (req, res) => {
       const roomId = crypto.randomBytes(3).toString('hex'); // 6 位十六进制房间号
       const token = randomToken();
       getOrCreateRoom(roomId, token);
+      persistRooms();
       return sendJSON(res, 200, { roomId, token });
     } catch (e) {
       return sendJSON(res, 400, { error: '请求解析失败：' + e.message });
@@ -142,6 +179,8 @@ wss.on('connection', (ws, req) => {
 
     if (msg.type === 'TEXT_SYNC') {
       room.text = msg.payload.text;
+      room.lastActive = Date.now();
+      persistRooms();
       room.clients.forEach((_, c) => {
         if (c !== ws && c.readyState === 1) {
           c.send(JSON.stringify({ type: 'TEXT_SYNC', payload: msg.payload }));
@@ -149,6 +188,8 @@ wss.on('connection', (ws, req) => {
       });
     } else if (msg.type === 'LANG_SYNC') {
       room.language = msg.payload.language;
+      room.lastActive = Date.now();
+      persistRooms();
       room.clients.forEach((_, c) => {
         if (c !== ws && c.readyState === 1) {
           c.send(JSON.stringify({ type: 'LANG_SYNC', payload: msg.payload }));
@@ -173,6 +214,7 @@ setInterval(() => {
       rooms.delete(roomId);
     }
   });
+  persistRooms();
 }, 10 * 60 * 1000);
 
 // WS 升级：接受任意路径
@@ -183,9 +225,11 @@ httpServer.on('upgrade', (req, socket, head) => {
 });
 
 httpServer.listen(PORT, () => {
+  loadRooms(); // 启动时从磁盘恢复房间
   console.log(`Codex 服务已启动：http://localhost:${PORT}`);
   console.log(`  管理员建房: POST /api/rooms  { key }`);
   console.log(`  WS 打字同步: ws://localhost:${PORT}/ws?room=<id>&token=<t>&user=<name>`);
   console.log(`  静态页: ${DIST_DIR}`);
+  console.log(`  数据目录: ${DATA_DIR}`);
   console.log(`  ADMIN_KEY 已${ADMIN_KEY === 'dev-admin-key' ? '使用开发默认值（生产务必在环境变量设置）' : '从环境变量读取'}`);
 });
