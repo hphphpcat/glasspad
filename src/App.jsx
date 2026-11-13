@@ -10,7 +10,7 @@ export default function App() {
   const [roomInput, setRoomInput] = useState(roomId);
 
   // 邀请 token（管理员建房后随链接下发；缺失则无法进入房间）
-  const [token] = useState(() => params.get('token') || '');
+  const [token, setToken] = useState(() => params.get('token') || '');
 
   const [userName, setUserName] = useState(
     () => params.get('user') || localStorage.getItem('pad_user') || 'Cstech Cat'
@@ -197,18 +197,14 @@ export default function App() {
     }
   };
 
-  // 无 token：显示空状态（客户必须通过邀请链接进入）
+  // 无 token：显示「粘贴邀请链接」入口（客户把导师发的链接粘进来即可加入）
   if (!token) {
-    return (
-      <div style={{
-        height: '100vh', display: 'flex', flexDirection: 'column',
-        alignItems: 'center', justifyContent: 'center', gap: '12px',
-        background: '#0d0d0d', color: '#e5e5e5', fontFamily: 'monospace',
-      }}>
-        <div style={{ fontSize: '18px' }}>需要邀请链接</div>
-        <div style={{ color: '#888', fontSize: '13px' }}>请使用导师发给你的链接打开本应用</div>
-      </div>
-    );
+    return <JoinGate onJoin={(room, tok, user) => {
+      setRoomId(room);
+      setRoomInput(room);
+      setToken(tok);
+      if (user) setUserName(user);
+    }} />;
   }
 
   return (
@@ -419,6 +415,119 @@ export default function App() {
           />
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── 加入入口：客户粘贴导师发的邀请链接 ──
+function JoinGate({ onJoin }) {
+  const [input, setInput] = useState('');
+  const [error, setError] = useState('');
+  const [hasClipboard, setHasClipboard] = useState(false);
+
+  // 检测剪贴板是否可用（Electron 里优先用 preload 暴露的接口）
+  useEffect(() => {
+    const electronClipboard = !!window.electronAPI?.readClipboardText;
+    const browserClipboard = typeof navigator.clipboard?.readText === 'function';
+    setHasClipboard(electronClipboard || browserClipboard);
+  }, []);
+
+  // 解析邀请链接：从中提取 room / token / user
+  const parseLink = (raw) => {
+    const s = (raw || '').trim();
+    if (!s) return null;
+    try {
+      const u = new URL(s);
+      const room = u.searchParams.get('room');
+      const token = u.searchParams.get('token');
+      const user = u.searchParams.get('user');
+      if (room && token) return { room, token, user };
+    } catch {
+      // 不是完整 URL，尝试按 room+token 纯文本解析
+      const m = s.match(/room=([^&\s]+).*token=([^&\s]+)/);
+      if (m) return { room: m[1], token: m[2], user: null };
+    }
+    return null;
+  };
+
+  const join = () => {
+    const parsed = parseLink(input);
+    if (!parsed) {
+      setError('链接无效，请粘贴完整的邀请链接');
+      return;
+    }
+    onJoin(parsed.room, parsed.token, parsed.user || 'Client');
+  };
+
+  const pasteFromClipboard = async () => {
+    try {
+      // 桌面端优先走 Electron 剪贴板接口
+      let text = '';
+      if (window.electronAPI?.readClipboardText) {
+        text = window.electronAPI.readClipboardText();
+      } else {
+        text = await navigator.clipboard.readText();
+      }
+      setInput(text);
+      const parsed = parseLink(text);
+      if (parsed) {
+        onJoin(parsed.room, parsed.token, parsed.user || 'Client');
+      } else {
+        setError('剪贴板里没有有效的邀请链接');
+      }
+    } catch {
+      setError('无法读取剪贴板，请手动粘贴');
+    }
+  };
+
+  return (
+    <div style={{
+      height: '100vh', display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center', gap: '14px',
+      background: '#0d0d0d', color: '#e5e5e5', fontFamily: 'monospace',
+      padding: '20px',
+    }}>
+      <div style={{ fontSize: '18px', fontWeight: 600 }}>加入面试房间</div>
+      <div style={{ color: '#888', fontSize: '13px', textAlign: 'center', lineHeight: 1.6 }}>
+        请粘贴导师发给你的邀请链接
+      </div>
+
+      <input
+        value={input}
+        onChange={(e) => { setInput(e.target.value); setError(''); }}
+        onKeyDown={(e) => { if (e.key === 'Enter') join(); }}
+        placeholder="https://.../?room=xxxx&token=xxxx"
+        style={{
+          width: '100%', maxWidth: 420, background: '#1f1f1f', border: '1px solid #333',
+          borderRadius: '8px', color: '#e5e5e5', padding: '12px 14px', fontSize: '13px',
+          outline: 'none', fontFamily: 'monospace',
+        }}
+      />
+
+      <div style={{ display: 'flex', gap: '10px' }}>
+        <button
+          onClick={join}
+          style={{
+            background: '#10b981', color: '#04281f', border: 'none', borderRadius: '6px',
+            padding: '10px 20px', fontSize: '14px', fontWeight: 600, cursor: 'pointer',
+          }}
+        >
+          加入
+        </button>
+        {hasClipboard && (
+          <button
+            onClick={pasteFromClipboard}
+            style={{
+              background: '#1f1f1f', color: '#d4d4d4', border: '1px solid #333', borderRadius: '6px',
+              padding: '10px 16px', fontSize: '13px', cursor: 'pointer',
+            }}
+          >
+            从剪贴板粘贴
+          </button>
+        )}
+      </div>
+
+      {error && <div style={{ color: '#ef4444', fontSize: '13px' }}>{error}</div>}
     </div>
   );
 }
