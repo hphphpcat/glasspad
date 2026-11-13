@@ -54,6 +54,7 @@ function createWindow() {
     alwaysOnTop: true,
     skipTaskbar: true,
     hiddenInMissionControl: true,
+    focusable: false,             // 永不抢焦点：点击/拖拽窗口都不会让底层应用失焦（防切屏检测）
     type: process.platform === 'darwin' ? 'panel' : 'toolbar',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),

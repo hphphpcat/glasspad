@@ -554,6 +554,9 @@ function JoinGate({ onJoin }) {
       <div style={{ color: '#888', fontSize: '13px', textAlign: 'center', lineHeight: 1.6 }}>
         请粘贴导师发给你的邀请链接
       </div>
+      <div style={{ color: '#666', fontSize: '12px', textAlign: 'center' }}>
+        推荐：先复制链接，再点下方「从剪贴板粘贴」一键加入
+      </div>
 
       <input
         value={input}
