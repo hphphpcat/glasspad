@@ -4,6 +4,9 @@ import Editor from '@monaco-editor/react';
 export default function App() {
   const params = new URLSearchParams(window.location.search);
 
+  // 判断是否桌面应用端（客户 App 强制只读；导师用网页版可编辑）
+  const isClientApp = Boolean(window.electronAPI?.isDesktop);
+
   const [roomId, setRoomId] = useState(
     () => params.get('room') || localStorage.getItem('pad_room') || '1024'
   );
@@ -34,6 +37,8 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [authFail, setAuthFail] = useState(false);
+  // 鼠标穿透状态（仅桌面 App 端生效）
+  const [clickThrough, setClickThrough] = useState(false);
 
   const wsRef = useRef(null);
   const editorRef = useRef(null);
@@ -53,6 +58,10 @@ export default function App() {
         }
       });
     }
+    // 监听主进程 ⌘+M 快捷键触发的穿透状态变化
+    if (window.electronAPI?.onClickThroughChanged) {
+      window.electronAPI.onClickThroughChanged((val) => setClickThrough(val));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -61,6 +70,12 @@ export default function App() {
     setFrostedGlass(enabled);
     localStorage.setItem('pad_frost', String(enabled));
     window.electronAPI?.setFrostedGlass?.(enabled);
+  };
+
+  // 切换鼠标穿透模式
+  const toggleClickThrough = (enabled) => {
+    setClickThrough(enabled);
+    window.electronAPI?.setClickThrough?.(enabled);
   };
 
   // 3. 保存透明度并支持 ⌘+[ 和 ⌘+] 快捷键微调
@@ -164,6 +179,8 @@ export default function App() {
   }, [roomId, userName, autoScroll, token]);
 
   const handleTextChange = (val) => {
+    // 客户端 App 只读，直接拦截任何文本发送逻辑
+    if (isClientApp) return;
     if (isRemote.current) {
       isRemote.current = false;
       return;
@@ -188,6 +205,7 @@ export default function App() {
   };
 
   const clearPad = () => {
+    if (isClientApp) return; // 客户端不可清屏
     setText('');
     if (wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({
@@ -215,7 +233,7 @@ export default function App() {
       backdropFilter: supportsFrost && frostedGlass ? 'blur(14px)' : 'none',
       WebkitBackdropFilter: supportsFrost && frostedGlass ? 'blur(14px)' : 'none',
       color: '#e5e5e5', fontFamily: 'monospace',
-      border: `1px solid rgba(255, 255, 255, ${Math.min(opacity * 0.18, 0.15)})`,
+      border: `1px solid ${clickThrough ? 'rgba(16, 185, 129, 0.4)' : `rgba(255, 255, 255, ${Math.min(opacity * 0.18, 0.15)})`}`,
       borderRadius: '8px', overflow: 'hidden',
     }}>
       {/* 顶部栏 */}
@@ -225,7 +243,7 @@ export default function App() {
         padding: '8px 14px',
         background: `rgba(20, 20, 20, ${Math.min(opacity + 0.08, 1)})`,
         borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
-        WebkitAppRegion: 'drag',
+        WebkitAppRegion: clickThrough ? 'no-drag' : 'drag',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', WebkitAppRegion: 'no-drag' }}>
           <button style={{
@@ -253,15 +271,34 @@ export default function App() {
             />
           </form>
 
-          <button
-            onClick={clearPad}
-            style={{
-              background: 'rgba(31, 31, 31, 0.7)', color: '#9ca3af', border: '1px solid #333',
-              borderRadius: '6px', padding: '4px 8px', fontSize: '12px', cursor: 'pointer',
-            }}
-          >
-            Clear
-          </button>
+          {/* 仅网页端导师显示 Clear 清屏按钮，防止客户误触 */}
+          {!isClientApp && (
+            <button
+              onClick={clearPad}
+              style={{
+                background: 'rgba(31, 31, 31, 0.7)', color: '#9ca3af', border: '1px solid #333',
+                borderRadius: '6px', padding: '4px 8px', fontSize: '12px', cursor: 'pointer',
+              }}
+            >
+              Clear
+            </button>
+          )}
+
+          {/* 客户端显示穿透模式开关（快捷键 ⌘/Ctrl + M） */}
+          {isClientApp && (
+            <button
+              onClick={() => toggleClickThrough(!clickThrough)}
+              title="Press Cmd/Ctrl + M to toggle Click-Through at any time"
+              style={{
+                background: clickThrough ? 'rgba(16, 185, 129, 0.2)' : 'rgba(31, 31, 31, 0.7)',
+                color: clickThrough ? '#10b981' : '#9ca3af',
+                border: `1px solid ${clickThrough ? '#10b981' : '#333'}`,
+                borderRadius: '6px', padding: '4px 10px', fontSize: '12px', cursor: 'pointer',
+              }}
+            >
+              {clickThrough ? '⚡ Click-Through ON (⌘+M to unlock)' : '🔒 Read-Only | Enable Click-Through (⌘+M)'}
+            </button>
+          )}
         </div>
 
         {/* 右侧控制区：透明度滑块 + Frosted Glass 开关 + Auto-Scroll + 语言选择 */}
@@ -308,6 +345,7 @@ export default function App() {
 
           <select
             value={language}
+            disabled={isClientApp}
             onChange={(e) => {
               const lang = e.target.value;
               setLanguage(lang);
@@ -315,7 +353,7 @@ export default function App() {
             }}
             style={{
               background: 'transparent', color: '#9ca3af', border: 'none',
-              fontSize: '13px', outline: 'none', cursor: 'pointer',
+              fontSize: '13px', outline: 'none', cursor: isClientApp ? 'default' : 'pointer',
             }}
           >
             <option value="python" style={{ background: '#141414' }}>Python (3.8.1)</option>
@@ -327,8 +365,11 @@ export default function App() {
         </div>
       </div>
 
-      {/* 中间打字提词主区域（背景完全透明，透出外层容器的 rgba 透明度） */}
-      <div style={{ flex: 1, position: 'relative', paddingTop: '8px' }}>
+      {/* 中间打字提词主区域（客户端只读；穿透时忽略所有鼠标事件） */}
+      <div style={{
+        flex: 1, position: 'relative', paddingTop: '8px',
+        pointerEvents: clickThrough ? 'none' : 'auto',
+      }}>
         <Editor
           height="100%"
           theme="codex-transparent"
@@ -355,6 +396,8 @@ export default function App() {
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
           }}
           options={{
+            readOnly: isClientApp,            // 客户端强制只读
+            domReadOnly: isClientApp,         // 彻底禁止客户端聚焦光标/输入法
             fontSize: 15,
             lineHeight: 24,
             wordWrap: 'on',
@@ -406,6 +449,7 @@ export default function App() {
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '4px' }}>
           <input
             value={userName}
+            disabled={isClientApp && clickThrough}
             onChange={(e) => setUserName(e.target.value)}
             title="Click to edit your display name"
             style={{
