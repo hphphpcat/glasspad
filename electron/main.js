@@ -54,7 +54,7 @@ function createWindow() {
     alwaysOnTop: true,
     skipTaskbar: true,
     hiddenInMissionControl: true,
-    focusable: false,             // 永不抢焦点：点击/拖拽窗口都不会让底层应用失焦（防切屏检测）
+    show: false,                  // 先不显示，等页面加载完用 showInactive 避免激活应用
     type: process.platform === 'darwin' ? 'panel' : 'toolbar',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -70,6 +70,11 @@ function createWindow() {
 
   // 默认启动时若系统支持则开启毛玻璃
   applyNativeFrostedGlass(mainWindow, true);
+
+  // 页面加载完成后用 showInactive 显示，避免激活应用（防切屏检测）
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.showInactive();
+  });
 
   // 加载前端地址：默认连线上 Railway 公网地址（可用 ELECTRON_START_URL 覆盖）
   const startUrl = process.env.ELECTRON_START_URL || 'https://codex-clone-production.up.railway.app/';

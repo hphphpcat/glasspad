@@ -243,18 +243,16 @@ export default function App() {
         padding: '8px 14px',
         background: `rgba(20, 20, 20, ${Math.min(opacity + 0.08, 1)})`,
         borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
-        WebkitAppRegion: clickThrough ? 'no-drag' : 'drag',
       }}>
-        {/* 独立拖拽手柄（无边框窗口靠这里拖动） */}
-        {/* 纯拖拽把手，不设 no-drag，鼠标按住即可拖动窗口 */}
+        {/* 移动窗口提示：不设拖拽（拖拽会激活应用触发切屏检测），改用 ⌘+方向键移动 */}
         <div style={{
-          WebkitAppRegion: clickThrough ? 'no-drag' : 'drag',
           padding: '4px 10px', margin: '-4px 0', userSelect: 'none',
-          color: '#666', fontSize: '16px', lineHeight: 1, letterSpacing: '2px',
+          color: '#666', fontSize: '14px', lineHeight: 1.2,
           borderRight: '1px solid rgba(255,255,255,0.06)',
-          cursor: clickThrough ? 'default' : 'grab',
-        }} title="拖动窗口">
-          ⠿
+          display: 'flex', alignItems: 'center', gap: '6px',
+        }} title="移动窗口：⌘ + 方向键">
+          <span style={{ fontSize: '16px' }}>⠿</span>
+          <span style={{ fontSize: '11px', color: '#888' }}>⌘+方向键移动</span>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', WebkitAppRegion: 'no-drag' }}>
@@ -312,13 +310,6 @@ export default function App() {
             </button>
           )}
         </div>
-
-        {/* 中间弹性拖拽区：整条顶部栏空白处都能拖动窗口 */}
-        <div style={{
-          flex: 1, minWidth: '40px', alignSelf: 'stretch',
-          WebkitAppRegion: clickThrough ? 'no-drag' : 'drag',
-          cursor: clickThrough ? 'default' : 'grab',
-        }} />
 
         {/* 右侧控制区：透明度滑块 + Frosted Glass 开关 + Auto-Scroll + 语言选择 */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', WebkitAppRegion: 'no-drag' }}>
