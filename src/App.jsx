@@ -9,6 +9,9 @@ export default function App() {
   );
   const [roomInput, setRoomInput] = useState(roomId);
 
+  // 邀请 token（管理员建房后随链接下发；缺失则无法进入房间）
+  const [token] = useState(() => params.get('token') || '');
+
   const [userName, setUserName] = useState(
     () => params.get('user') || localStorage.getItem('pad_user') || 'Cstech Cat'
   );
@@ -30,6 +33,7 @@ export default function App() {
   const [participants, setParticipants] = useState([]);
   const [copied, setCopied] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [authFail, setAuthFail] = useState(false);
 
   const wsRef = useRef(null);
   const editorRef = useRef(null);
@@ -82,10 +86,17 @@ export default function App() {
 
   // 4. WebSocket 实时同步
   useEffect(() => {
+    // 无 token 不发起连接（客户必须通过邀请链接进入）
+    if (!token) {
+      setAuthFail(true);
+      return;
+    }
+    setAuthFail(false);
+
     localStorage.setItem('pad_room', roomId);
     localStorage.setItem('pad_user', userName);
 
-    const newUrl = `${window.location.pathname}?room=${encodeURIComponent(roomId)}&user=${encodeURIComponent(userName)}`;
+    const newUrl = `${window.location.pathname}?room=${encodeURIComponent(roomId)}&token=${encodeURIComponent(token)}&user=${encodeURIComponent(userName)}`;
     window.history.replaceState({}, '', newUrl);
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -97,13 +108,18 @@ export default function App() {
 
     const connect = () => {
       if (isUnmounted) return;
-      ws = new WebSocket(`${wsUrl}/?room=${encodeURIComponent(roomId)}&user=${encodeURIComponent(userName)}`);
+      ws = new WebSocket(`${wsUrl}/?room=${encodeURIComponent(roomId)}&token=${encodeURIComponent(token)}&user=${encodeURIComponent(userName)}`);
       wsRef.current = ws;
 
       ws.onopen = () => setWsConnected(true);
 
       ws.onmessage = (e) => {
         const { type, payload } = JSON.parse(e.data);
+        if (type === 'AUTH_FAIL') {
+          setAuthFail(true);
+          setWsConnected(false);
+          return;
+        }
         if (type === 'INIT' || type === 'TEXT_SYNC') {
           isRemote.current = true;
           const cleanText = (payload.text || '').replace(/\r\n/g, '\n');
@@ -145,7 +161,7 @@ export default function App() {
       clearTimeout(reconnectTimer);
       ws?.close();
     };
-  }, [roomId, userName, autoScroll]);
+  }, [roomId, userName, autoScroll, token]);
 
   const handleTextChange = (val) => {
     if (isRemote.current) {
@@ -181,12 +197,19 @@ export default function App() {
     }
   };
 
-  const copyInvite = () => {
-    const link = `${window.location.origin}/?room=${encodeURIComponent(roomId)}&user=Helper`;
-    navigator.clipboard.writeText(link);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
+  // 无 token：显示空状态（客户必须通过邀请链接进入）
+  if (!token) {
+    return (
+      <div style={{
+        height: '100vh', display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center', gap: '12px',
+        background: '#0d0d0d', color: '#e5e5e5', fontFamily: 'monospace',
+      }}>
+        <div style={{ fontSize: '18px' }}>需要邀请链接</div>
+        <div style={{ color: '#888', fontSize: '13px' }}>请使用导师发给你的链接打开本应用</div>
+      </div>
+    );
+  }
 
   return (
     <div style={{
@@ -355,16 +378,6 @@ export default function App() {
         background: `rgba(20, 20, 20, ${Math.min(opacity + 0.08, 1)})`,
         borderTop: '1px solid rgba(255, 255, 255, 0.08)', fontSize: '13px',
       }}>
-        <button
-          onClick={copyInvite}
-          style={{
-            background: 'transparent', color: copied ? '#10b981' : '#d4d4d4', border: 'none',
-            cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px',
-          }}
-        >
-          <span>+</span> {copied ? 'Copied!' : 'Invite'}
-        </button>
-
         <div style={{
           display: 'flex', alignItems: 'center', gap: '6px',
           background: 'rgba(34, 34, 34, 0.7)', padding: '3px 10px', borderRadius: '14px', fontSize: '12px', color: '#aaa',
@@ -375,6 +388,10 @@ export default function App() {
             background: wsConnected ? '#10b981' : '#ef4444',
           }} />
         </div>
+
+        {authFail && (
+          <span style={{ color: '#ef4444', fontSize: '12px' }}>房间凭证无效</span>
+        )}
 
         <span style={{ color: '#444' }}>|</span>
 

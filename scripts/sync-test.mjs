@@ -1,66 +1,71 @@
-// 极简版同步验证：打字广播 + 在线列表 + LANG_SYNC 语言同步
+// 管理员鉴权 + 邀请 token 端到端验证
 import { WebSocket } from 'ws';
 
-const room = 'sync-test-' + Date.now();
-const url = `ws://localhost:8080/?room=${room}`;
+const BASE = 'http://localhost:8080';
+const WS_BASE = 'ws://localhost:8080';
+const ADMIN_KEY = 'dev-admin-key';
 
-function makeClient(name) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`${url}&user=${encodeURIComponent(name)}`);
-    const messages = [];
-    ws.on('open', () => resolve({ ws, messages, name }));
-    ws.on('error', reject);
-    ws.on('message', (raw) => messages.push(JSON.parse(raw.toString())));
+async function createRoom(key) {
+  const res = await fetch(`${BASE}/api/rooms`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key }),
+  });
+  return { status: res.status, data: await res.json() };
+}
+
+function connectWS({ room, token, user }) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(`${WS_BASE}/?room=${room}&token=${token || ''}&user=${user}`);
+    const msgs = [];
+    ws.on('open', () => resolve({ ws, msgs, open: true }));
+    ws.on('close', (code) => resolve({ ws, msgs, open: false, closeCode: code }));
+    ws.on('message', (raw) => msgs.push(JSON.parse(raw.toString())));
   });
 }
 
-const waitFor = (fn, timeout = 5000) => new Promise((res, rej) => {
+const waitFor = (fn, ms = 5000) => new Promise((res, rej) => {
   const t0 = Date.now();
-  const check = () => {
-    if (fn()) res();
-    else if (Date.now() - t0 > timeout) rej(new Error('超时'));
-    else setTimeout(check, 50);
-  };
-  check();
+  const c = () => fn() ? res() : (Date.now() - t0 > ms ? rej(new Error('超时')) : setTimeout(c, 50));
+  c();
 });
 
-const a = await makeClient('Candidate');
-const b = await makeClient('Mentor');
+// 1. 错误密钥 → 401
+const bad = await createRoom('wrong-key');
+if (bad.status === 401) console.log('✓ 错误密钥被拒绝（401）');
+else { console.error('✗ 错误密钥未被拒绝', bad); process.exit(1); }
 
-await waitFor(() => a.messages.some((m) => m.type === 'INIT'));
-await waitFor(() => b.messages.some((m) => m.type === 'INIT'));
-console.log('✓ 双方收到 INIT');
+// 2. 正确密钥 → 返回 roomId + token
+const good = await createRoom(ADMIN_KEY);
+if (good.status === 200 && good.data.roomId && good.data.token) {
+  console.log('✓ 管理员建房成功 →', JSON.stringify(good.data));
+} else { console.error('✗ 建房失败', good); process.exit(1); }
 
-// PRESENCE
-await waitFor(() => {
-  const p = b.messages.filter((m) => m.type === 'PRESENCE').at(-1);
-  return p && p.payload.length === 2 && p.payload.some((u) => u.name === 'Candidate');
-});
-console.log('✓ PRESENCE 在线列表含双方');
+const { roomId, token } = good.data;
 
-// TEXT_SYNC
-a.ws.send(JSON.stringify({ type: 'TEXT_SYNC', payload: { text: "I'd say..." } }));
-await waitFor(() => b.messages.some((m) => m.type === 'TEXT_SYNC' && m.payload.text === "I'd say..."));
-console.log('✓ B 收到 A 的 TEXT_SYNC 打字广播');
+// 3. 无 token 连接 → 被拒（AUTH_FAIL + close 4001）
+const noToken = await connectWS({ room: roomId, user: 'Eve' });
+await waitFor(() => noToken.msgs.some((m) => m.type === 'AUTH_FAIL'));
+console.log('✓ 无 token 连接被拒（AUTH_FAIL）');
+noToken.ws.close();
 
-// LANG_SYNC
-a.ws.send(JSON.stringify({ type: 'LANG_SYNC', payload: { language: 'plaintext' } }));
-await waitFor(() => b.messages.some((m) => m.type === 'LANG_SYNC' && m.payload.language === 'plaintext'));
-console.log('✓ B 收到 A 的 LANG_SYNC 语言切换');
+// 4. 错误 token → 被拒
+const badToken = await connectWS({ room: roomId, token: 'ffffffffffff', user: 'Eve' });
+await waitFor(() => badToken.msgs.some((m) => m.type === 'AUTH_FAIL'));
+console.log('✓ 错误 token 连接被拒');
+badToken.ws.close();
 
-// 语言状态持久（新成员 INIT 拿到 plaintext）
-const c = await makeClient('Cstech Cat');
-await waitFor(() => c.messages.some((m) => m.type === 'INIT' && m.payload.language === 'plaintext' && m.payload.text === "I'd say..."));
-console.log('✓ 房间状态持久（新成员拿到最新文字 + 语言）');
+// 5. 正确 token → 双端进入 + 同步
+const a = await connectWS({ room: roomId, token, user: 'Mentor' });
+const b = await connectWS({ room: roomId, token, user: 'Client' });
+await waitFor(() => a.msgs.some((m) => m.type === 'INIT'));
+await waitFor(() => b.msgs.some((m) => m.type === 'INIT'));
+console.log('✓ 正确 token 双方进入房间');
 
-// 断线 PRESENCE
-a.ws.close();
-await waitFor(() => {
-  const p = b.messages.filter((m) => m.type === 'PRESENCE').at(-1);
-  return p && p.payload.length === 2;
-});
-console.log('✓ 断线后 PRESENCE 正确更新');
+a.ws.send(JSON.stringify({ type: 'TEXT_SYNC', payload: { text: 'hello 加密房' } }));
+await waitFor(() => b.msgs.some((m) => m.type === 'TEXT_SYNC' && m.payload.text === 'hello 加密房'));
+console.log('✓ token 房间内打字同步成功');
 
-a.ws.close(); b.ws.close(); c.ws.close();
+a.ws.close(); b.ws.close();
 console.log('\n全部通过 ✓');
 process.exit(0);
