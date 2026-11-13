@@ -35,6 +35,7 @@ function getOrCreateRoom(roomId, token) {
       text: '',
       language: 'python',
       clients: new Map(),
+      lastActive: Date.now(),
     });
   }
   return rooms.get(roomId);
@@ -119,6 +120,7 @@ wss.on('connection', (ws, req) => {
 
   const color = COLORS[room.clients.size % COLORS.length];
   room.clients.set(ws, { name: userName, color });
+  room.lastActive = Date.now();
 
   // 广播房间内最新在线成员列表（含彩色铭牌）
   const broadcastPresence = () => {
@@ -158,9 +160,20 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     room.clients.delete(ws);
     broadcastPresence();
-    if (room.clients.size === 0) rooms.delete(roomId); // 空房间回收
+    // 不立即删除空房间：保留 roomId + token，避免「先建房→后加入」时短暂空房导致凭证失效
+    // 房间由定时器在闲置超时后统一回收
   });
 });
+
+// 闲置房间回收：房间超过 6 小时无人使用才删除（保留 token 有效性，且不会无限增长）
+setInterval(() => {
+  const now = Date.now();
+  rooms.forEach((room, roomId) => {
+    if (room.clients.size === 0 && now - room.lastActive > 6 * 3600 * 1000) {
+      rooms.delete(roomId);
+    }
+  });
+}, 10 * 60 * 1000);
 
 // WS 升级：接受任意路径
 httpServer.on('upgrade', (req, socket, head) => {
