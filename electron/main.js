@@ -3,7 +3,6 @@ const path = require('path');
 const os = require('os');
 
 let mainWindow;
-let isClickThrough = false; // 鼠标穿透状态
 const MOVE_STEP = 40;
 
 // 检测系统是否支持原生毛玻璃（macOS 或 Windows 11 22H2 Build 22621+）
@@ -27,20 +26,6 @@ function applyNativeFrostedGlass(win, enabled) {
   } else if (process.platform === 'win32') {
     win.setBackgroundMaterial(enabled ? 'acrylic' : 'none');
   }
-}
-
-// 统一切换鼠标穿透模式，并通知前端更新 UI 状态
-function setClickThroughMode(enabled) {
-  if (!mainWindow) return;
-  isClickThrough = Boolean(enabled);
-  if (isClickThrough) {
-    // 开启穿透：鼠标点击直接穿透到底层浏览器/IDE，完全不抢焦点
-    mainWindow.setIgnoreMouseEvents(true, { forward: true });
-  } else {
-    // 关闭穿透：允许在悬浮窗上修改房间号或拖动滑块
-    mainWindow.setIgnoreMouseEvents(false);
-  }
-  mainWindow.webContents.send('CLICK_THROUGH_CHANGED', isClickThrough);
 }
 
 function createWindow() {
@@ -101,11 +86,6 @@ ipcMain.on('SET_FROSTED_GLASS', (_e, enabled) => {
   applyNativeFrostedGlass(mainWindow, Boolean(enabled));
 });
 
-// 前端按钮/快捷键开启鼠标穿透
-ipcMain.on('SET_CLICK_THROUGH', (_e, enabled) => {
-  setClickThroughMode(enabled);
-});
-
 function registerShortcuts() {
   // 1. ⌘ + B : 显隐切换（showInactive 避免面试页触发失焦报警）
   globalShortcut.register('CommandOrControl+B', () => {
@@ -113,12 +93,7 @@ function registerShortcuts() {
     mainWindow.isVisible() ? mainWindow.hide() : mainWindow.showInactive();
   });
 
-  // 2. ⌘/Ctrl + M : 一键开启/关闭鼠标穿透模式（穿透后可直接点击底层浏览器写代码）
-  globalShortcut.register('CommandOrControl+M', () => {
-    setClickThroughMode(!isClickThrough);
-  });
-
-  // 3. ⌘/Ctrl + ↑ ↓ ← → : 无鼠移动窗口位置
+  // 2. ⌘/Ctrl + ↑ ↓ ← → : 无鼠移动窗口位置
   const moveDirections = {
     Up: [0, -MOVE_STEP],
     Down: [0, MOVE_STEP],

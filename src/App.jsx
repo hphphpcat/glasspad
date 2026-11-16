@@ -20,11 +20,10 @@ export default function App() {
     () => params.get('user') || (isClientApp ? 'Client' : 'Mentor')
   );
 
-  // 桌面端外观：透明度 / 毛玻璃 / 鼠标穿透
+  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃
   const [opacity, setOpacity] = useState(() => Number(localStorage.getItem('pad_opacity')) || 0.78);
   const [supportsFrost, setSupportsFrost] = useState(false);
   const [frostedGlass, setFrostedGlass] = useState(() => localStorage.getItem('pad_frost') !== 'false');
-  const [clickThrough, setClickThrough] = useState(false);
 
   const [text, setText] = useState('');
   const [language, setLanguage] = useState('python');
@@ -37,7 +36,7 @@ export default function App() {
   const isRemote = useRef(false);
   const remoteSelDecorations = useRef(null); // 对方选区的高亮装饰集合
 
-  // 桌面端：检测毛玻璃支持 + 监听主进程 ⌘M 切换的穿透状态
+  // 桌面端：检测系统是否支持毛玻璃
   useEffect(() => {
     const api = window.electronAPI;
     if (!api) return;
@@ -46,7 +45,6 @@ export default function App() {
       setSupportsFrost(ok);
       api.setFrostedGlass(ok && frostedGlass);
     });
-    api.onClickThroughChanged?.((val) => setClickThrough(val));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -75,11 +73,6 @@ export default function App() {
     setFrostedGlass(enabled);
     localStorage.setItem('pad_frost', String(enabled));
     window.electronAPI?.setFrostedGlass?.(enabled);
-  };
-
-  const toggleClickThrough = (enabled) => {
-    setClickThrough(enabled);
-    window.electronAPI?.setClickThrough?.(enabled);
   };
 
   // WebSocket 实时同步
@@ -244,7 +237,7 @@ export default function App() {
       backdropFilter: frost ? 'blur(14px)' : 'none',
       WebkitBackdropFilter: frost ? 'blur(14px)' : 'none',
       color: '#e5e5e5', fontFamily: 'monospace',
-      border: `1px solid ${clickThrough ? 'rgba(16, 185, 129, 0.4)' : 'rgba(255, 255, 255, 0.12)'}`,
+      border: '1px solid rgba(255, 255, 255, 0.12)',
       borderRadius: '8px', overflow: 'hidden',
     }}>
       {/* 顶部栏 */}
@@ -260,15 +253,6 @@ export default function App() {
             <span style={{ userSelect: 'none', color: '#888' }} title="移动窗口：⌘ + 方向键">
               ⠿ ⌘+方向键移动
             </span>
-            <button
-              onClick={() => toggleClickThrough(!clickThrough)}
-              title="⌘/Ctrl + M 随时切换"
-              style={clickThrough
-                ? { ...btn, background: 'rgba(16, 185, 129, 0.2)', color: '#10b981', borderColor: '#10b981' }
-                : btn}
-            >
-              {clickThrough ? '⚡ Click-Through ON (⌘M)' : 'Click-Through (⌘M)'}
-            </button>
 
             <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '12px' }}>
               <label style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="⌘[ / ⌘] 调节">
@@ -316,8 +300,8 @@ export default function App() {
         )}
       </div>
 
-      {/* 提词区（客户端只读；穿透时忽略所有鼠标事件） */}
-      <div style={{ flex: 1, position: 'relative', paddingTop: '8px', pointerEvents: clickThrough ? 'none' : 'auto' }}>
+      {/* 提词区（客户端只读） */}
+      <div style={{ flex: 1, position: 'relative', paddingTop: '8px' }}>
         <Editor
           height="100%"
           theme="codex-transparent"
