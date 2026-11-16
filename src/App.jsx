@@ -43,6 +43,7 @@ export default function App() {
   const wsRef = useRef(null);
   const editorRef = useRef(null);
   const isRemote = useRef(false);
+  const remoteSelDecorations = useRef(null); // 对方选区的高亮装饰集合
 
   // 1. 初始化检测系统是否支持原生毛玻璃（Win10 自动隐藏开关并关闭）
   useEffect(() => {
@@ -150,6 +151,8 @@ export default function App() {
           }
         } else if (type === 'LANG_SYNC') {
           setLanguage(payload.language);
+        } else if (type === 'SEL_SYNC') {
+          applyRemoteSelections(payload.selections || []);
         } else if (type === 'PRESENCE') {
           setParticipants(payload);
         }
@@ -178,6 +181,23 @@ export default function App() {
       ws?.close();
     };
   }, [roomId, userName, autoScroll, token]);
+
+  // 把对方的选区画成高亮装饰（不影响本地选区）
+  const applyRemoteSelections = (selections) => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    if (!remoteSelDecorations.current) {
+      remoteSelDecorations.current = editor.createDecorationsCollection();
+    }
+    remoteSelDecorations.current.set(
+      selections
+        .filter((s) => s.startLineNumber !== s.endLineNumber || s.startColumn !== s.endColumn)
+        .map((s) => ({
+          range: s,
+          options: { className: 'remote-selection', stickiness: 1 },
+        }))
+    );
+  };
 
   // 远端文字增量写入：只替换前后缀之间变化的部分，避免整体 setValue 清掉客户的选区
   const applyRemoteText = (newText) => {
@@ -453,8 +473,25 @@ export default function App() {
                 .monaco-editor .focused .selected-text {
                   background-color: #1e5aa8 !important;
                 }
+                .monaco-editor .remote-selection {
+                  background-color: rgba(245, 158, 11, 0.45);
+                  border-radius: 2px;
+                }
               `;
               document.head.appendChild(style);
+            }
+            // 导师端：把自己的选区实时发给客户（客户端只读，不发送）
+            if (!isClientApp) {
+              editor.onDidChangeCursorSelection(() => {
+                if (wsRef.current?.readyState !== 1) return;
+                const selections = editor.getSelections().map((s) => ({
+                  startLineNumber: s.startLineNumber,
+                  startColumn: s.startColumn,
+                  endLineNumber: s.endLineNumber,
+                  endColumn: s.endColumn,
+                }));
+                wsRef.current.send(JSON.stringify({ type: 'SEL_SYNC', payload: { selections } }));
+              });
             }
           }}
           options={{

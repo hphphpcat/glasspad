@@ -195,6 +195,13 @@ wss.on('connection', (ws, req) => {
           c.send(JSON.stringify({ type: 'LANG_SYNC', payload: msg.payload }));
         }
       });
+    } else if (msg.type === 'SEL_SYNC') {
+      // 选区同步：只转发不持久化（临时状态）
+      room.clients.forEach((_, c) => {
+        if (c !== ws && c.readyState === 1) {
+          c.send(JSON.stringify({ type: 'SEL_SYNC', payload: msg.payload }));
+        }
+      });
     }
   });
 
