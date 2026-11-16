@@ -3,3 +3,9 @@ html, body, #root {
   height: 100%;
   overflow: hidden;
 }
+
+/* 导师选区在客户端显示的橙色高亮 */
+.monaco-editor .remote-selection {
+  background-color: rgba(245, 158, 11, 0.45);
+  border-radius: 2px;
+}
