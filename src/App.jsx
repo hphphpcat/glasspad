@@ -136,8 +136,9 @@ export default function App() {
           return;
         }
         if (type === 'INIT' || type === 'TEXT_SYNC') {
-          isRemote.current = true;
           const cleanText = (payload.text || '').replace(/\r\n/g, '\n');
+          // 先增量写入编辑器（保留选区），再同步 React 状态（此时内容已一致，不会整体 setValue）
+          applyRemoteText(cleanText);
           setText(cleanText);
           if (payload.language) setLanguage(payload.language);
 
@@ -177,6 +178,34 @@ export default function App() {
       ws?.close();
     };
   }, [roomId, userName, autoScroll, token]);
+
+  // 远端文字增量写入：只替换前后缀之间变化的部分，避免整体 setValue 清掉客户的选区
+  const applyRemoteText = (newText) => {
+    const model = editorRef.current?.getModel();
+    if (!model) return;
+    const oldText = model.getValue();
+    if (oldText === newText) return;
+    let start = 0;
+    const minLen = Math.min(oldText.length, newText.length);
+    while (start < minLen && oldText[start] === newText[start]) start++;
+    let endOld = oldText.length;
+    let endNew = newText.length;
+    while (endOld > start && endNew > start && oldText[endOld - 1] === newText[endNew - 1]) {
+      endOld--;
+      endNew--;
+    }
+    const from = model.getPositionAt(start);
+    const to = model.getPositionAt(endOld);
+    isRemote.current = true; // applyEdits 会同步触发 onChange，由 handleTextChange 消费该标记
+    model.applyEdits([{
+      range: {
+        startLineNumber: from.lineNumber, startColumn: from.column,
+        endLineNumber: to.lineNumber, endColumn: to.column,
+      },
+      text: newText.slice(start, endNew),
+    }]);
+    isRemote.current = false;
+  };
 
   const handleTextChange = (val) => {
     // 客户端 App 只读，直接拦截任何文本发送逻辑
@@ -384,7 +413,10 @@ export default function App() {
           height="100%"
           theme="codex-transparent"
           language={language}
-          value={text}
+          // 客户端只读：不走受控 value（库在只读模式下每次 value 变化都会整体 setValue，清掉选区），
+          // 远端文字由 applyRemoteText 增量写入；导师端保持受控
+          value={isClientApp ? undefined : text}
+          defaultValue={text}
           onChange={handleTextChange}
           beforeMount={(monaco) => {
             // 将编辑器和行号栏背景设为 #00000000 全透明
