@@ -249,9 +249,9 @@ export default function App() {
       }}>
         {isClientApp ? (
           <>
-            {/* 不用鼠标拖拽（会激活应用触发切屏检测），改用 ⌘+方向键移动 */}
-            <span style={{ userSelect: 'none', color: '#888' }} title="移动窗口：⌘ + 方向键">
-              ⠿ ⌘+方向键移动
+            {/* 快捷键用法提示（不用鼠标拖拽：会激活应用触发切屏检测） */}
+            <span style={{ userSelect: 'none', color: '#777', fontSize: '11px', whiteSpace: 'nowrap' }}>
+              ⌘+方向键 移动 · ⌘B 隐藏/显示 · ⌘[ ⌘] 透明度 · ⌘R 刷新 · ⌘Q 退出
             </span>
 
             <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '12px' }}>
