@@ -397,11 +397,11 @@ export default function App() {
                 'editorGutter.background': '#00000000',
                 'editor.lineHighlightBackground': '#00000000',
                 'scrollbarSlider.background': '#ffffff22',
-                // 选中文字高亮：激活/非激活都用醒目的蓝色，保证客户一眼看到选中范围
-                'editor.selectionBackground': '#1e5aa855',
-                'editor.inactiveSelectionBackground': '#1e5aa866',
-                'editor.selectionHighlightBackground': '#2d6fbf44',
-                'editor.selectionHighlightBorder': '#58a6ff66',
+                // 选中高亮：用高对比度的实心蓝，透明背景下也清晰可见
+                'editor.selectionBackground': '#1e5aa8',
+                'editor.inactiveSelectionBackground': '#1e5aa8',
+                'editor.selectionHighlightBackground': '#2d6fbf',
+                'editor.selectionHighlightBorder': '#58a6ff',
               },
             });
           }}
