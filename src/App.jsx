@@ -35,6 +35,7 @@ export default function App() {
   const editorRef = useRef(null);
   const isRemote = useRef(false);
   const remoteSelDecorations = useRef(null); // 对方选区的高亮装饰集合
+  const latestText = useRef(''); // 最近收到的远端文字（编辑器挂载前到达时用于补写）
 
   // 桌面端：检测系统是否支持毛玻璃
   useEffect(() => {
@@ -104,6 +105,7 @@ export default function App() {
         } else if (type === 'INIT' || type === 'TEXT_SYNC') {
           const clean = normalizeLF(payload.text);
           // 先增量写入编辑器（保留选区），再同步 React 状态
+          latestText.current = clean;
           applyRemoteText(clean);
           setText(clean);
           if (payload.language) setLanguage(payload.language);
@@ -328,6 +330,8 @@ export default function App() {
           }}
           onMount={(editor, monaco) => {
             editorRef.current = editor;
+            // WS 的 INIT 可能早于 Monaco 加载完成到达，挂载时补写最新文字
+            if (isClientApp && latestText.current) applyRemoteText(latestText.current);
             monaco.editor.setTheme('codex-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
             // 导师端：把自己的选区实时发给客户

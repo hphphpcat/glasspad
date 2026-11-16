@@ -1,51 +1,114 @@
-# Codex Clone · 极简实时打字提词版
+# Interview Prompter
 
-实时打字同步 + 动态房间码 + 昵称记忆 + 自动滚屏 + 在线队友列表。打包一次客户端发给所有客户，每次面试发个 4 位房间码即可秒进专属提词房间。
+导师在网页端打字，候选人在桌面 App 里实时看到。候选人的 App 是一个可调透明度的悬浮窗，置顶显示在浏览器上方，内容只读。
+
+![候选人 App](docs/screenshots/client.png)
 
 ## 功能
 
-- **动态房间码切换**：左上角 `Room:` 框输入 4 位数字回车，秒切房间；URL / localStorage 三级记忆。
-- **昵称记忆**：右下角改名字，存 localStorage，下次自动恢复。
-- **自动滚屏跟随**：导师打字超过一屏，候选人界面自动滚到底部（可开关）。
-- **语言同步**：导师切 Python / Plain Text / C++ / Java / JS，客户端语法高亮跟着切（`LANG_SYNC`）。
-- **一键清屏**：`Clear` 按钮同步清空双方屏幕，切下一道题用。
-- **在线列表**：底部 `Wss: 🟢` 状态灯 + 彩色队友铭牌 + 断线自动重连。
+- **实时同步**：导师逐字输入，候选人端即时显示，超过一屏时自动滚到最新一行。
+- **选区同步**：导师选中的文字，在候选人端显示为橙色高亮，用来指出重点。
+- **只读**：候选人端不能修改内容。
+- **透明悬浮窗**：透明度 8% 到 100% 可调，可以透过窗口看到下面的浏览器；可开 Frosted Glass 毛玻璃模糊背景。
+- **邀请链接加入**：房间由管理员创建，每个房间有独立 token，没有链接进不了房间。
+- **房间持久化**：服务重启后房间和 token 仍然有效，房间闲置 6 小时后回收。
 
-## 协议
+## 使用流程
 
-`INIT`（房间文字+语言）/ `TEXT_SYNC`（打字广播）/ `LANG_SYNC`（语言同步）/ `PRESENCE`（在线列表）/ `PING`（心跳）。
+### 1. 导师创建房间
 
-## 本地运行
+打开管理台 `https://你的域名/admin`，输入 `ADMIN_KEY`，点「创建房间」。页面给出两条链接：蓝色发给候选人，黄色自己用。
+
+![管理台](docs/screenshots/admin.png)
+
+### 2. 候选人加入
+
+候选人打开桌面 App，复制邀请链接后点「从剪贴板粘贴」。
+
+![加入页](docs/screenshots/join.png)
+
+### 3. 导师打字
+
+导师用浏览器打开自己的链接，直接在编辑器里输入。`Clear` 清空双方屏幕，右上角切换语法高亮（BQ 面试的英文回答用 Plain Text，避免 `I'd` 这类缩写被当成字符串染色）。
+
+![导师网页端](docs/screenshots/mentor.png)
+
+## 候选人 App 快捷键
+
+| 快捷键（Windows 用 Ctrl） | 作用 |
+|---|---|
+| `⌘` + 方向键 | 移动窗口（每次 40px） |
+| `⌘B` | 隐藏 / 显示窗口 |
+| `⌘[` / `⌘]` | 降低 / 提高透明度 |
+| `⌘R` | 刷新 |
+| `⌘Q` | 退出 |
+
+窗口不支持鼠标拖动：在 macOS 上拖动窗口会激活应用，面试平台可能把它识别成切换应用，所以只用快捷键移动。
+
+**透明度怎么调**
+
+- 想看清下面浏览器里的题目：关掉 Frosted Glass，透明度调到 20% 到 35%。
+- 下面的页面太花、影响看字：打开 Frosted Glass，透明度调到 60% 到 80%。
+
+## 安装候选人 App
+
+到 [Releases](../../releases) 下载：
+
+- macOS（Apple Silicon）：`Codex-1.0.0-arm64.dmg`
+- Windows（x64）：`Codex-1.0.0-portable.exe`，免安装，双击运行
+
+安装包没有签名：
+
+- **macOS**：把 App 拖进「应用程序」后，如果提示「已损坏」，在终端运行一次：
+  ```bash
+  xattr -cr /Applications/Codex.app
+  ```
+- **Windows**：SmartScreen 提示时点「更多信息」→「仍要运行」。
+
+## 部署服务端
+
+服务端是一个 Node 进程，同一个端口提供页面、WebSocket 和建房接口。仓库自带 `Dockerfile` 和 `railway.json`，可以直接部署到 Railway。
+
+**必须设置的环境变量**
+
+| 变量 | 说明 |
+|---|---|
+| `ADMIN_KEY` | 管理台密钥。生产环境不设置时服务拒绝启动。 |
+| `DATA_DIR` | 房间数据目录。Railway 上挂一个 Volume 到 `/data`，并设为 `/data`，否则重启后房间丢失。 |
+
+部署好后，修改 `electron/main.js` 里的 `startUrl` 为你的域名，再打包候选人 App。
+
+## 本地开发
 
 ```bash
-export PATH="/opt/homebrew/bin:$PATH"
-cd ~/codex-clone
 npm install
-npm run build          # 生成 dist
-node server/index.js   # 后端 8080，打开 http://localhost:8080
+npm run build             # 构建前端到 dist/
+node server/index.js      # 服务端 http://localhost:8080，管理台 /admin，开发密钥 dev-admin-key
+npm run electron          # 启动候选人 App（连本地需设置 ELECTRON_START_URL=http://localhost:8080/）
 ```
 
-开发热更新：`npm run dev`（起 server + web），打开 http://localhost:5173 —— `.env.development` 已把 WS 指向 `ws://localhost:8080`。
-
-## 跨互联网部署（打包一次，永久复用）
-
-1. **部署后端**：把目录推到 Railway / Render / Fly.io，构建 `npm run build`、启动 `node server/index.js`，得到 `https://xxx.up.railway.app`。
-2. **打包客户端**：`ELECTRON_START_URL=https://xxx.up.railway.app/` 打包 Mac/Win 客户端（`startUrl` 不带固定房间号）。
-3. **每次面试**：
-   - 客户打开软件，左上角 `Room:` 输入你发他的 4 位码（如 `2088`）回车。
-   - 导师浏览器打开 `https://xxx.up.railway.app/?room=2088&user=Mentor`。
-   - 双方底部亮 `Wss: 🟢`，导师打字 → 客户实时逐字浮现 + 自动滚屏。
-   - 切下一题：导师点 `Clear`。
-
-## 验证
+**打包**
 
 ```bash
-node server/index.js
-node scripts/sync-test.mjs
+npm run dist              # macOS dmg
+npm run dist:win          # Windows x64 便携版
 ```
 
-## 说明
+**测试**（先启动服务端）
 
-- **Run 按钮当前是纯 UI**（截图 1:1 复刻），无代码执行逻辑。
-- 房间状态存单进程内存，重启丢失；单节点够全球打字同步用，要持久化需接存储。
-- 4 位房间码当前是「约定码」，无鉴权——知道房间号即可加入。若要防串线/防旁听，需加房间密码或 token（可后续补）。
+```bash
+node scripts/sync-test.mjs        # 鉴权 + 打字同步
+node scripts/empty-room-test.mjs  # 房间清空后 token 仍有效
+npx electron scripts/screenshots.js  # 重新生成 README 截图
+```
+
+## 目录
+
+```
+server/index.js      服务端：静态页、WebSocket 房间、建房接口、房间持久化
+src/App.jsx          导师网页端 + 候选人 App 共用的页面（按是否运行在 Electron 区分）
+src/Admin.jsx        管理台
+electron/main.js     候选人 App 窗口：透明、置顶、防截屏、快捷键
+electron/preload.js  暴露给页面的桌面能力（毛玻璃、剪贴板）
+scripts/             测试与截图脚本
+```

@@ -9,6 +9,11 @@ const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 8080;
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 // 管理员密钥：从环境变量读取（Railway 后台配置），未配置时本地开发用默认值
+// 生产环境（NODE_ENV=production，Dockerfile 已设置）必须配置 ADMIN_KEY，否则拒绝启动，避免公开的默认值被人用来建房
+if (process.env.NODE_ENV === 'production' && !process.env.ADMIN_KEY) {
+  console.error('生产环境必须设置 ADMIN_KEY 环境变量，服务未启动');
+  process.exit(1);
+}
 const ADMIN_KEY = process.env.ADMIN_KEY || 'dev-admin-key';
 
 const MIME = {
