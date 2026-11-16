@@ -397,6 +397,11 @@ export default function App() {
                 'editorGutter.background': '#00000000',
                 'editor.lineHighlightBackground': '#00000000',
                 'scrollbarSlider.background': '#ffffff22',
+                // 选中文字高亮：激活/非激活都用醒目的蓝色，保证客户一眼看到选中范围
+                'editor.selectionBackground': '#1e5aa855',
+                'editor.inactiveSelectionBackground': '#1e5aa866',
+                'editor.selectionHighlightBackground': '#2d6fbf44',
+                'editor.selectionHighlightBorder': '#58a6ff66',
               },
             });
           }}
@@ -406,8 +411,7 @@ export default function App() {
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
           }}
           options={{
-            readOnly: isClientApp,            // 客户端强制只读
-            domReadOnly: isClientApp,         // 彻底禁止客户端聚焦光标/输入法
+            readOnly: isClientApp,            // 客户端强制只读（仍可选中文字查看高亮）
             fontSize: 15,
             lineHeight: 24,
             wordWrap: 'on',
