@@ -409,6 +409,21 @@ export default function App() {
             editorRef.current = editor;
             monaco.editor.setTheme('codex-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
+            // 兜底：直接注入 CSS 覆盖选中高亮，确保任何主题/焦点状态下都可见
+            const styleId = 'codex-selection-style';
+            if (!document.getElementById(styleId)) {
+              const style = document.createElement('style');
+              style.id = styleId;
+              style.textContent = `
+                .monaco-editor .selected-text {
+                  background-color: #1e5aa8 !important;
+                }
+                .monaco-editor .focused .selected-text {
+                  background-color: #1e5aa8 !important;
+                }
+              `;
+              document.head.appendChild(style);
+            }
           }}
           options={{
             readOnly: isClientApp,            // 客户端强制只读（仍可选中文字查看高亮）
