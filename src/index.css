@@ -2,6 +2,9 @@ html, body, #root {
   margin: 0;
   height: 100%;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 /* 导师选区在客户端显示的橙色高亮 */

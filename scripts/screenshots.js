@@ -1,10 +1,11 @@
 // 生成 README 截图：管理台、导师网页端、客户 App（只读 + 导师选区高亮）、加入页
 // 用法：先启动本地服务（node server/index.js），再运行 npx electron scripts/screenshots.js
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
 ipcMain.handle('GET_FROST_SUPPORT', () => ({ isDesktop: true, supportsFrostedGlass: true }));
+ipcMain.handle('READ_CLIPBOARD_TEXT', () => clipboard.readText());
 ipcMain.on('SET_FROSTED_GLASS', () => {});
 
 const BASE = 'http://localhost:8080';

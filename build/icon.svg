@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- 深邃碳黑渐变底板 -->
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#141b24" />
+      <stop offset="50%" stop-color="#0b0f14" />
+      <stop offset="100%" stop-color="#071512" />
+    </linearGradient>
+
+    <!-- 翡翠绿环境辉光 -->
+    <radialGradient id="emeraldGlow" cx="0.65" cy="0.35" r="0.55">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.38" />
+      <stop offset="55%" stop-color="#059669" stop-opacity="0.12" />
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- 后层毛玻璃板渐变 -->
+    <linearGradient id="backPaneGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.45" />
+      <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0.18" />
+    </linearGradient>
+
+    <!-- 前层主玻璃板渐变 -->
+    <linearGradient id="frontPaneGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.20" />
+      <stop offset="50%" stop-color="#94a3b8" stop-opacity="0.10" />
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0.16" />
+    </linearGradient>
+
+    <!-- 玻璃高光边框渐变 -->
+    <linearGradient id="strokeGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.55" />
+      <stop offset="50%" stop-color="#34d399" stop-opacity="0.35" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.12" />
+    </linearGradient>
+
+    <!-- 翡翠代码高光渐变 -->
+    <linearGradient id="accentGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+
+    <!-- 投影滤镜 -->
+    <filter id="paneShadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#000000" flood-opacity="0.65" />
+    </filter>
+  </defs>
+
+  <!-- 1. 圆角应用底板 (macOS / Windows 通用圆角) -->
+  <rect x="48" y="48" width="928" height="928" rx="210" fill="url(#bgGrad)" stroke="#ffffff" stroke-opacity="0.1" stroke-width="6" />
+  <rect x="48" y="48" width="928" height="928" rx="210" fill="url(#emeraldGlow)" />
+
+  <!-- 2. 后层倾斜透视板（象征底层窗口与透视层叠） -->
+  <g transform="rotate(-7 540 480)">
+    <rect x="270" y="190" width="540" height="440" rx="56" fill="url(#backPaneGrad)" stroke="#34d399" stroke-opacity="0.45" stroke-width="5" />
+    <rect x="330" y="260" width="180" height="22" rx="11" fill="#a7f3d0" fill-opacity="0.35" />
+    <rect x="330" y="304" width="290" height="22" rx="11" fill="#a7f3d0" fill-opacity="0.22" />
+  </g>
+
+  <!-- 3. 前层主透明悬浮提词板 (GlassPad 主体) -->
+  <g filter="url(#paneShadow)">
+    <rect x="196" y="280" width="590" height="480" rx="64" fill="#0f1722" fill-opacity="0.72" />
+    <rect x="196" y="280" width="590" height="480" rx="64" fill="url(#frontPaneGrad)" stroke="url(#strokeGrad)" stroke-width="7" />
+
+    <!-- 顶部玻璃控制栏分隔线与圆点 -->
+    <line x1="200" y1="368" x2="782" y2="368" stroke="#ffffff" stroke-opacity="0.12" stroke-width="4" />
+    <circle cx="264" cy="324" r="11" fill="#34d399" />
+    <circle cx="304" cy="324" r="11" fill="#94a3b8" fill-opacity="0.45" />
+    <rect x="640" y="314" width="88" height="20" rx="10" fill="#10b981" fill-opacity="0.35" />
+
+    <!-- 左侧终端代码提示符 `>` -->
+    <path d="M276 456 L342 508 L276 560" fill="none" stroke="url(#accentGrad)" stroke-width="32" stroke-linecap="round" stroke-linejoin="round" />
+
+    <!-- 右侧实时同步提词流光线条 -->
+    <rect x="386" y="452" width="290" height="30" rx="15" fill="url(#accentGrad)" />
+    <rect x="386" y="510" width="210" height="28" rx="14" fill="#e2e8f0" fill-opacity="0.88" />
+    <rect x="276" y="598" width="380" height="26" rx="13" fill="#94a3b8" fill-opacity="0.45" />
+    <rect x="276" y="650" width="240" height="26" rx="13" fill="#94a3b8" fill-opacity="0.28" />
+    <!-- 实时闪烁光标块 -->
+    <rect x="536" y="647" width="36" height="32" rx="8" fill="#10b981" />
+  </g>
+</svg>

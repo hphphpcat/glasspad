@@ -15,12 +15,13 @@
     "electron": "electron electron/main.js",
     "dev:all": "concurrently -k -n server,web,electron \"npm run server\" \"npm run web\" \"npm run electron\"",
     "build": "vite build",
-    "dist": "electron-builder --mac dmg",
-    "dist:dir": "electron-builder --mac dir",
-    "dist:win": "electron-builder --win portable --x64"
+    "dist": "npm run build && electron-builder --mac dmg",
+    "dist:dir": "npm run build && electron-builder --mac dir",
+    "dist:win": "npm run build && electron-builder --win portable --x64"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",
+    "monaco-editor": "^0.57.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ws": "^8.18.0"
@@ -33,34 +34,51 @@
     "vite": "^5.4.11"
   },
   "build": {
-    "appId": "com.codex.clone",
-    "productName": "Codex",
+    "appId": "com.glasspad.app",
+    "productName": "GlassPad",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "build"
     },
     "files": [
+      "dist/**/*",
       "electron/**/*",
-      "package.json"
+      "package.json",
+      "!node_modules/**/*"
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
-      "target": ["dmg"],
+      "icon": "build/icon.icns",
+      "target": [
+        "dmg"
+      ],
       "identity": null
     },
     "win": {
-      "target": ["portable"],
-      "icon": null,
+      "target": [
+        "portable"
+      ],
+      "icon": "build/icon.png",
       "signAndEditExecutable": false,
       "sign": null
     },
     "portable": {
-      "artifactName": "Codex-${version}-portable.exe"
+      "artifactName": "GlassPad-${version}-portable.exe"
     },
     "dmg": {
-      "title": "Codex",
+      "title": "GlassPad",
+      "icon": "build/icon.icns",
       "contents": [
-        { "x": 130, "y": 220 },
-        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
       ]
     }
   }

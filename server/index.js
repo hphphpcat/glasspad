@@ -38,7 +38,14 @@ function persistRooms() {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const data = {};
     rooms.forEach((room, roomId) => {
-      data[roomId] = { token: room.token, text: room.text, language: room.language, lastActive: room.lastActive };
+      data[roomId] = {
+        token: room.token,
+        note: room.note || '',
+        text: room.text,
+        language: room.language,
+        createdAt: room.createdAt || room.lastActive,
+        lastActive: room.lastActive,
+      };
     });
     fs.writeFileSync(ROOMS_FILE, JSON.stringify(data));
   } catch (e) {
@@ -53,9 +60,11 @@ function loadRooms() {
     Object.entries(data).forEach(([roomId, r]) => {
       rooms.set(roomId, {
         token: r.token,
+        note: r.note || '',
         text: r.text || '',
         language: r.language || 'python',
         clients: new Map(),
+        createdAt: r.createdAt || r.lastActive || Date.now(),
         lastActive: r.lastActive || Date.now(),
       });
     });
@@ -69,17 +78,61 @@ function randomToken() {
   return crypto.randomBytes(6).toString('hex'); // 12 位十六进制，足够难猜
 }
 
-function getOrCreateRoom(roomId, token) {
+function getOrCreateRoom(roomId, token, note = '') {
   if (!rooms.has(roomId)) {
+    const now = Date.now();
     rooms.set(roomId, {
       token: token || randomToken(),
+      note: note || '',
       text: '',
       language: 'python',
       clients: new Map(),
-      lastActive: Date.now(),
+      createdAt: now,
+      lastActive: now,
     });
   }
   return rooms.get(roomId);
+}
+
+// 序列化房间信息供管理台展示
+function serializeRoom(roomId, room) {
+  const participants = Array.from(room.clients.values());
+  const text = room.text || '';
+  return {
+    roomId,
+    token: room.token,
+    note: room.note || '',
+    language: room.language || 'python',
+    onlineCount: participants.length,
+    participants,
+    textLength: text.length,
+    textPreview: text.slice(0, 120),
+    createdAt: room.createdAt || room.lastActive,
+    lastActive: room.lastActive,
+  };
+}
+
+// 销毁指定房间并踢出所有在线 WebSocket 客户端
+function destroyRoom(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return false;
+  const msg = JSON.stringify({ type: 'ROOM_DESTROYED', payload: { reason: '该房间已被管理员销毁' } });
+  room.clients.forEach((_, clientWs) => {
+    try {
+      if (clientWs.readyState === 1) clientWs.send(msg);
+      clientWs.close(4002, 'room_destroyed');
+    } catch {}
+  });
+  room.clients.clear();
+  rooms.delete(roomId);
+  return true;
+}
+
+function checkAdminKey(req, url, body) {
+  const headerKey = req.headers['x-admin-key'] || '';
+  const queryKey = url.searchParams.get('key') || '';
+  const bodyKey = body?.key || '';
+  return (headerKey || queryKey || bodyKey) === ADMIN_KEY;
 }
 
 function sendJSON(res, status, obj) {
@@ -98,25 +151,75 @@ function readBody(req) {
   });
 }
 
-// ── HTTP：静态文件 + 管理员建房 API ──
+// ── HTTP：静态文件 + 管理员房间管理 API ──
 const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
-  // 管理员创建房间
+  // 1. 管理员查询全部房间列表：GET /api/rooms
+  if (req.method === 'GET' && url.pathname === '/api/rooms') {
+    if (!checkAdminKey(req, url)) {
+      return sendJSON(res, 401, { error: '无效的管理员密钥' });
+    }
+    const list = [];
+    rooms.forEach((room, roomId) => {
+      list.push(serializeRoom(roomId, room));
+    });
+    // 在线人数优先，其次按最近活跃时间倒序
+    list.sort((a, b) => (b.onlineCount - a.onlineCount) || (b.lastActive - a.lastActive));
+    return sendJSON(res, 200, { rooms: list });
+  }
+
+  // 2. 管理员创建房间：POST /api/rooms
   if (req.method === 'POST' && url.pathname === '/api/rooms') {
     try {
       const body = await readBody(req);
-      if ((body.key || '') !== ADMIN_KEY) {
+      if (!checkAdminKey(req, url, body)) {
         return sendJSON(res, 401, { error: '无效的管理员密钥' });
       }
       const roomId = crypto.randomBytes(3).toString('hex'); // 6 位十六进制房间号
       const token = randomToken();
-      getOrCreateRoom(roomId, token);
+      const note = String(body.note || '').trim().slice(0, 60);
+      const room = getOrCreateRoom(roomId, token, note);
       persistRooms();
-      return sendJSON(res, 200, { roomId, token });
+      return sendJSON(res, 200, serializeRoom(roomId, room));
     } catch (e) {
       return sendJSON(res, 400, { error: '请求解析失败：' + e.message });
     }
+  }
+
+  // 3. 管理员销毁单个房间：DELETE /api/rooms/:roomId
+  if (req.method === 'DELETE' && url.pathname.startsWith('/api/rooms/')) {
+    let body = {};
+    try { body = await readBody(req); } catch {}
+    if (!checkAdminKey(req, url, body)) {
+      return sendJSON(res, 401, { error: '无效的管理员密钥' });
+    }
+    const targetId = decodeURIComponent(url.pathname.slice('/api/rooms/'.length)).trim();
+    if (!targetId || !rooms.has(targetId)) {
+      return sendJSON(res, 404, { error: '房间不存在或已销毁' });
+    }
+    destroyRoom(targetId);
+    persistRooms();
+    return sendJSON(res, 200, { ok: true, destroyed: targetId });
+  }
+
+  // 4. 管理员批量销毁房间：DELETE /api/rooms?mode=idle|all
+  if (req.method === 'DELETE' && url.pathname === '/api/rooms') {
+    let body = {};
+    try { body = await readBody(req); } catch {}
+    if (!checkAdminKey(req, url, body)) {
+      return sendJSON(res, 401, { error: '无效的管理员密钥' });
+    }
+    const mode = url.searchParams.get('mode') || body.mode || 'idle';
+    const destroyed = [];
+    Array.from(rooms.keys()).forEach((roomId) => {
+      const r = rooms.get(roomId);
+      if (mode === 'all' || (r && r.clients.size === 0)) {
+        if (destroyRoom(roomId)) destroyed.push(roomId);
+      }
+    });
+    persistRooms();
+    return sendJSON(res, 200, { ok: true, destroyedCount: destroyed.length, destroyed });
   }
 
   if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }

@@ -3,6 +3,10 @@ import Editor from '@monaco-editor/react';
 
 // 客户 App（Electron）只读；导师用网页版可编辑
 const isClientApp = Boolean(window.electronAPI?.isDesktop);
+const isWindows = window.electronAPI?.platform === 'win32' || /Win/i.test(navigator.platform || '');
+const modKey = isWindows ? 'Ctrl+' : '⌘';
+const uiFont = 'ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif';
+const codeFont = 'ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, Menlo, "Microsoft YaHei UI", monospace';
 
 const normalizeLF = (s) => (s || '').replace(/\r\n/g, '\n');
 
@@ -11,24 +15,58 @@ const btn = {
   borderRadius: '6px', padding: '4px 10px', fontSize: '12px', cursor: 'pointer',
 };
 
+// GlassPad 品牌矢量 Logo（双层翡翠透视毛玻璃板 + 终端提词流光）
+export function BrandLogo({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64" fill="none" style={{ flexShrink: 0, display: 'block' }}>
+      <defs>
+        <linearGradient id="gp-bg" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor="#141b24" />
+          <stop offset="100%" stopColor="#071512" />
+        </linearGradient>
+        <linearGradient id="gp-back" x1="16" y1="10" x2="54" y2="42" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor="#10b981" stopOpacity="0.55" />
+          <stop offset="100%" stopColor="#0ea5e9" stopOpacity="0.22" />
+        </linearGradient>
+        <linearGradient id="gp-front" x1="10" y1="18" x2="50" y2="52" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor="#ffffff" stopOpacity="0.22" />
+          <stop offset="100%" stopColor="#10b981" stopOpacity="0.2" />
+        </linearGradient>
+      </defs>
+      <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#gp-bg)" stroke="#ffffff" strokeOpacity="0.14" strokeWidth="1.5" />
+      <g transform="rotate(-7 34 30)">
+        <rect x="17" y="12" width="34" height="28" rx="6" fill="url(#gp-back)" stroke="#34d399" strokeOpacity="0.55" strokeWidth="1.4" />
+      </g>
+      <rect x="11" y="18" width="38" height="31" rx="6.5" fill="#0f1722" fillOpacity="0.82" />
+      <rect x="11" y="18" width="38" height="31" rx="6.5" fill="url(#gp-front)" stroke="#34d399" strokeOpacity="0.65" strokeWidth="1.5" />
+      <path d="M17 29.5 L21.5 33 L17 36.5" stroke="#34d399" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round" />
+      <rect x="25" y="29" width="18" height="3" rx="1.5" fill="#10b981" />
+      <rect x="25" y="34" width="13" height="2.8" rx="1.4" fill="#e2e8f0" />
+      <rect x="17" y="40.5" width="22" height="2.4" rx="1.2" fill="#94a3b8" fillOpacity="0.55" />
+    </svg>
+  );
+}
+
 export default function App() {
   const params = new URLSearchParams(window.location.search);
 
   const [roomId, setRoomId] = useState(() => params.get('room') || '');
   const [token, setToken] = useState(() => params.get('token') || '');
+  const [wsBase, setWsBase] = useState(() => params.get('ws') || '');
   const [userName, setUserName] = useState(
     () => params.get('user') || (isClientApp ? 'Client' : 'Mentor')
   );
 
-  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃
+  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）
   const [opacity, setOpacity] = useState(() => Number(localStorage.getItem('pad_opacity')) || 0.78);
   const [supportsFrost, setSupportsFrost] = useState(false);
-  const [frostedGlass, setFrostedGlass] = useState(() => localStorage.getItem('pad_frost') !== 'false');
+  const [frostedGlass, setFrostedGlass] = useState(() => localStorage.getItem('pad_frost_v2') === 'true');
 
   const [text, setText] = useState('');
   const [language, setLanguage] = useState('python');
   const [wsConnected, setWsConnected] = useState(false);
   const [authFail, setAuthFail] = useState(false);
+  const [destroyedMsg, setDestroyedMsg] = useState('');
   const [participants, setParticipants] = useState([]);
 
   const wsRef = useRef(null);
@@ -72,7 +110,7 @@ export default function App() {
 
   const toggleFrostedGlass = (enabled) => {
     setFrostedGlass(enabled);
-    localStorage.setItem('pad_frost', String(enabled));
+    localStorage.setItem('pad_frost_v2', String(enabled));
     window.electronAPI?.setFrostedGlass?.(enabled);
   };
 
@@ -80,12 +118,16 @@ export default function App() {
   useEffect(() => {
     if (!token) return;
     setAuthFail(false);
+    setDestroyedMsg('');
 
     // 房间参数留在地址栏，⌘R 刷新后仍在同一房间
-    window.history.replaceState({}, '', `${window.location.pathname}?room=${encodeURIComponent(roomId)}&token=${encodeURIComponent(token)}&user=${encodeURIComponent(userName)}`);
+    const extraWs = wsBase ? `&ws=${encodeURIComponent(wsBase)}` : '';
+    window.history.replaceState({}, '', `${window.location.pathname}?room=${encodeURIComponent(roomId)}&token=${encodeURIComponent(token)}&user=${encodeURIComponent(userName)}${extraWs}`);
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = import.meta.env.VITE_WS_URL || `${protocol}//${window.location.host}`;
+    const defaultWsUrl = window.location.protocol === 'file:'
+      ? 'wss://codex-clone-production.up.railway.app'
+      : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
+    const wsUrl = wsBase || import.meta.env.VITE_WS_URL || defaultWsUrl;
 
     let ws;
     let reconnectTimer;
@@ -102,6 +144,9 @@ export default function App() {
         const { type, payload } = JSON.parse(e.data);
         if (type === 'AUTH_FAIL') {
           setAuthFail(true);
+        } else if (type === 'ROOM_DESTROYED') {
+          setDestroyedMsg(payload?.reason || '该房间已被管理员销毁');
+          setParticipants([]);
         } else if (type === 'INIT' || type === 'TEXT_SYNC') {
           const clean = normalizeLF(payload.text);
           // 先增量写入编辑器（保留选区），再同步 React 状态
@@ -121,8 +166,8 @@ export default function App() {
 
       ws.onclose = (ev) => {
         setWsConnected(false);
-        // 4001 = 凭证无效，重连也没用
-        if (!closed && ev.code !== 4001) reconnectTimer = setTimeout(connect, 1500);
+        // 4001 = 凭证无效 / 4002 = 房间已销毁，均不再重连
+        if (!closed && ev.code !== 4001 && ev.code !== 4002) reconnectTimer = setTimeout(connect, 1500);
       };
     };
 
@@ -140,7 +185,7 @@ export default function App() {
       clearTimeout(reconnectTimer);
       ws?.close();
     };
-  }, [roomId, token, userName]);
+  }, [roomId, token, userName, wsBase]);
 
   // 客户端提词：导师打字超过一屏时自动滚到最新一行
   const scrollToBottom = () => {
@@ -219,10 +264,11 @@ export default function App() {
   if (!token) {
     return (
       <JoinGate
-        onJoin={(room, tok, user) => {
+        onJoin={(room, tok, user, wsOrigin) => {
           setRoomId(room);
           setToken(tok);
           if (user) setUserName(user);
+          if (wsOrigin) setWsBase(wsOrigin);
         }}
       />
     );
@@ -238,26 +284,43 @@ export default function App() {
       background: `rgba(13, 13, 13, ${bgAlpha})`,
       backdropFilter: frost ? 'blur(14px)' : 'none',
       WebkitBackdropFilter: frost ? 'blur(14px)' : 'none',
-      color: '#e5e5e5', fontFamily: 'monospace',
+      color: '#e5e5e5', fontFamily: uiFont,
       border: '1px solid rgba(255, 255, 255, 0.12)',
       borderRadius: '8px', overflow: 'hidden',
     }}>
-      {/* 顶部栏 */}
+      {/* 顶部栏（桌面端整条可按住拖拽移动窗口，右侧控件除外） */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: '10px',
         padding: '8px 14px', background: barBg,
         borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
-        fontSize: '12px', color: '#9ca3af',
+        fontSize: '12.5px', color: '#d1d5db',
+        WebkitAppRegion: isClientApp ? 'drag' : 'no-drag',
+        cursor: isClientApp ? 'grab' : 'default',
       }}>
         {isClientApp ? (
           <>
-            {/* 快捷键用法提示（不用鼠标拖拽：会激活应用触发切屏检测） */}
-            <span style={{ userSelect: 'none', color: '#777', fontSize: '11px', whiteSpace: 'nowrap' }}>
-              ⌘+方向键 移动 · ⌘B 隐藏/显示 · ⌘[ ⌘] 透明度 · ⌘R 刷新 · ⌘Q 退出
-            </span>
+            {/* 品牌标识 + 拖拽手柄 + 清晰快捷键提示 */}
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: '8px',
+              userSelect: 'none', color: '#cbd5e1', fontSize: '12px', fontWeight: 500,
+              whiteSpace: 'nowrap', letterSpacing: '0.2px',
+            }} title="按住顶部栏任意空白处可拖动窗口">
+              <BrandLogo size={18} />
+              <span style={{ color: '#f1f5f9', fontWeight: 600, marginRight: '2px' }}>GlassPad</span>
+              <span style={{ color: '#475569' }}>|</span>
+              <span>
+                拖拽移动 · {modKey}方向键 移动 · {modKey}B 隐藏/显示 · {modKey}[ {modKey}] 透明度 · {modKey}R 刷新 · {modKey}Q 退出
+              </span>
+            </div>
 
-            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '6px' }} title="⌘[ / ⌘] 调节">
+            {/* 中间弹性拖拽区 */}
+            <div style={{ flex: 1, minWidth: '20px', alignSelf: 'stretch' }} />
+
+            <div style={{
+              marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '12px',
+              WebkitAppRegion: 'no-drag', cursor: 'default',
+            }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#e2e8f0', fontWeight: 500 }} title={`${modKey}[ / ${modKey}] 调节`}>
                 Opacity {Math.round(opacity * 100)}%
                 <input
                   type="range" min="0.08" max="1" step="0.04" value={opacity}
@@ -266,7 +329,7 @@ export default function App() {
                 />
               </label>
               {supportsFrost && (
-                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', color: frostedGlass ? '#10b981' : '#888' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontWeight: 500, color: frostedGlass ? '#10b981' : '#cbd5e1' }}>
                   <input
                     type="checkbox" checked={frostedGlass}
                     onChange={(e) => toggleFrostedGlass(e.target.checked)}
@@ -279,6 +342,10 @@ export default function App() {
           </>
         ) : (
           <>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginRight: '6px' }}>
+              <BrandLogo size={20} />
+              <span style={{ color: '#f1f5f9', fontWeight: 600, fontSize: '13px' }}>GlassPad</span>
+            </div>
             <button onClick={clearPad} style={btn}>Clear</button>
             <select
               value={language}
@@ -350,6 +417,7 @@ export default function App() {
           }}
           options={{
             readOnly: isClientApp,
+            fontFamily: codeFont,
             fontSize: 15,
             lineHeight: 24,
             wordWrap: 'on',
@@ -362,11 +430,13 @@ export default function App() {
         />
       </div>
 
-      {/* 底部栏：连接状态 + 在线成员 */}
+      {/* 底部栏：连接状态 + 在线成员（桌面端同样支持按住拖拽） */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: '12px',
         padding: '8px 16px', background: barBg,
         borderTop: '1px solid rgba(255, 255, 255, 0.08)', fontSize: '13px',
+        WebkitAppRegion: isClientApp ? 'drag' : 'no-drag',
+        cursor: isClientApp ? 'grab' : 'default',
       }}>
         <div style={{
           display: 'flex', alignItems: 'center', gap: '6px',
@@ -377,6 +447,7 @@ export default function App() {
         </div>
 
         {authFail && <span style={{ color: '#ef4444', fontSize: '12px' }}>房间凭证无效</span>}
+        {destroyedMsg && <span style={{ color: '#ef4444', fontSize: '12px' }}>{destroyedMsg}</span>}
 
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
           {participants.map((p, idx) => (
@@ -391,7 +462,7 @@ export default function App() {
   );
 }
 
-// 解析邀请链接：提取 room / token / user
+// 解析邀请链接：提取 room / token / user / wsOrigin
 function parseLink(raw) {
   const s = (raw || '').trim();
   if (!s) return null;
@@ -399,10 +470,13 @@ function parseLink(raw) {
     const u = new URL(s);
     const room = u.searchParams.get('room');
     const token = u.searchParams.get('token');
-    if (room && token) return { room, token, user: u.searchParams.get('user') };
+    const wsOrigin = (u.protocol === 'http:' || u.protocol === 'https:')
+      ? `${u.protocol === 'https:' ? 'wss:' : 'ws:'}//${u.host}`
+      : '';
+    if (room && token) return { room, token, user: u.searchParams.get('user'), wsOrigin };
   } catch {
     const m = s.match(/room=([^&\s]+).*token=([^&\s]+)/);
-    if (m) return { room: m[1], token: m[2], user: null };
+    if (m) return { room: m[1], token: m[2], user: null, wsOrigin: '' };
   }
   return null;
 }
@@ -418,13 +492,13 @@ function JoinGate({ onJoin }) {
       setError('链接无效，请粘贴完整的邀请链接');
       return;
     }
-    onJoin(parsed.room, parsed.token, parsed.user || 'Client');
+    onJoin(parsed.room, parsed.token, parsed.user || 'Client', parsed.wsOrigin);
   };
 
   const pasteFromClipboard = async () => {
     try {
       const value = window.electronAPI?.readClipboardText
-        ? window.electronAPI.readClipboardText()
+        ? await window.electronAPI.readClipboardText()
         : await navigator.clipboard.readText();
       setInput(value);
       tryJoin(value);
@@ -437,24 +511,40 @@ function JoinGate({ onJoin }) {
     <div style={{
       height: '100vh', display: 'flex', flexDirection: 'column',
       alignItems: 'center', justifyContent: 'center', gap: '14px',
-      background: '#0d0d0d', color: '#e5e5e5', fontFamily: 'monospace', padding: '20px',
+      background: '#0d0d0d', color: '#e5e5e5', fontFamily: uiFont, padding: '20px',
+      WebkitAppRegion: isClientApp ? 'drag' : 'no-drag',
     }}>
-      <div style={{ fontSize: '18px', fontWeight: 600 }}>加入面试房间</div>
-      <div style={{ color: '#888', fontSize: '13px' }}>复制导师发的邀请链接，点「从剪贴板粘贴」即可加入</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '2px' }}>
+        <BrandLogo size={38} />
+        <div>
+          <div style={{ fontSize: '20px', fontWeight: 700, letterSpacing: '0.3px', color: '#f8fafc' }}>GlassPad</div>
+          <div style={{ fontSize: '12px', color: '#10b981', fontWeight: 500 }}>加入实时提词房间</div>
+        </div>
+      </div>
+      <div style={{ color: '#9ca3af', fontSize: '13px' }}>复制导师发的邀请链接，点「从剪贴板粘贴」即可加入</div>
 
       <input
         value={input}
         onChange={(e) => { setInput(e.target.value); setError(''); }}
+        onPaste={(e) => {
+          const pasted = e.clipboardData?.getData('text');
+          if (pasted) {
+            e.preventDefault();
+            setInput(pasted);
+            setError('');
+            tryJoin(pasted);
+          }
+        }}
         onKeyDown={(e) => { if (e.key === 'Enter') tryJoin(input); }}
         placeholder="https://.../?room=xxxx&token=xxxx"
         style={{
           width: '100%', maxWidth: 420, background: '#1f1f1f', border: '1px solid #333',
           borderRadius: '8px', color: '#e5e5e5', padding: '12px 14px', fontSize: '13px',
-          outline: 'none', fontFamily: 'monospace',
+          outline: 'none', fontFamily: codeFont, WebkitAppRegion: 'no-drag',
         }}
       />
 
-      <div style={{ display: 'flex', gap: '10px' }}>
+      <div style={{ display: 'flex', gap: '10px', WebkitAppRegion: 'no-drag' }}>
         <button
           onClick={pasteFromClipboard}
           style={{
