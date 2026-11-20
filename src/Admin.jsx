@@ -26,6 +26,69 @@ export default function Admin() {
   const [created, setCreated] = useState(null); // 最近新创建的房间
   const [copiedTag, setCopiedTag] = useState(''); // 例如 "new-client" | "<roomId>-client" | "<roomId>-mentor"
 
+  // 客户端版本更新发布管理
+  const [releaseForm, setReleaseForm] = useState({
+    version: '1.0.0',
+    macUrl: '',
+    winUrl: '',
+    notes: '',
+    forceUpdate: false,
+  });
+  const [savingRelease, setSavingRelease] = useState(false);
+  const [releaseSavedMsg, setReleaseSavedMsg] = useState('');
+  const [showReleasePanel, setShowReleasePanel] = useState(false);
+
+  const fetchReleaseInfo = useCallback(async () => {
+    try {
+      const res = await fetch('/api/version');
+      if (!res.ok) return;
+      const data = await res.json();
+      setReleaseForm({
+        version: data.version || '1.0.0',
+        macUrl: data.macUrl || '',
+        winUrl: data.winUrl || '',
+        notes: data.notes || '',
+        forceUpdate: Boolean(data.forceUpdate),
+      });
+    } catch {}
+  }, []);
+
+  const saveReleaseInfo = async () => {
+    const k = key.trim();
+    if (!k) { setError('请先输入管理员密钥'); return; }
+    setSavingRelease(true);
+    setReleaseSavedMsg('');
+    setError('');
+    try {
+      const res = await fetch('/api/version', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-key': k,
+        },
+        body: JSON.stringify({ key: k, ...releaseForm }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || '版本配置保存失败');
+        return;
+      }
+      setReleaseForm({
+        version: data.version || '1.0.0',
+        macUrl: data.macUrl || '',
+        winUrl: data.winUrl || '',
+        notes: data.notes || '',
+        forceUpdate: Boolean(data.forceUpdate),
+      });
+      setReleaseSavedMsg(`已发布 v${data.version}`);
+      setTimeout(() => setReleaseSavedMsg(''), 3000);
+    } catch (e) {
+      setError('保存版本配置失败：' + e.message);
+    } finally {
+      setSavingRelease(false);
+    }
+  };
+
   // 邀请链接：客户点开即进，带 room + token + user=Client
   const buildLink = (roomId, token, user) =>
     `${window.location.origin}/?room=${roomId}&token=${token}&user=${user}`;
@@ -59,6 +122,7 @@ export default function Admin() {
   useEffect(() => {
     const saved = localStorage.getItem('admin_key');
     if (saved) fetchRooms(saved);
+    fetchReleaseInfo();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -255,7 +319,112 @@ export default function Admin() {
             >
               {loading ? '刷新中…' : '刷新列表'}
             </button>
+            <button
+              onClick={() => {
+                const next = !showReleasePanel;
+                setShowReleasePanel(next);
+                if (next) fetchReleaseInfo();
+              }}
+              style={{
+                background: showReleasePanel ? 'rgba(56, 189, 248, 0.16)' : '#1e2636',
+                color: showReleasePanel ? '#38bdf8' : '#cbd5e1',
+                border: `1px solid ${showReleasePanel ? 'rgba(56, 189, 248, 0.45)' : '#334155'}`,
+                borderRadius: '7px', padding: '10px 14px', fontSize: '13px', fontWeight: 500,
+                cursor: 'pointer', whiteSpace: 'nowrap',
+              }}
+            >
+              客户端版本发布 (v{releaseForm.version || '1.0.0'})
+            </button>
           </div>
+
+          {showReleasePanel && (
+            <div style={{
+              marginTop: '14px', padding: '14px', background: '#0b0e13',
+              border: '1px solid #2b3445', borderRadius: '8px',
+              display: 'flex', flexDirection: 'column', gap: '10px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+                <span style={{ fontSize: '13px', fontWeight: 600, color: '#38bdf8' }}>
+                  GlassPad Win / Mac 客户端版本与更新源配置（/api/version）
+                </span>
+                {releaseSavedMsg && (
+                  <span style={{ fontSize: '12.5px', color: '#34d399', fontWeight: 600 }}>
+                    ✓ {releaseSavedMsg}
+                  </span>
+                )}
+              </div>
+
+              <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                <input
+                  type="text"
+                  value={releaseForm.version}
+                  onChange={(e) => setReleaseForm((p) => ({ ...p, version: e.target.value }))}
+                  placeholder="最新版本号（如 1.0.1）"
+                  style={{
+                    width: '150px', background: '#121721', border: '1px solid #2b3445',
+                    borderRadius: '6px', color: '#f1f5f9', padding: '8px 10px',
+                    fontSize: '12.5px', fontFamily: codeFont, outline: 'none',
+                  }}
+                />
+                <input
+                  type="text"
+                  value={releaseForm.macUrl}
+                  onChange={(e) => setReleaseForm((p) => ({ ...p, macUrl: e.target.value }))}
+                  placeholder="macOS 安装包下载链接 (.dmg URL)"
+                  style={{
+                    flex: '1 1 240px', background: '#121721', border: '1px solid #2b3445',
+                    borderRadius: '6px', color: '#f1f5f9', padding: '8px 10px',
+                    fontSize: '12.5px', fontFamily: codeFont, outline: 'none',
+                  }}
+                />
+                <input
+                  type="text"
+                  value={releaseForm.winUrl}
+                  onChange={(e) => setReleaseForm((p) => ({ ...p, winUrl: e.target.value }))}
+                  placeholder="Windows 安装包下载链接 (.exe URL)"
+                  style={{
+                    flex: '1 1 240px', background: '#121721', border: '1px solid #2b3445',
+                    borderRadius: '6px', color: '#f1f5f9', padding: '8px 10px',
+                    fontSize: '12.5px', fontFamily: codeFont, outline: 'none',
+                  }}
+                />
+              </div>
+
+              <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
+                <input
+                  type="text"
+                  value={releaseForm.notes}
+                  onChange={(e) => setReleaseForm((p) => ({ ...p, notes: e.target.value }))}
+                  placeholder="更新说明（可选，如：新增自动更新检查与屏幕共享优化）"
+                  style={{
+                    flex: '1 1 300px', background: '#121721', border: '1px solid #2b3445',
+                    borderRadius: '6px', color: '#f1f5f9', padding: '8px 10px',
+                    fontSize: '12.5px', outline: 'none',
+                  }}
+                />
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12.5px', color: '#cbd5e1', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={releaseForm.forceUpdate}
+                    onChange={(e) => setReleaseForm((p) => ({ ...p, forceUpdate: e.target.checked }))}
+                    style={{ accentColor: '#10b981', cursor: 'pointer' }}
+                  />
+                  强制更新提示
+                </label>
+                <button
+                  onClick={saveReleaseInfo}
+                  disabled={savingRelease}
+                  style={{
+                    background: '#38bdf8', color: '#082f49', border: 'none',
+                    borderRadius: '6px', padding: '8px 16px', fontSize: '12.5px',
+                    fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap',
+                  }}
+                >
+                  {savingRelease ? '保存中…' : '保存并发布版本'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {error && (
             <div style={{

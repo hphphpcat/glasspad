@@ -13,6 +13,85 @@ const RTC_ICE_SERVERS = [
 
 const normalizeLF = (s) => (s || '').replace(/\r\n/g, '\n');
 
+const DEFAULT_SERVER_HTTP = 'https://glasspad.up.railway.app';
+
+// 语义化版本对比（纯前端兜底，当 electronAPI.checkForUpdates 不可用时使用）
+function compareSemverClient(remoteVer, localVer) {
+  const clean = (v) => String(v || '').trim().replace(/^v/i, '').split('-')[0];
+  const rParts = clean(remoteVer).split('.').map((n) => parseInt(n, 10) || 0);
+  const lParts = clean(localVer).split('.').map((n) => parseInt(n, 10) || 0);
+  const len = Math.max(rParts.length, lParts.length, 3);
+  for (let i = 0; i < len; i++) {
+    const r = rParts[i] || 0;
+    const l = lParts[i] || 0;
+    if (r > l) return 1;
+    if (r < l) return -1;
+  }
+  return 0;
+}
+
+// 统一的客户端更新检测函数：优先走 Electron 主进程 IPC，支持传入当前房间的 wsBase 或自定义 JSON 地址
+async function performUpdateCheck(customBase) {
+  const savedEndpoint = localStorage.getItem('pad_update_endpoint') || '';
+  const targetBase = (customBase || savedEndpoint || '').trim();
+  if (window.electronAPI?.checkForUpdates) {
+    return window.electronAPI.checkForUpdates(targetBase);
+  }
+  // 浏览器环境或旧版 preload 兜底直接 fetch /api/version
+  const currentVersion = '1.0.0';
+  let checkUrl = `${DEFAULT_SERVER_HTTP}/api/version`;
+  if (targetBase) {
+    try {
+      const u = new URL(targetBase);
+      if (u.protocol === 'ws:') u.protocol = 'http:';
+      if (u.protocol === 'wss:') u.protocol = 'https:';
+      if (!u.pathname || u.pathname === '/') u.pathname = '/api/version';
+      checkUrl = u.toString();
+    } catch {}
+  } else if (window.location.protocol.startsWith('http')) {
+    checkUrl = `${window.location.origin}/api/version`;
+  }
+  try {
+    const res = await fetch(checkUrl, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const latestVersion = String(data.version || currentVersion).trim().replace(/^v/i, '');
+    const hasUpdate = compareSemverClient(latestVersion, currentVersion) > 0;
+    const downloadUrl = isWindows
+      ? (data.winUrl || data.downloadUrl || '')
+      : (data.macUrl || data.downloadUrl || '');
+    return {
+      ok: true,
+      hasUpdate,
+      currentVersion,
+      latestVersion,
+      downloadUrl,
+      macUrl: data.macUrl || '',
+      winUrl: data.winUrl || '',
+      notes: data.notes || '',
+      forceUpdate: Boolean(data.forceUpdate),
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      hasUpdate: false,
+      currentVersion,
+      latestVersion: currentVersion,
+      error: e.message || '检查更新失败',
+    };
+  }
+}
+
+function openDownloadUrl(url) {
+  const s = String(url || '').trim();
+  if (!s) return;
+  if (window.electronAPI?.openExternalUrl) {
+    window.electronAPI.openExternalUrl(s);
+  } else {
+    window.open(s, '_blank', 'noopener,noreferrer');
+  }
+}
+
 const btn = {
   background: 'rgba(31, 31, 31, 0.7)', color: '#9ca3af', border: '1px solid #333',
   borderRadius: '6px', padding: '4px 10px', fontSize: '12px', cursor: 'pointer',
@@ -82,6 +161,13 @@ export default function App() {
   const [viewerConnected, setViewerConnected] = useState(false);
   const [viewerMuted, setViewerMuted] = useState(false);
 
+  // ── 客户端版本与检查更新状态 ──
+  const [appVersion, setAppVersion] = useState('1.0.0');
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState(null); // { ok, hasUpdate, currentVersion, latestVersion, downloadUrl, notes, forceUpdate, error }
+  const [showUpdateModal, setShowUpdateModal] = useState(false);
+  const [updateBannerText, setUpdateBannerText] = useState('');
+
   const wsRef = useRef(null);
   const myClientIdRef = useRef('');
   const editorRef = useRef(null);
@@ -95,7 +181,7 @@ export default function App() {
   const viewerPcRef = useRef(null); // { pc, sharerId, pendingIce: [], stream: MediaStream }
   const remoteVideoRef = useRef(null);
 
-  // 桌面端：检测系统是否支持毛玻璃
+  // 桌面端：检测系统是否支持毛玻璃 + 启动时获取版本号并静默检查更新
   useEffect(() => {
     const api = window.electronAPI;
     if (!api) return;
@@ -104,8 +190,42 @@ export default function App() {
       setSupportsFrost(ok);
       api.setFrostedGlass(ok && frostedGlass);
     });
+    api.getAppVersion?.().then((info) => {
+      if (info?.version) setAppVersion(info.version);
+    });
+    // 启动后自动静默检测一次更新（若有新版本则在顶栏高亮提示或弹出更新卡片）
+    performUpdateCheck(wsBase).then((res) => {
+      if (res?.currentVersion) setAppVersion(res.currentVersion);
+      if (res?.ok && res.hasUpdate) {
+        setUpdateInfo(res);
+        if (res.forceUpdate) setShowUpdateModal(true);
+      }
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 手动点击「检查更新」
+  const handleManualCheckUpdate = async () => {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    setUpdateBannerText('');
+    try {
+      const res = await performUpdateCheck(wsBase);
+      if (res?.currentVersion) setAppVersion(res.currentVersion);
+      setUpdateInfo(res);
+      if (!res?.ok) {
+        setUpdateBannerText(`检查失败: ${res?.error || '网络不可达'}`);
+        setTimeout(() => setUpdateBannerText(''), 3500);
+      } else if (res.hasUpdate) {
+        setShowUpdateModal(true);
+      } else {
+        setUpdateBannerText(`当前已是最新版本 (v${res.currentVersion})`);
+        setTimeout(() => setUpdateBannerText(''), 3000);
+      }
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
 
   // 桌面端：透明度记忆 + ⌘[ / ⌘] 调节
   useEffect(() => {
@@ -483,7 +603,7 @@ export default function App() {
     window.history.replaceState({}, '', `${window.location.pathname}?room=${encodeURIComponent(roomId)}&token=${encodeURIComponent(token)}&user=${encodeURIComponent(userName)}${extraWs}`);
 
     const defaultWsUrl = window.location.protocol === 'file:'
-      ? 'wss://codex-clone-production.up.railway.app'
+      ? 'wss://glasspad.up.railway.app'
       : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
     const wsUrl = wsBase || import.meta.env.VITE_WS_URL || defaultWsUrl;
 
@@ -649,14 +769,28 @@ export default function App() {
   // 无 token：显示「粘贴邀请链接」入口
   if (!token) {
     return (
-      <JoinGate
-        onJoin={(room, tok, user, wsOrigin) => {
-          setRoomId(room);
-          setToken(tok);
-          if (user) setUserName(user);
-          if (wsOrigin) setWsBase(wsOrigin);
-        }}
-      />
+      <>
+        <JoinGate
+          appVersion={appVersion}
+          updateInfo={updateInfo}
+          checkingUpdate={checkingUpdate}
+          updateBannerText={updateBannerText}
+          onCheckUpdate={handleManualCheckUpdate}
+          onOpenUpdateModal={() => setShowUpdateModal(true)}
+          onJoin={(room, tok, user, wsOrigin) => {
+            setRoomId(room);
+            setToken(tok);
+            if (user) setUserName(user);
+            if (wsOrigin) setWsBase(wsOrigin);
+          }}
+        />
+        {showUpdateModal && updateInfo && (
+          <UpdateModal
+            updateInfo={updateInfo}
+            onClose={() => setShowUpdateModal(false)}
+          />
+        )}
+      </>
     );
   }
 
@@ -693,6 +827,7 @@ export default function App() {
             }} title="按住顶部栏任意空白处可拖动窗口">
               <BrandLogo size={18} />
               <span style={{ color: '#f1f5f9', fontWeight: 600, marginRight: '2px' }}>GlassPad</span>
+              <span style={{ color: '#64748b', fontSize: '11px', fontFamily: codeFont }}>v{appVersion}</span>
               <span style={{ color: '#475569' }}>|</span>
               <span>
                 拖拽移动 · {modKey}方向键 移动 · {modKey}B 隐藏/显示 · {modKey}[ {modKey}] 透明度 · {modKey}R 刷新 · {modKey}Q 退出
@@ -706,6 +841,35 @@ export default function App() {
               marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '10px',
               WebkitAppRegion: 'no-drag', cursor: 'default',
             }}>
+              {updateBannerText && (
+                <span style={{ color: '#34d399', fontSize: '11.5px', whiteSpace: 'nowrap' }}>
+                  {updateBannerText}
+                </span>
+              )}
+
+              {/* 检查更新按钮（有新版本时高亮提示） */}
+              <button
+                onClick={() => (updateInfo?.hasUpdate ? setShowUpdateModal(true) : handleManualCheckUpdate())}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: '5px',
+                  background: updateInfo?.hasUpdate ? 'rgba(56, 189, 248, 0.2)' : 'rgba(31, 41, 55, 0.75)',
+                  color: updateInfo?.hasUpdate ? '#38bdf8' : '#cbd5e1',
+                  border: `1px solid ${updateInfo?.hasUpdate ? 'rgba(56, 189, 248, 0.5)' : '#374151'}`,
+                  borderRadius: '6px', padding: '4px 9px', fontSize: '11.5px', fontWeight: 600,
+                  cursor: 'pointer', whiteSpace: 'nowrap',
+                }}
+                title={updateInfo?.hasUpdate ? `发现新版本 v${updateInfo.latestVersion}，点击查看并下载` : '点击检查是否有新版本'}
+              >
+                {updateInfo?.hasUpdate && (
+                  <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#38bdf8' }} />
+                )}
+                {checkingUpdate
+                  ? '检查中…'
+                  : updateInfo?.hasUpdate
+                    ? `新版本 v${updateInfo.latestVersion}`
+                    : '检查更新'}
+              </button>
+
               {shareError && (
                 <span
                   onClick={() => window.electronAPI?.openPrivacySettings?.('screen')}
@@ -1007,6 +1171,112 @@ export default function App() {
           ))}
         </div>
       </div>
+
+      {/* 客户端版本更新详情与下载弹窗 */}
+      {showUpdateModal && updateInfo && (
+        <UpdateModal
+          updateInfo={updateInfo}
+          onClose={() => setShowUpdateModal(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── 更新详情弹窗：展示最新版本号、更新日志与 Win/Mac 一键下载 ──
+function UpdateModal({ updateInfo, onClose }) {
+  const platformLabel = isWindows ? 'Windows (.exe)' : 'macOS (.dmg)';
+  const primaryUrl = updateInfo.downloadUrl || (isWindows ? updateInfo.winUrl : updateInfo.macUrl) || '';
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, zIndex: 9999,
+        background: 'rgba(0, 0, 0, 0.65)', backdropFilter: 'blur(6px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: '20px', fontFamily: uiFont, WebkitAppRegion: 'no-drag',
+      }}
+      onClick={() => { if (!updateInfo.forceUpdate) onClose(); }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: '100%', maxWidth: '420px', background: '#121721',
+          border: '1px solid rgba(56, 189, 248, 0.4)', borderRadius: '12px',
+          padding: '20px', color: '#e2e8f0', boxShadow: '0 20px 50px rgba(0,0,0,0.6)',
+          display: 'flex', flexDirection: 'column', gap: '14px',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <BrandLogo size={28} />
+            <div>
+              <div style={{ fontSize: '15px', fontWeight: 700, color: '#f8fafc' }}>
+                发现 GlassPad 新版本 v{updateInfo.latestVersion}
+              </div>
+              <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '2px' }}>
+                当前版本 v{updateInfo.currentVersion} → 最新版本 v{updateInfo.latestVersion}
+              </div>
+            </div>
+          </div>
+          {!updateInfo.forceUpdate && (
+            <button
+              onClick={onClose}
+              style={{
+                background: 'transparent', border: 'none', color: '#64748b',
+                fontSize: '16px', cursor: 'pointer', padding: '4px',
+              }}
+            >
+              ✕
+            </button>
+          )}
+        </div>
+
+        {updateInfo.notes ? (
+          <div style={{
+            background: '#0b0e13', border: '1px solid #2b3445', borderRadius: '8px',
+            padding: '10px 12px', fontSize: '12.5px', color: '#cbd5e1',
+            lineHeight: 1.6, whiteSpace: 'pre-wrap', maxHeight: '150px', overflowY: 'auto',
+          }}>
+            {updateInfo.notes}
+          </div>
+        ) : (
+          <div style={{ fontSize: '12.5px', color: '#94a3b8' }}>
+            包含性能优化、防截屏稳定性提升与最新功能更新，建议立即升级。
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', flexWrap: 'wrap', marginTop: '4px' }}>
+          {!updateInfo.forceUpdate && (
+            <button
+              onClick={onClose}
+              style={{
+                background: '#1e2636', color: '#cbd5e1', border: '1px solid #334155',
+                borderRadius: '7px', padding: '8px 14px', fontSize: '12.5px', cursor: 'pointer',
+              }}
+            >
+              稍后提醒
+            </button>
+          )}
+
+          {primaryUrl ? (
+            <button
+              onClick={() => openDownloadUrl(primaryUrl)}
+              style={{
+                background: '#10b981', color: '#032219', border: 'none',
+                borderRadius: '7px', padding: '8px 16px', fontSize: '13px',
+                fontWeight: 700, cursor: 'pointer',
+              }}
+            >
+              立即下载 {platformLabel} ↗
+            </button>
+          ) : (
+            <span style={{ fontSize: '12px', color: '#f59e0b', alignSelf: 'center' }}>
+              管理员暂未配置当前平台下载链接
+            </span>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1031,7 +1301,15 @@ function parseLink(raw) {
 }
 
 // ── 加入入口：客户粘贴导师发的邀请链接 ──
-function JoinGate({ onJoin }) {
+function JoinGate({
+  onJoin,
+  appVersion,
+  updateInfo,
+  checkingUpdate,
+  updateBannerText,
+  onCheckUpdate,
+  onOpenUpdateModal,
+}) {
   const [input, setInput] = useState('');
   const [error, setError] = useState('');
 
@@ -1061,8 +1339,45 @@ function JoinGate({ onJoin }) {
       height: '100vh', display: 'flex', flexDirection: 'column',
       alignItems: 'center', justifyContent: 'center', gap: '14px',
       background: '#0d0d0d', color: '#e5e5e5', fontFamily: uiFont, padding: '20px',
+      position: 'relative',
       WebkitAppRegion: isClientApp ? 'drag' : 'no-drag',
     }}>
+      {/* 右上角：当前版本与检查更新入口 */}
+      {isClientApp && (
+        <div style={{
+          position: 'absolute', top: '14px', right: '18px',
+          display: 'flex', alignItems: 'center', gap: '10px',
+          WebkitAppRegion: 'no-drag',
+        }}>
+          {updateBannerText && (
+            <span style={{ color: '#34d399', fontSize: '12px' }}>{updateBannerText}</span>
+          )}
+          <span style={{ color: '#64748b', fontSize: '12px', fontFamily: codeFont }}>
+            v{appVersion || '1.0.0'}
+          </span>
+          <button
+            onClick={() => (updateInfo?.hasUpdate ? onOpenUpdateModal?.() : onCheckUpdate?.())}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: '6px',
+              background: updateInfo?.hasUpdate ? 'rgba(56, 189, 248, 0.18)' : '#1a1a1a',
+              color: updateInfo?.hasUpdate ? '#38bdf8' : '#cbd5e1',
+              border: `1px solid ${updateInfo?.hasUpdate ? 'rgba(56, 189, 248, 0.5)' : '#333'}`,
+              borderRadius: '6px', padding: '5px 11px', fontSize: '12px', fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            {updateInfo?.hasUpdate && (
+              <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#38bdf8' }} />
+            )}
+            {checkingUpdate
+              ? '检查中…'
+              : updateInfo?.hasUpdate
+                ? `发现新版本 v${updateInfo.latestVersion}`
+                : '检查更新'}
+          </button>
+        </div>
+      )}
+
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '2px' }}>
         <BrandLogo size={38} />
         <div>

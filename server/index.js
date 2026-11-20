@@ -29,9 +29,50 @@ const MIME = {
 const rooms = new Map();
 const COLORS = ['#00bcd4', '#3b82f6', '#10b981', '#f59e0b', '#ec4899'];
 
-// 持久化：房间数据写磁盘，Railway 重启/多副本也不丢 token
+// 持久化：房间数据与客户端版本信息写磁盘，Railway 重启/多副本也不丢
 const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
+const VERSION_FILE = path.join(DATA_DIR, 'version.json');
+
+let pkgVersion = '1.0.0';
+try {
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.0';
+} catch {}
+
+let appRelease = {
+  version: process.env.LATEST_APP_VERSION || pkgVersion,
+  macUrl: process.env.MAC_DOWNLOAD_URL || '',
+  winUrl: process.env.WIN_DOWNLOAD_URL || '',
+  notes: process.env.RELEASE_NOTES || '',
+  forceUpdate: process.env.FORCE_UPDATE === 'true',
+  updatedAt: Date.now(),
+};
+
+function persistRelease() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(VERSION_FILE, JSON.stringify(appRelease, null, 2));
+  } catch (e) {
+    console.error('版本配置持久化失败：', e.message);
+  }
+}
+
+function loadRelease() {
+  try {
+    if (!fs.existsSync(VERSION_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(VERSION_FILE, 'utf8'));
+    appRelease = {
+      version: String(saved.version || appRelease.version).trim(),
+      macUrl: String(saved.macUrl ?? appRelease.macUrl).trim(),
+      winUrl: String(saved.winUrl ?? appRelease.winUrl).trim(),
+      notes: String(saved.notes ?? appRelease.notes).trim(),
+      forceUpdate: Boolean(saved.forceUpdate ?? appRelease.forceUpdate),
+      updatedAt: saved.updatedAt || Date.now(),
+    };
+  } catch (e) {
+    console.error('版本配置加载失败：', e.message);
+  }
+}
 
 function persistRooms() {
   try {
@@ -141,7 +182,12 @@ function checkAdminKey(req, url, body) {
 }
 
 function sendJSON(res, status, obj) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, x-admin-key',
+  });
   res.end(JSON.stringify(obj));
 }
 
@@ -156,9 +202,50 @@ function readBody(req) {
   });
 }
 
-// ── HTTP：静态文件 + 管理员房间管理 API ──
+// ── HTTP：静态文件 + 管理员房间管理 API + 客户端版本检测 API ──
 const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, x-admin-key',
+    });
+    res.end();
+    return;
+  }
+
+  // 0a. 客户端查询最新版本信息：GET /api/version（公开接口，供 Win/Mac 客户端检查更新）
+  if (req.method === 'GET' && url.pathname === '/api/version') {
+    return sendJSON(res, 200, appRelease);
+  }
+
+  // 0b. 管理员发布/修改客户端版本与下载链接：POST /api/version
+  if (req.method === 'POST' && url.pathname === '/api/version') {
+    try {
+      const body = await readBody(req);
+      if (!checkAdminKey(req, url, body)) {
+        return sendJSON(res, 401, { error: '无效的管理员密钥' });
+      }
+      const nextVersion = String(body.version || '').trim();
+      if (!nextVersion) {
+        return sendJSON(res, 400, { error: '版本号不能为空' });
+      }
+      appRelease = {
+        version: nextVersion.replace(/^v/i, ''),
+        macUrl: String(body.macUrl ?? '').trim(),
+        winUrl: String(body.winUrl ?? '').trim(),
+        notes: String(body.notes ?? '').trim().slice(0, 500),
+        forceUpdate: Boolean(body.forceUpdate),
+        updatedAt: Date.now(),
+      };
+      persistRelease();
+      return sendJSON(res, 200, appRelease);
+    } catch (e) {
+      return sendJSON(res, 400, { error: '版本配置保存失败：' + e.message });
+    }
+  }
 
   // 1. 管理员查询全部房间列表：GET /api/rooms
   if (req.method === 'GET' && url.pathname === '/api/rooms') {
@@ -228,6 +315,11 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
+
+  // 未命中的 /api/* 路径直接返回 404 JSON，不走 SPA index.html 回退
+  if (url.pathname.startsWith('/api/')) {
+    return sendJSON(res, 404, { error: 'API 接口不存在' });
+  }
 
   // 静态文件服务（dist 由 npm run build 生成）
   let filePath = url.pathname === '/' ? '/index.html' : url.pathname;
@@ -449,9 +541,11 @@ httpServer.on('upgrade', (req, socket, head) => {
 });
 
 httpServer.listen(PORT, () => {
-  loadRooms(); // 启动时从磁盘恢复房间
+  loadRooms();   // 启动时从磁盘恢复房间
+  loadRelease(); // 启动时从磁盘恢复客户端版本配置
   console.log(`Codex 服务已启动：http://localhost:${PORT}`);
   console.log(`  管理员建房: POST /api/rooms  { key }`);
+  console.log(`  版本检测: GET /api/version | POST /api/version`);
   console.log(`  WS 打字同步: ws://localhost:${PORT}/ws?room=<id>&token=<t>&user=<name>`);
   console.log(`  静态页: ${DIST_DIR}`);
   console.log(`  数据目录: ${DATA_DIR}`);

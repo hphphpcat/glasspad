@@ -10,4 +10,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 屏幕共享权限检测与系统设置跳转
   getMediaPermissionStatus: () => ipcRenderer.invoke('GET_MEDIA_PERMISSION_STATUS'),
   openPrivacySettings: (type) => ipcRenderer.invoke('OPEN_PRIVACY_SETTINGS', type),
+  // 客户端版本获取与检查更新
+  getAppVersion: () => ipcRenderer.invoke('GET_APP_VERSION'),
+  checkForUpdates: (customBase) => ipcRenderer.invoke('CHECK_FOR_UPDATES', customBase),
+  openExternalUrl: (url) => ipcRenderer.invoke('OPEN_EXTERNAL_URL', url),
 });
