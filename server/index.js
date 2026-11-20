@@ -39,10 +39,15 @@ try {
   pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.0';
 } catch {}
 
+const DEFAULT_MAC_DOWNLOAD_URL =
+  'https://github.com/hphphpcat/glasspad/releases/download/glasspad/GlassPad-1.0.0-arm64.dmg';
+const DEFAULT_WIN_DOWNLOAD_URL =
+  'https://github.com/hphphpcat/glasspad/releases/download/glasspad/GlassPad-1.0.0-portable.exe';
+
 let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
-  macUrl: process.env.MAC_DOWNLOAD_URL || '',
-  winUrl: process.env.WIN_DOWNLOAD_URL || '',
+  macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
+  winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
   notes: process.env.RELEASE_NOTES || '',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
