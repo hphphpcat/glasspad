@@ -416,6 +416,16 @@ export default function Admin() {
                         </span>
                       )}
 
+                      {room.screenSharing && (
+                        <span style={{
+                          background: 'rgba(56, 189, 248, 0.14)', color: '#38bdf8',
+                          border: '1px solid rgba(56, 189, 248, 0.35)',
+                          padding: '2px 8px', borderRadius: '5px', fontSize: '11.5px', fontWeight: 600,
+                        }}>
+                          ● 屏幕共享中
+                        </span>
+                      )}
+
                       <span style={{ color: '#64748b', fontSize: '12px' }}>
                         {room.language} · {room.textLength || 0} 字符 · 活跃于 {formatRelativeTime(room.lastActive)}
                       </span>

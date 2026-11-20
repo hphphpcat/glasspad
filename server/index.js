@@ -64,6 +64,8 @@ function loadRooms() {
         text: r.text || '',
         language: r.language || 'python',
         clients: new Map(),
+        sharerId: null,
+        sharerMicOn: false,
         createdAt: r.createdAt || r.lastActive || Date.now(),
         lastActive: r.lastActive || Date.now(),
       });
@@ -87,6 +89,8 @@ function getOrCreateRoom(roomId, token, note = '') {
       text: '',
       language: 'python',
       clients: new Map(),
+      sharerId: null,
+      sharerMicOn: false,
       createdAt: now,
       lastActive: now,
     });
@@ -105,6 +109,7 @@ function serializeRoom(roomId, room) {
     language: room.language || 'python',
     onlineCount: participants.length,
     participants,
+    screenSharing: Boolean(room.sharerId),
     textLength: text.length,
     textPreview: text.slice(0, 120),
     createdAt: room.createdAt || room.lastActive,
@@ -263,9 +268,18 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
+  const clientId = crypto.randomBytes(4).toString('hex');
   const color = COLORS[room.clients.size % COLORS.length];
-  room.clients.set(ws, { name: userName, color });
+  room.clients.set(ws, { id: clientId, name: userName, color });
   room.lastActive = Date.now();
+
+  // 根据 clientId 查找房间内的 ws 实例
+  const findWsByClientId = (targetId) => {
+    for (const [c, info] of room.clients.entries()) {
+      if (info.id === targetId && c.readyState === 1) return c;
+    }
+    return null;
+  };
 
   // 广播房间内最新在线成员列表（含彩色铭牌）
   const broadcastPresence = () => {
@@ -276,8 +290,35 @@ wss.on('connection', (ws, req) => {
     });
   };
 
-  // 下发当前房间文字内容
-  ws.send(JSON.stringify({ type: 'INIT', payload: { text: room.text, language: room.language } }));
+  // 广播当前屏幕共享状态
+  const broadcastShareState = () => {
+    const msg = JSON.stringify({
+      type: 'SCREEN_SHARE_STATE',
+      payload: {
+        active: Boolean(room.sharerId),
+        sharerId: room.sharerId || null,
+        micOn: Boolean(room.sharerMicOn),
+      },
+    });
+    room.clients.forEach((_, c) => {
+      if (c.readyState === 1) c.send(msg);
+    });
+  };
+
+  // 下发当前房间文字内容、自身的 clientId 以及当前屏幕共享状态
+  ws.send(JSON.stringify({
+    type: 'INIT',
+    payload: {
+      clientId,
+      text: room.text,
+      language: room.language,
+      screenShare: {
+        active: Boolean(room.sharerId),
+        sharerId: room.sharerId || null,
+        micOn: Boolean(room.sharerMicOn),
+      },
+    },
+  }));
   broadcastPresence();
 
   ws.on('message', (raw) => {
@@ -310,11 +351,79 @@ wss.on('connection', (ws, req) => {
           c.send(JSON.stringify({ type: 'SEL_SYNC', payload: msg.payload }));
         }
       });
+    } else if (msg.type === 'SCREEN_SHARE_START') {
+      room.sharerId = clientId;
+      room.sharerMicOn = Boolean(msg.payload?.micOn);
+      room.lastActive = Date.now();
+      broadcastShareState();
+    } else if (msg.type === 'SCREEN_SHARE_MIC') {
+      if (room.sharerId === clientId) {
+        room.sharerMicOn = Boolean(msg.payload?.micOn);
+        broadcastShareState();
+      }
+    } else if (msg.type === 'SCREEN_SHARE_STOP') {
+      // 共享方主动停止，或导师端请求停止共享
+      if (room.sharerId) {
+        const sharerWs = findWsByClientId(room.sharerId);
+        if (sharerWs && sharerWs !== ws) {
+          sharerWs.send(JSON.stringify({ type: 'SCREEN_SHARE_FORCE_STOP' }));
+        }
+        room.sharerId = null;
+        room.sharerMicOn = false;
+        broadcastShareState();
+      }
+    } else if (msg.type === 'SCREEN_VIEWER_JOIN') {
+      // 观看端（导师）请求订阅画面，转发给当前共享方以触发 WebRTC Offer
+      if (room.sharerId) {
+        const sharerWs = findWsByClientId(room.sharerId);
+        if (sharerWs) {
+          sharerWs.send(JSON.stringify({
+            type: 'SCREEN_VIEWER_JOIN',
+            payload: { viewerId: clientId },
+          }));
+        }
+      }
+    } else if (msg.type === 'SCREEN_VIEWER_LEAVE') {
+      if (room.sharerId) {
+        const sharerWs = findWsByClientId(room.sharerId);
+        if (sharerWs) {
+          sharerWs.send(JSON.stringify({
+            type: 'SCREEN_VIEWER_LEAVE',
+            payload: { viewerId: clientId },
+          }));
+        }
+      }
+    } else if (msg.type === 'RTC_SIGNAL') {
+      // 点对点转发 WebRTC Offer / Answer / ICE Candidate
+      const targetWs = findWsByClientId(msg.payload?.to);
+      if (targetWs) {
+        targetWs.send(JSON.stringify({
+          type: 'RTC_SIGNAL',
+          payload: {
+            from: clientId,
+            sdp: msg.payload.sdp || null,
+            candidate: msg.payload.candidate || null,
+          },
+        }));
+      }
     }
   });
 
   ws.on('close', () => {
     room.clients.delete(ws);
+    if (room.sharerId === clientId) {
+      room.sharerId = null;
+      room.sharerMicOn = false;
+      broadcastShareState();
+    } else if (room.sharerId) {
+      const sharerWs = findWsByClientId(room.sharerId);
+      if (sharerWs) {
+        sharerWs.send(JSON.stringify({
+          type: 'SCREEN_VIEWER_LEAVE',
+          payload: { viewerId: clientId },
+        }));
+      }
+    }
     broadcastPresence();
     // 不立即删除空房间：保留 roomId + token，避免「先建房→后加入」时短暂空房导致凭证失效
     // 房间由定时器在闲置超时后统一回收

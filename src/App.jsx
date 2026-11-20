@@ -7,6 +7,9 @@ const isWindows = window.electronAPI?.platform === 'win32' || /Win/i.test(naviga
 const modKey = isWindows ? 'Ctrl+' : '⌘';
 const uiFont = 'ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif';
 const codeFont = 'ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, Menlo, "Microsoft YaHei UI", monospace';
+const RTC_ICE_SERVERS = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+];
 
 const normalizeLF = (s) => (s || '').replace(/\r\n/g, '\n');
 
@@ -69,11 +72,28 @@ export default function App() {
   const [destroyedMsg, setDestroyedMsg] = useState('');
   const [participants, setParticipants] = useState([]);
 
+  // ── 屏幕共享状态（客户端推流 / 导师端观看）──
+  const [isSharingScreen, setIsSharingScreen] = useState(false);
+  const [shareMicOn, setShareMicOn] = useState(false);
+  const [shareHasMic, setShareHasMic] = useState(false);
+  const [shareError, setShareError] = useState('');
+  const [remoteShareState, setRemoteShareState] = useState({ active: false, sharerId: null, micOn: false });
+  const [showViewerPane, setShowViewerPane] = useState(true);
+  const [viewerConnected, setViewerConnected] = useState(false);
+  const [viewerMuted, setViewerMuted] = useState(false);
+
   const wsRef = useRef(null);
+  const myClientIdRef = useRef('');
   const editorRef = useRef(null);
   const isRemote = useRef(false);
   const remoteSelDecorations = useRef(null); // 对方选区的高亮装饰集合
   const latestText = useRef(''); // 最近收到的远端文字（编辑器挂载前到达时用于补写）
+
+  // 客户端共享屏幕用到的 WebRTC / Media 引用
+  const shareSessionRef = useRef(null); // { displayStream, micStream, audioCtx, micGain, videoTrack, audioTrack, peers: Map<viewerId, { pc, pendingIce: [] }> }
+  // 导师端观看屏幕用到的 WebRTC / Video 引用
+  const viewerPcRef = useRef(null); // { pc, sharerId, pendingIce: [], stream: MediaStream }
+  const remoteVideoRef = useRef(null);
 
   // 桌面端：检测系统是否支持毛玻璃
   useEffect(() => {
@@ -114,6 +134,344 @@ export default function App() {
     window.electronAPI?.setFrostedGlass?.(enabled);
   };
 
+  // ── 屏幕共享：清理观看端 WebRTC 连接 ──
+  const closeViewerConnection = () => {
+    const cur = viewerPcRef.current;
+    if (cur) {
+      cur.pc.onicecandidate = null;
+      cur.pc.ontrack = null;
+      cur.pc.onconnectionstatechange = null;
+      try { cur.pc.close(); } catch {}
+      viewerPcRef.current = null;
+    }
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
+    setViewerConnected(false);
+  };
+
+  // ── 屏幕共享：关闭单个观看者的 PeerConnection（共享端） ──
+  const removeViewerPeer = (viewerId) => {
+    const session = shareSessionRef.current;
+    if (!session) return;
+    const entry = session.peers.get(viewerId);
+    if (entry) {
+      entry.pc.onicecandidate = null;
+      entry.pc.onconnectionstatechange = null;
+      try { entry.pc.close(); } catch {}
+      session.peers.delete(viewerId);
+    }
+  };
+
+  // ── 屏幕共享：为指定观看者创建 WebRTC Offer 并推流（共享端） ──
+  const createOfferForViewer = async (viewerId) => {
+    const session = shareSessionRef.current;
+    if (!session || !viewerId) return;
+    removeViewerPeer(viewerId);
+
+    const pc = new RTCPeerConnection({ iceServers: RTC_ICE_SERVERS });
+    const entry = { pc, pendingIce: [] };
+    session.peers.set(viewerId, entry);
+
+    if (session.videoTrack) {
+      pc.addTrack(session.videoTrack, session.displayStream);
+    }
+    if (session.audioTrack) {
+      pc.addTrack(session.audioTrack, session.displayStream);
+    }
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate && wsRef.current?.readyState === 1) {
+        wsRef.current.send(JSON.stringify({
+          type: 'RTC_SIGNAL',
+          payload: { to: viewerId, candidate: ev.candidate.toJSON() },
+        }));
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+        removeViewerPeer(viewerId);
+      }
+    };
+
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      if (wsRef.current?.readyState === 1) {
+        wsRef.current.send(JSON.stringify({
+          type: 'RTC_SIGNAL',
+          payload: { to: viewerId, sdp: pc.localDescription },
+        }));
+      }
+    } catch (err) {
+      console.error('[screenshare] createOffer error:', err);
+      removeViewerPeer(viewerId);
+    }
+  };
+
+  // ── 屏幕共享：停止本地共享（客户端） ──
+  const stopScreenShare = (notifyServer = true) => {
+    const session = shareSessionRef.current;
+    if (session) {
+      session.stopped = true;
+      session.peers.forEach((entry) => {
+        entry.pc.onicecandidate = null;
+        entry.pc.onconnectionstatechange = null;
+        try { entry.pc.close(); } catch {}
+      });
+      session.peers.clear();
+      session.displayStream?.getTracks().forEach((t) => t.stop());
+      session.micStream?.getTracks().forEach((t) => t.stop());
+      session.audioCtx?.close().catch(() => {});
+      shareSessionRef.current = null;
+    }
+    setIsSharingScreen(false);
+    setShareMicOn(false);
+    setShareHasMic(false);
+    if (notifyServer && wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify({ type: 'SCREEN_SHARE_STOP' }));
+    }
+  };
+
+  // ── 屏幕共享：启动本地静默共享（对齐 Codex Interview：主屏画面 + 系统声音 + 麦克风混音） ──
+  const startScreenShare = async () => {
+    if (shareSessionRef.current) return;
+    setShareError('');
+
+    try {
+      // 1. 直接调用 getDisplayMedia 触发系统底层 desktopCapturer.getSources：
+      //    在 macOS 上只有真正发起一次抓屏调用，系统才会把 GlassPad 自动注册进「录屏与系统录音」列表
+      let displayStream;
+      try {
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+      } catch (captureErr) {
+        if (window.electronAPI?.getMediaPermissionStatus) {
+          const perm = await window.electronAPI.getMediaPermissionStatus();
+          if (perm?.screen && perm.screen !== 'granted') {
+            setShareError('请在系统「录屏与系统录音」中勾选 GlassPad（或点左下角 + 号添加）后重试');
+            window.electronAPI.openPrivacySettings?.('screen');
+            return;
+          }
+        }
+        throw captureErr;
+      }
+
+      // 2. 尝试采集麦克风并通过 GainNode 混音（默认静音，可在顶栏一键开关 Mic）
+      let micStream = null;
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      } catch {
+        // 无麦克风或未授权时继续仅共享屏幕+系统音频
+      }
+
+      const videoTrack = displayStream.getVideoTracks()[0] || null;
+      const sysAudioTrack = displayStream.getAudioTracks()[0] || null;
+      const micAudioTrack = micStream?.getAudioTracks()[0] || null;
+
+      let audioCtx = null;
+      let micGain = null;
+      let mixedAudioTrack = null;
+
+      if (sysAudioTrack || micAudioTrack) {
+        try {
+          audioCtx = new AudioContext();
+          await audioCtx.resume();
+          const dest = audioCtx.createMediaStreamDestination();
+          if (sysAudioTrack) {
+            audioCtx.createMediaStreamSource(new MediaStream([sysAudioTrack])).connect(dest);
+          }
+          if (micAudioTrack) {
+            micGain = audioCtx.createGain();
+            micGain.gain.value = 0; // 默认关闭麦克风，只传系统声音
+            audioCtx.createMediaStreamSource(new MediaStream([micAudioTrack])).connect(micGain);
+            micGain.connect(dest);
+          }
+          mixedAudioTrack = dest.stream.getAudioTracks()[0] || null;
+        } catch {
+          mixedAudioTrack = sysAudioTrack || null;
+        }
+      }
+
+      const session = {
+        stopped: false,
+        displayStream,
+        micStream,
+        audioCtx,
+        micGain,
+        videoTrack,
+        audioTrack: mixedAudioTrack,
+        peers: new Map(),
+      };
+      shareSessionRef.current = session;
+
+      if (videoTrack) {
+        videoTrack.addEventListener('ended', () => {
+          if (!session.stopped) stopScreenShare(true);
+        });
+      }
+
+      setIsSharingScreen(true);
+      setShareMicOn(false);
+      setShareHasMic(Boolean(micGain));
+
+      if (wsRef.current?.readyState === 1) {
+        wsRef.current.send(JSON.stringify({
+          type: 'SCREEN_SHARE_START',
+          payload: { micOn: false },
+        }));
+      }
+    } catch (err) {
+      console.error('[screenshare] start failed:', err);
+      setShareError('共享屏幕启动失败');
+      stopScreenShare(false);
+    }
+  };
+
+  // ── 屏幕共享：切换候选人麦克风开关 ──
+  const toggleShareMic = () => {
+    const session = shareSessionRef.current;
+    if (!session?.micGain) return;
+    const next = !shareMicOn;
+    session.micGain.gain.value = next ? 1 : 0;
+    setShareMicOn(next);
+    if (wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify({
+        type: 'SCREEN_SHARE_MIC',
+        payload: { micOn: next },
+      }));
+    }
+  };
+
+  // ── 屏幕共享：处理收到的 WebRTC 信令（Offer / Answer / ICE） ──
+  const handleRtcSignal = async ({ from, sdp, candidate }) => {
+    if (!from) return;
+
+    // A. 如果本地是共享端：收到观看端的 Answer 或 ICE
+    if (shareSessionRef.current) {
+      const entry = shareSessionRef.current.peers.get(from);
+      if (!entry) return;
+      try {
+        if (sdp && sdp.type === 'answer') {
+          await entry.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+          while (entry.pendingIce.length > 0) {
+            const c = entry.pendingIce.shift();
+            await entry.pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+          }
+        } else if (candidate) {
+          if (entry.pc.remoteDescription) {
+            await entry.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+          } else {
+            entry.pendingIce.push(candidate);
+          }
+        }
+      } catch (err) {
+        console.error('[screenshare] sharer signal error:', err);
+      }
+      return;
+    }
+
+    // B. 如果本地是观看端（导师端）：收到共享端的 Offer 或 ICE
+    try {
+      if (sdp && sdp.type === 'offer') {
+        closeViewerConnection();
+        const pc = new RTCPeerConnection({ iceServers: RTC_ICE_SERVERS });
+        const remoteStream = new MediaStream();
+        const viewerState = { pc, sharerId: from, pendingIce: [], stream: remoteStream };
+        viewerPcRef.current = viewerState;
+
+        pc.ontrack = (ev) => {
+          if (ev.streams && ev.streams[0]) {
+            ev.streams[0].getTracks().forEach((t) => remoteStream.addTrack(t));
+          } else if (ev.track) {
+            remoteStream.addTrack(ev.track);
+          }
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = remoteStream;
+            remoteVideoRef.current.play().catch(() => {});
+          }
+          setViewerConnected(true);
+        };
+
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate && wsRef.current?.readyState === 1) {
+            wsRef.current.send(JSON.stringify({
+              type: 'RTC_SIGNAL',
+              payload: { to: from, candidate: ev.candidate.toJSON() },
+            }));
+          }
+        };
+
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'connected') {
+            setViewerConnected(true);
+          } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+            setViewerConnected(false);
+          }
+        };
+
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        while (viewerState.pendingIce.length > 0) {
+          const c = viewerState.pendingIce.shift();
+          await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+        }
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        if (wsRef.current?.readyState === 1) {
+          wsRef.current.send(JSON.stringify({
+            type: 'RTC_SIGNAL',
+            payload: { to: from, sdp: pc.localDescription },
+          }));
+        }
+      } else if (candidate && viewerPcRef.current && viewerPcRef.current.sharerId === from) {
+        const vState = viewerPcRef.current;
+        if (vState.pc.remoteDescription) {
+          await vState.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+        } else {
+          vState.pendingIce.push(candidate);
+        }
+      }
+    } catch (err) {
+      console.error('[screenshare] viewer signal error:', err);
+    }
+  };
+
+  // 组件卸载时释放共享资源
+  useEffect(() => {
+    return () => {
+      stopScreenShare(false);
+      closeViewerConnection();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 导师端：当房间有活跃屏幕共享且打开了预览面板时，自动发起观看请求
+  useEffect(() => {
+    if (isClientApp) return;
+    if (remoteShareState.active && showViewerPane && wsConnected) {
+      wsRef.current?.send(JSON.stringify({ type: 'SCREEN_VIEWER_JOIN' }));
+    } else {
+      closeViewerConnection();
+      if (remoteShareState.active && !showViewerPane && wsConnected) {
+        wsRef.current?.send(JSON.stringify({ type: 'SCREEN_VIEWER_LEAVE' }));
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remoteShareState.active, remoteShareState.sharerId, showViewerPane, wsConnected]);
+
+  // 当 remoteVideoRef 挂载时绑定已有的视频流
+  useEffect(() => {
+    if (remoteVideoRef.current && viewerPcRef.current?.stream) {
+      remoteVideoRef.current.srcObject = viewerPcRef.current.stream;
+      remoteVideoRef.current.play().catch(() => {});
+    }
+  }, [viewerConnected, showViewerPane]);
+
   // WebSocket 实时同步
   useEffect(() => {
     if (!token) return;
@@ -138,7 +496,16 @@ export default function App() {
       ws = new WebSocket(`${wsUrl}/?room=${encodeURIComponent(roomId)}&token=${encodeURIComponent(token)}&user=${encodeURIComponent(userName)}`);
       wsRef.current = ws;
 
-      ws.onopen = () => setWsConnected(true);
+      ws.onopen = () => {
+        setWsConnected(true);
+        // 若客户端本地正在共享屏幕（例如断线重连后），自动重新向服务端注册共享状态
+        if (shareSessionRef.current && !shareSessionRef.current.stopped) {
+          ws.send(JSON.stringify({
+            type: 'SCREEN_SHARE_START',
+            payload: { micOn: Boolean(shareSessionRef.current.micGain?.gain.value) },
+          }));
+        }
+      };
 
       ws.onmessage = (e) => {
         const { type, payload } = JSON.parse(e.data);
@@ -147,7 +514,13 @@ export default function App() {
         } else if (type === 'ROOM_DESTROYED') {
           setDestroyedMsg(payload?.reason || '该房间已被管理员销毁');
           setParticipants([]);
+          stopScreenShare(false);
+          closeViewerConnection();
         } else if (type === 'INIT' || type === 'TEXT_SYNC') {
+          if (payload.clientId) myClientIdRef.current = payload.clientId;
+          if (payload.screenShare) {
+            setRemoteShareState(payload.screenShare);
+          }
           const clean = normalizeLF(payload.text);
           // 先增量写入编辑器（保留选区），再同步 React 状态
           latestText.current = clean;
@@ -161,6 +534,19 @@ export default function App() {
           applyRemoteSelections(payload.selections || []);
         } else if (type === 'PRESENCE') {
           setParticipants(payload);
+        } else if (type === 'SCREEN_SHARE_STATE') {
+          setRemoteShareState(payload || { active: false, sharerId: null, micOn: false });
+          if (!payload?.active) {
+            closeViewerConnection();
+          }
+        } else if (type === 'SCREEN_SHARE_FORCE_STOP') {
+          stopScreenShare(false);
+        } else if (type === 'SCREEN_VIEWER_JOIN') {
+          if (payload?.viewerId) createOfferForViewer(payload.viewerId);
+        } else if (type === 'SCREEN_VIEWER_LEAVE') {
+          if (payload?.viewerId) removeViewerPeer(payload.viewerId);
+        } else if (type === 'RTC_SIGNAL') {
+          handleRtcSignal(payload || {});
         }
       };
 
@@ -317,9 +703,55 @@ export default function App() {
             <div style={{ flex: 1, minWidth: '20px', alignSelf: 'stretch' }} />
 
             <div style={{
-              marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '12px',
+              marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '10px',
               WebkitAppRegion: 'no-drag', cursor: 'default',
             }}>
+              {shareError && (
+                <span
+                  onClick={() => window.electronAPI?.openPrivacySettings?.('screen')}
+                  style={{ color: '#f87171', fontSize: '11.5px', cursor: 'pointer', textDecoration: 'underline' }}
+                  title="点击打开系统录屏权限设置"
+                >
+                  {shareError}
+                </span>
+              )}
+
+              {/* 客户端静默屏幕共享开关（对齐 Codex Interview：免弹窗直接共享主屏幕 + 系统声音） */}
+              <button
+                onClick={() => (isSharingScreen ? stopScreenShare(true) : startScreenShare())}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: '6px',
+                  background: isSharingScreen ? 'rgba(16, 185, 129, 0.2)' : 'rgba(31, 41, 55, 0.85)',
+                  color: isSharingScreen ? '#34d399' : '#e2e8f0',
+                  border: `1px solid ${isSharingScreen ? 'rgba(16, 185, 129, 0.5)' : '#374151'}`,
+                  borderRadius: '6px', padding: '4px 10px', fontSize: '12px', fontWeight: 600,
+                  cursor: 'pointer', whiteSpace: 'nowrap',
+                }}
+                title={isSharingScreen ? '正在共享主屏幕与系统声音，点击停止' : '点击静默共享主屏幕与系统声音给导师'}
+              >
+                <span style={{
+                  width: '7px', height: '7px', borderRadius: '50%',
+                  background: isSharingScreen ? '#10b981' : '#64748b',
+                }} />
+                {isSharingScreen ? 'Sharing Screen' : 'Share Screen'}
+              </button>
+
+              {isSharingScreen && shareHasMic && (
+                <button
+                  onClick={toggleShareMic}
+                  style={{
+                    background: shareMicOn ? 'rgba(16, 185, 129, 0.18)' : 'rgba(31, 41, 55, 0.75)',
+                    color: shareMicOn ? '#34d399' : '#94a3b8',
+                    border: `1px solid ${shareMicOn ? 'rgba(16, 185, 129, 0.45)' : '#374151'}`,
+                    borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 500,
+                    cursor: 'pointer', whiteSpace: 'nowrap',
+                  }}
+                  title="切换是否把自己的麦克风声音也传给导师"
+                >
+                  Mic: {shareMicOn ? 'ON' : 'OFF'}
+                </button>
+              )}
+
               <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#e2e8f0', fontWeight: 500 }} title={`${modKey}[ / ${modKey}] 调节`}>
                 Opacity {Math.round(opacity * 100)}%
                 <input
@@ -347,6 +779,42 @@ export default function App() {
               <span style={{ color: '#f1f5f9', fontWeight: 600, fontSize: '13px' }}>GlassPad</span>
             </div>
             <button onClick={clearPad} style={btn}>Clear</button>
+
+            {/* 导师端：当候选人开启屏幕共享时显示实时观看控制 */}
+            {remoteShareState.active ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <button
+                  onClick={() => setShowViewerPane((v) => !v)}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '6px',
+                    background: showViewerPane ? 'rgba(16, 185, 129, 0.2)' : 'rgba(31, 41, 55, 0.8)',
+                    color: showViewerPane ? '#34d399' : '#cbd5e1',
+                    border: `1px solid ${showViewerPane ? 'rgba(16, 185, 129, 0.45)' : '#374151'}`,
+                    borderRadius: '6px', padding: '4px 10px', fontSize: '12px', fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#10b981' }} />
+                  {showViewerPane ? '隐藏客户屏幕' : '查看客户屏幕 (Live)'}
+                </button>
+                <button
+                  onClick={() => wsRef.current?.send(JSON.stringify({ type: 'SCREEN_SHARE_STOP' }))}
+                  style={{
+                    background: 'rgba(239, 68, 68, 0.14)', color: '#f87171',
+                    border: '1px solid rgba(239, 68, 68, 0.35)', borderRadius: '6px',
+                    padding: '4px 9px', fontSize: '12px', cursor: 'pointer',
+                  }}
+                  title="远程关闭候选人的屏幕共享"
+                >
+                  停止共享
+                </button>
+              </div>
+            ) : (
+              <span style={{ color: '#64748b', fontSize: '12px' }}>
+                客户未开启屏幕共享
+              </span>
+            )}
+
             <select
               value={language}
               onChange={(e) => {
@@ -369,10 +837,90 @@ export default function App() {
         )}
       </div>
 
-      {/* 提词区（客户端只读） */}
-      <div style={{ flex: 1, position: 'relative', paddingTop: '8px' }}>
-        <Editor
-          height="100%"
+      {/* 主体区域：导师端在观看屏幕时左右分栏（左侧客户实时屏幕 + 右侧提词编辑器），客户端保持单栏 */}
+      <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
+        {!isClientApp && remoteShareState.active && showViewerPane && (
+          <div style={{
+            width: '52%', minWidth: '340px', maxWidth: '75%',
+            borderRight: '1px solid rgba(255, 255, 255, 0.1)',
+            background: '#05070a', display: 'flex', flexDirection: 'column',
+            position: 'relative',
+          }}>
+            {/* 播放器顶栏 */}
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '6px 12px', background: 'rgba(15, 23, 34, 0.9)',
+              borderBottom: '1px solid rgba(255, 255, 255, 0.07)', fontSize: '12px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{
+                  width: '7px', height: '7px', borderRadius: '50%',
+                  background: viewerConnected ? '#10b981' : '#f59e0b',
+                }} />
+                <span style={{ color: '#e2e8f0', fontWeight: 600 }}>
+                  {viewerConnected ? '客户桌面实时画面 (WebRTC)' : '正在连接客户桌面…'}
+                </span>
+                <span style={{ color: '#64748b', fontSize: '11.5px' }}>
+                  · 客户麦克风: {remoteShareState.micOn ? '已开启' : '静音(仅系统音)'}
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <button
+                  onClick={() => {
+                    const next = !viewerMuted;
+                    setViewerMuted(next);
+                    if (remoteVideoRef.current) remoteVideoRef.current.muted = next;
+                  }}
+                  style={{
+                    background: '#1e293b', color: viewerMuted ? '#f87171' : '#cbd5e1',
+                    border: '1px solid #334155', borderRadius: '5px',
+                    padding: '3px 8px', fontSize: '11.5px', cursor: 'pointer',
+                  }}
+                >
+                  {viewerMuted ? '已静音 🔇' : '声音开启 🔊'}
+                </button>
+                <button
+                  onClick={() => remoteVideoRef.current?.requestFullscreen?.()}
+                  style={{
+                    background: '#1e293b', color: '#cbd5e1',
+                    border: '1px solid #334155', borderRadius: '5px',
+                    padding: '3px 8px', fontSize: '11.5px', cursor: 'pointer',
+                  }}
+                >
+                  全屏 ⛶
+                </button>
+              </div>
+            </div>
+
+            {/* 视频画面容器 */}
+            <div style={{
+              flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              position: 'relative', overflow: 'hidden', background: '#000',
+            }}>
+              <video
+                ref={remoteVideoRef}
+                autoPlay
+                playsInline
+                muted={viewerMuted}
+                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+              />
+              {!viewerConnected && (
+                <div style={{
+                  position: 'absolute', color: '#94a3b8', fontSize: '13px',
+                  background: 'rgba(15, 23, 34, 0.85)', padding: '8px 14px', borderRadius: '6px',
+                }}>
+                  正在建立 WebRTC 点对点视频流…
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* 提词编辑器区（客户端只读） */}
+        <div style={{ flex: 1, minWidth: 0, position: 'relative', paddingTop: '8px' }}>
+          <Editor
+            height="100%"
           theme="codex-transparent"
           language={language}
           // 客户端不走受控 value（库在只读模式下每次 value 变化都会整体 setValue，清掉选区），
@@ -428,6 +976,7 @@ export default function App() {
             scrollBeyondLastLine: false,
           }}
         />
+        </div>
       </div>
 
       {/* 底部栏：连接状态 + 在线成员（桌面端同样支持按住拖拽） */}

@@ -1,4 +1,14 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, clipboard } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  globalShortcut,
+  ipcMain,
+  clipboard,
+  session,
+  desktopCapturer,
+  systemPreferences,
+  shell,
+} = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -103,6 +113,52 @@ ipcMain.handle('GET_FROST_SUPPORT', () => ({
 // 主进程读取剪贴板（兼容 Electron 20+ 默认开启的 sandbox 渲染进程）
 ipcMain.handle('READ_CLIPBOARD_TEXT', () => clipboard.readText());
 
+// 媒体权限检测（macOS 需检测屏幕录制与麦克风权限，Windows 直接返回 granted）
+ipcMain.handle('GET_MEDIA_PERMISSION_STATUS', () => {
+  if (process.platform !== 'darwin') {
+    return { screen: 'granted', microphone: 'granted' };
+  }
+  return {
+    screen: systemPreferences.getMediaAccessStatus('screen'),
+    microphone: systemPreferences.getMediaAccessStatus('microphone'),
+  };
+});
+
+// macOS 一键打开系统「隐私与安全性 -> 屏幕录制/麦克风」设置
+ipcMain.handle('OPEN_PRIVACY_SETTINGS', (_e, type) => {
+  if (process.platform !== 'darwin') return;
+  const anchor = type === 'microphone' ? 'Privacy_Microphone' : 'Privacy_ScreenCapture';
+  shell.openExternal(`x-apple.systempreferences:com.apple.preference.security?${anchor}`);
+});
+
+// 配置免弹窗静默抓屏（对齐 Codex Interview：自动选择主屏幕 + 系统内录声音 loopback，useSystemPicker: false）
+function setupSilentScreenCapture() {
+  const ses = session.defaultSession;
+  ses.setPermissionRequestHandler((_webContents, _permission, callback) => {
+    callback(true);
+  });
+  ses.setPermissionCheckHandler(() => true);
+  ses.setDisplayMediaRequestHandler(
+    (request, callback) => {
+      desktopCapturer
+        .getSources({ types: ['screen'] })
+        .then((sources) => {
+          if (!sources || sources.length === 0) {
+            callback({});
+            return;
+          }
+          const result = { video: sources[0] };
+          if (request.audioRequested) {
+            result.audio = 'loopback';
+          }
+          callback(result);
+        })
+        .catch(() => callback({}));
+    },
+    { useSystemPicker: false }
+  );
+}
+
 // 前端复选框实时开关原生毛玻璃
 ipcMain.on('SET_FROSTED_GLASS', (_e, enabled) => {
   applyNativeFrostedGlass(mainWindow, Boolean(enabled));
@@ -139,6 +195,7 @@ function registerShortcuts() {
 
 app.whenReady().then(() => {
   if (process.platform === 'darwin') app.dock.hide(); // 隐藏 Mac Dock 图标
+  setupSilentScreenCapture();
   createWindow();
   registerShortcuts();
 });
