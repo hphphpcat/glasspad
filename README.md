@@ -1,4 +1,4 @@
-# Interview Prompter
+#Glasspad
 
 导师在网页端打字，候选人在桌面 App 里实时看到。候选人的 App 是一个可调透明度的悬浮窗，置顶显示在浏览器上方，内容只读。
 
