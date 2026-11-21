@@ -240,7 +240,8 @@ ipcMain.handle('GET_APP_VERSION', () => ({
 // 检查更新：向后端 /api/version 或自定义 JSON 接口拉取最新版本信息
 ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
   const currentVersion = app.getVersion();
-  const checkUrl = resolveVersionCheckUrl(customBase);
+  const baseUrl = resolveVersionCheckUrl(customBase);
+  const checkUrl = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`;
   try {
     const data = await fetchJson(checkUrl);
     const latestVersion = String(data.version || data.latestVersion || currentVersion)
@@ -261,7 +262,7 @@ ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
       winUrl: data.winUrl || '',
       notes: data.notes || data.releaseNotes || '',
       forceUpdate: Boolean(data.forceUpdate),
-      checkUrl,
+      checkUrl: baseUrl,
     };
   } catch (err) {
     return {
@@ -270,7 +271,7 @@ ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
       currentVersion,
       latestVersion: currentVersion,
       error: err.message || '检查更新失败',
-      checkUrl,
+      checkUrl: baseUrl,
     };
   }
 });

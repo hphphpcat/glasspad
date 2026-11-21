@@ -38,7 +38,13 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或旧版 preload 兜底直接 fetch /api/version
-  const currentVersion = '1.0.0';
+  let currentVersion = '1.0.1';
+  if (window.electronAPI?.getAppVersion) {
+    try {
+      const info = await window.electronAPI.getAppVersion();
+      if (info?.version) currentVersion = info.version;
+    } catch {}
+  }
   let checkUrl = `${DEFAULT_SERVER_HTTP}/api/version`;
   if (targetBase) {
     try {
@@ -52,7 +58,7 @@ async function performUpdateCheck(customBase) {
     checkUrl = `${window.location.origin}/api/version`;
   }
   try {
-    const res = await fetch(checkUrl, { cache: 'no-store' });
+    const res = await fetch(`${checkUrl}${checkUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const latestVersion = String(data.version || currentVersion).trim().replace(/^v/i, '');
@@ -193,12 +199,12 @@ export default function App() {
     api.getAppVersion?.().then((info) => {
       if (info?.version) setAppVersion(info.version);
     });
-    // 启动后自动静默检测一次更新（若有新版本则在顶栏高亮提示或弹出更新卡片）
+    // 启动后自动检查更新：若发现新版本，直接弹出更新提示卡片并高亮顶栏按钮
     performUpdateCheck(wsBase).then((res) => {
       if (res?.currentVersion) setAppVersion(res.currentVersion);
       if (res?.ok && res.hasUpdate) {
         setUpdateInfo(res);
-        if (res.forceUpdate) setShowUpdateModal(true);
+        setShowUpdateModal(true);
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps

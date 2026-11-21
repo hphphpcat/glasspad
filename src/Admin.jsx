@@ -28,7 +28,7 @@ export default function Admin() {
 
   // 客户端版本更新发布管理
   const [releaseForm, setReleaseForm] = useState({
-    version: '1.0.0',
+    version: '1.0.1',
     macUrl: '',
     winUrl: '',
     notes: '',
@@ -44,7 +44,7 @@ export default function Admin() {
       if (!res.ok) return;
       const data = await res.json();
       setReleaseForm({
-        version: data.version || '1.0.0',
+        version: data.version || '1.0.1',
         macUrl: data.macUrl || '',
         winUrl: data.winUrl || '',
         notes: data.notes || '',

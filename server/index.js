@@ -34,21 +34,36 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.0';
+let pkgVersion = '1.0.1';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.0';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.1';
 } catch {}
 
+// 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
+function compareSemver(a, b) {
+  const clean = (v) => String(v || '').trim().replace(/^v/i, '').split('-')[0];
+  const aParts = clean(a).split('.').map((n) => parseInt(n, 10) || 0);
+  const bParts = clean(b).split('.').map((n) => parseInt(n, 10) || 0);
+  const len = Math.max(aParts.length, bParts.length, 3);
+  for (let i = 0; i < len; i++) {
+    const x = aParts[i] || 0;
+    const y = bParts[i] || 0;
+    if (x > y) return 1;
+    if (x < y) return -1;
+  }
+  return 0;
+}
+
 const DEFAULT_MAC_DOWNLOAD_URL =
-  'https://github.com/hphphpcat/glasspad/releases/download/glasspad/GlassPad-1.0.0-arm64.dmg';
+  `https://github.com/hphphpcat/glasspad/releases/download/glasspad/GlassPad-${pkgVersion}-arm64.dmg`;
 const DEFAULT_WIN_DOWNLOAD_URL =
-  'https://github.com/hphphpcat/glasspad/releases/download/glasspad/GlassPad-1.0.0-portable.exe';
+  `https://github.com/hphphpcat/glasspad/releases/download/glasspad/GlassPad-${pkgVersion}-portable.exe`;
 
 let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '',
+  notes: process.env.RELEASE_NOTES || '1. 优化屏幕共享 1080p@30fps 与 48kHz 低延迟音画同步\n2. 新增客户端在线检查更新与一键下载',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -66,10 +81,16 @@ function loadRelease() {
   try {
     if (!fs.existsSync(VERSION_FILE)) return;
     const saved = JSON.parse(fs.readFileSync(VERSION_FILE, 'utf8'));
+    const savedVer = String(saved.version || '').trim();
+    // 若代码仓库 package.json 中的版本已经高于磁盘旧缓存版本，自动以最新代码版本为准
+    if (savedVer && compareSemver(pkgVersion, savedVer) > 0) {
+      persistRelease();
+      return;
+    }
     appRelease = {
-      version: String(saved.version || appRelease.version).trim(),
-      macUrl: String(saved.macUrl ?? appRelease.macUrl).trim(),
-      winUrl: String(saved.winUrl ?? appRelease.winUrl).trim(),
+      version: savedVer || appRelease.version,
+      macUrl: String(saved.macUrl || appRelease.macUrl).trim(),
+      winUrl: String(saved.winUrl || appRelease.winUrl).trim(),
       notes: String(saved.notes ?? appRelease.notes).trim(),
       forceUpdate: Boolean(saved.forceUpdate ?? appRelease.forceUpdate),
       updatedAt: saved.updatedAt || Date.now(),
