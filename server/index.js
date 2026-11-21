@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.10';
+let pkgVersion = '1.0.11';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.10';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.11';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 修复局部字号缩放：同时选中大小不一的文字时按各自原有字号独立放大/缩小，不再被统一成同一字号\n2. 修复局部字号渲染后鼠标框选定位偏移、边缘打字吞入旧样式及点击顶栏选区偶发丢失问题\n3. 选中文字局部放大/缩小、加粗、改色实时同步到客户端',
+  notes: process.env.RELEASE_NOTES || '1. 新增 CoderPad 风格实时光标与姓名标签：任何成员点击或框选编辑器任意位置，其他成员会在该位置看到彩色光标竖线与姓名气泡\n2. 进入 Pad 支持输入自定义名字（不再使用固定的 Client / Mentor 默认名），底部在线栏支持随时点击自己名字改名\n3. 选中文字局部放大/缩小、加粗、改色实时同步',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -558,12 +558,31 @@ wss.on('connection', (ws, req) => {
         }
       });
     } else if (msg.type === 'SEL_SYNC') {
-      // 选区同步：只转发不持久化（临时状态）
+      // 光标与选区同步（CoderPad 风格）：附带发送者的 clientId、姓名与代表色广播给房间内其他成员
+      const senderInfo = room.clients.get(ws) || { id: clientId, name: userName, color };
+      const outMsg = JSON.stringify({
+        type: 'SEL_SYNC',
+        payload: {
+          clientId: senderInfo.id,
+          name: senderInfo.name,
+          color: senderInfo.color,
+          selections: Array.isArray(msg.payload?.selections) ? msg.payload.selections : [],
+        },
+      });
       room.clients.forEach((_, c) => {
         if (c !== ws && c.readyState === 1) {
-          c.send(JSON.stringify({ type: 'SEL_SYNC', payload: msg.payload }));
+          c.send(outMsg);
         }
       });
+    } else if (msg.type === 'NAME_SYNC') {
+      const nextName = String(msg.payload?.name || '').trim().slice(0, 24);
+      if (nextName) {
+        const info = room.clients.get(ws);
+        if (info) {
+          info.name = nextName;
+          broadcastPresence();
+        }
+      }
     } else if (msg.type === 'SCREEN_SHARE_START') {
       room.sharerId = clientId;
       room.sharerMicOn = Boolean(msg.payload?.micOn);

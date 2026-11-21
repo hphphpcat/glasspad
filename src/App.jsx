@@ -202,6 +202,36 @@ const FONT_COLOR_PRESETS = [
   { label: '亮红', value: '#f87171', swatch: '#f87171' },
 ];
 
+// 动态注入远端成员选区背景色（按每个人的代表色半透明高亮）
+const injectedRemoteSelClasses = new Set();
+function getRemoteSelectionClassName(hex) {
+  const clean = String(hex || '').trim().toLowerCase();
+  if (!/^#[0-9a-f]{6}$/.test(clean)) return 'remote-selection';
+  const className = `gp-remote-sel-${clean.slice(1)}`;
+  if (!injectedRemoteSelClasses.has(className) && typeof document !== 'undefined') {
+    let styleEl = document.getElementById('gp-remote-sel-styles');
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'gp-remote-sel-styles';
+      document.head.appendChild(styleEl);
+    }
+    const r = parseInt(clean.slice(1, 3), 16);
+    const g = parseInt(clean.slice(3, 5), 16);
+    const b = parseInt(clean.slice(5, 7), 16);
+    styleEl.textContent += `.monaco-editor .${className} { background-color: rgba(${r}, ${g}, ${b}, 0.35); border-radius: 2px; }\n`;
+    injectedRemoteSelClasses.add(className);
+  }
+  return className;
+}
+
+// 过滤掉旧版默认角色名（Client / Mentor / Candidate），要求用户输入真实称呼
+function normalizeCustomName(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (/^(client|mentor|candidate|guest)$/i.test(s)) return '';
+  return s.slice(0, 24);
+}
+
 // 动态注入单色 Monaco inlineClassName 样式，实现任意 Hex 颜色的局部选中着色
 const injectedInlineColorClasses = new Set();
 function getInlineColorClassName(hex) {
@@ -351,7 +381,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.10';
+  let currentVersion = '1.0.11';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -459,8 +489,10 @@ export default function App() {
   const [token, setToken] = useState(() => params.get('token') || '');
   const [wsBase, setWsBase] = useState(() => params.get('ws') || '');
   const [userName, setUserName] = useState(
-    () => params.get('user') || (isClientApp ? 'Client' : 'Mentor')
+    () => normalizeCustomName(params.get('user')) || normalizeCustomName(localStorage.getItem('pad_user_name')) || ''
   );
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
 
   // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）
   const [opacity, setOpacity] = useState(() => Number(localStorage.getItem('pad_opacity')) || 0.78);
@@ -501,6 +533,8 @@ export default function App() {
   const editorRef = useRef(null);
   const isRemote = useRef(false);
   const remoteSelDecorations = useRef(null); // 对方选区的高亮装饰集合
+  const remoteCursorsRef = useRef(new Map()); // Map<clientId, { name, color, selections }>
+  const cursorWidgetsRef = useRef(new Map()); // Map<clientId, Monaco IContentWidget>
   const colorMarksDecorations = useRef(null); // 选中文本局部字色装饰集合
   const colorMarksRef = useRef([]); // 当前文档的局部字色区间 [{ start, end, color }]
   const boldMarksDecorations = useRef(null); // 选中文本加粗装饰集合
@@ -1004,12 +1038,13 @@ export default function App() {
     }
   }, [viewerConnected, showViewerPane]);
 
-  // WebSocket 实时同步
+  // WebSocket 实时同步（须同时具备 token 与用户输入的自定义名字才建立连接）
   useEffect(() => {
-    if (!token) return;
+    if (!token || !userName) return;
     setAuthFail(false);
     setDestroyedMsg('');
 
+    localStorage.setItem('pad_user_name', userName);
     // 房间参数留在地址栏，⌘R 刷新后仍在同一房间
     const extraWs = wsBase ? `&ws=${encodeURIComponent(wsBase)}` : '';
     window.history.replaceState({}, '', `${window.location.pathname}?room=${encodeURIComponent(roomId)}&token=${encodeURIComponent(token)}&user=${encodeURIComponent(userName)}${extraWs}`);
@@ -1084,9 +1119,11 @@ export default function App() {
         } else if (type === 'LANG_SYNC') {
           setLanguage(payload.language);
         } else if (type === 'SEL_SYNC') {
-          applyRemoteSelections(payload.selections || []);
+          updateRemoteCursor(payload);
         } else if (type === 'PRESENCE') {
-          setParticipants(payload);
+          const list = Array.isArray(payload) ? payload : [];
+          setParticipants(list);
+          syncRemoteCursorsWithPresence(list);
         } else if (type === 'SCREEN_SHARE_STATE') {
           setRemoteShareState(payload || { active: false, sharerId: null, micOn: false });
           if (!payload?.active) {
@@ -1135,18 +1172,124 @@ export default function App() {
     }, 20);
   };
 
-  // 把对方的选区画成高亮装饰（不影响本地选区）
-  const applyRemoteSelections = (selections) => {
+  // ── CoderPad 风格：渲染所有远端成员的选区高亮 + 点击/光标位置的彩色姓名气泡 ──
+  const renderAllRemoteCursors = () => {
     const editor = editorRef.current;
-    if (!editor) return;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
     if (!remoteSelDecorations.current) {
       remoteSelDecorations.current = editor.createDecorationsCollection();
     }
-    remoteSelDecorations.current.set(
-      selections
-        .filter((s) => s.startLineNumber !== s.endLineNumber || s.startColumn !== s.endColumn)
-        .map((s) => ({ range: s, options: { className: 'remote-selection', stickiness: 1 } }))
-    );
+
+    const allDecos = [];
+    const activeIds = new Set();
+    const maxLine = model.getLineCount();
+
+    remoteCursorsRef.current.forEach((info, cid) => {
+      if (!cid || cid === myClientIdRef.current) return;
+      const selections = Array.isArray(info.selections) ? info.selections : [];
+      if (selections.length === 0) return;
+
+      const selClass = getRemoteSelectionClassName(info.color);
+      for (const s of selections) {
+        if (s.startLineNumber !== s.endLineNumber || s.startColumn !== s.endColumn) {
+          allDecos.push({
+            range: s,
+            options: { className: selClass, stickiness: 2 },
+          });
+        }
+      }
+
+      // 取第一处选区/点击位置显示光标竖线和名字标签（点击某处时 start === end 同样显示）
+      const primary = selections[0];
+      const posLine = Math.max(1, Math.min(maxLine, primary.positionLineNumber || primary.endLineNumber || primary.startLineNumber || 1));
+      const maxCol = model.getLineMaxColumn(posLine);
+      const posCol = Math.max(1, Math.min(maxCol, primary.positionColumn || primary.endColumn || primary.startColumn || 1));
+
+      activeIds.add(cid);
+      const color = info.color || '#10b981';
+      const name = info.name || 'User';
+
+      let widget = cursorWidgetsRef.current.get(cid);
+      if (!widget) {
+        const domNode = document.createElement('div');
+        domNode.className = 'gp-remote-cursor-widget';
+        const caret = document.createElement('div');
+        caret.className = 'gp-remote-cursor-caret';
+        const flag = document.createElement('div');
+        flag.className = 'gp-remote-cursor-flag';
+        domNode.appendChild(caret);
+        domNode.appendChild(flag);
+
+        widget = {
+          _domNode: domNode,
+          _caret: caret,
+          _flag: flag,
+          _position: { lineNumber: posLine, column: posCol },
+          getId: () => `gp.cursor.${cid}`,
+          getDomNode: () => domNode,
+          getPosition: function () {
+            return {
+              position: this._position,
+              preference: [0], // EXACT：紧贴点击/光标所在行列展示
+            };
+          },
+        };
+        cursorWidgetsRef.current.set(cid, widget);
+        editor.addContentWidget(widget);
+      }
+
+      widget._caret.style.backgroundColor = color;
+      widget._flag.style.backgroundColor = color;
+      widget._flag.textContent = name;
+      // 第 1 行顶部空间较窄时，姓名标签向下贴合避免被编辑器顶边裁切
+      widget._flag.style.top = posLine <= 1 ? '0px' : '-18px';
+      widget._position = { lineNumber: posLine, column: posCol };
+      editor.layoutContentWidget(widget);
+    });
+
+    // 清理已离开或无光标的成员 Widget
+    cursorWidgetsRef.current.forEach((widget, cid) => {
+      if (!activeIds.has(cid)) {
+        try { editor.removeContentWidget(widget); } catch {}
+        cursorWidgetsRef.current.delete(cid);
+      }
+    });
+
+    remoteSelDecorations.current.set(allDecos);
+  };
+
+  const updateRemoteCursor = (payload) => {
+    if (!payload) return;
+    const cid = payload.clientId || 'legacy';
+    if (cid === myClientIdRef.current) return;
+    remoteCursorsRef.current.set(cid, {
+      name: payload.name || 'User',
+      color: payload.color || '#f59e0b',
+      selections: Array.isArray(payload.selections) ? payload.selections : [],
+    });
+    renderAllRemoteCursors();
+  };
+
+  const syncRemoteCursorsWithPresence = (list) => {
+    const onlineMap = new Map();
+    for (const p of list || []) {
+      if (p && p.id) onlineMap.set(p.id, p);
+    }
+    let changed = false;
+    remoteCursorsRef.current.forEach((cur, cid) => {
+      if (cid === 'legacy') return;
+      const p = onlineMap.get(cid);
+      if (!p) {
+        remoteCursorsRef.current.delete(cid);
+        changed = true;
+      } else if (p.name !== cur.name || p.color !== cur.color) {
+        cur.name = p.name;
+        cur.color = p.color;
+        changed = true;
+      }
+    });
+    if (changed) renderAllRemoteCursors();
   };
 
   // 将局部文字颜色区间渲染为 Monaco inlineClassName 装饰
@@ -1425,7 +1568,19 @@ export default function App() {
     sendText('', [], [], []);
   };
 
-  // 无 token：显示「粘贴邀请链接」入口
+  const commitNameChange = (raw) => {
+    const clean = normalizeCustomName(raw);
+    if (!clean) return false;
+    setUserName(clean);
+    localStorage.setItem('pad_user_name', clean);
+    setEditingName(false);
+    if (wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify({ type: 'NAME_SYNC', payload: { name: clean } }));
+    }
+    return true;
+  };
+
+  // 无 token：显示「粘贴邀请链接 + 输入名字」入口
   if (!token) {
     return (
       <>
@@ -1436,12 +1591,40 @@ export default function App() {
           updateBannerText={updateBannerText}
           onCheckUpdate={handleManualCheckUpdate}
           onOpenUpdateModal={() => setShowUpdateModal(true)}
+          initialName={userName}
           onJoin={(room, tok, user, wsOrigin) => {
             setRoomId(room);
             setToken(tok);
-            if (user) setUserName(user);
+            if (user) {
+              setUserName(user);
+              localStorage.setItem('pad_user_name', user);
+            }
             if (wsOrigin) setWsBase(wsOrigin);
           }}
+        />
+        {showUpdateModal && updateInfo && (
+          <UpdateModal
+            updateInfo={updateInfo}
+            onClose={() => setShowUpdateModal(false)}
+          />
+        )}
+      </>
+    );
+  }
+
+  // 有 token 但尚未设置个人名字：进入 Pad 前先输入自己的名字（CoderPad 风格，不再使用默认 Client/Mentor）
+  if (!userName) {
+    return (
+      <>
+        <NameGate
+          roomId={roomId}
+          appVersion={appVersion}
+          updateInfo={updateInfo}
+          checkingUpdate={checkingUpdate}
+          updateBannerText={updateBannerText}
+          onCheckUpdate={handleManualCheckUpdate}
+          onOpenUpdateModal={() => setShowUpdateModal(true)}
+          onSubmit={(name) => commitNameChange(name)}
         />
         {showUpdateModal && updateInfo && (
           <UpdateModal
@@ -1820,19 +2003,24 @@ export default function App() {
             if (colorMarksRef.current.length > 0) renderColorMarks(colorMarksRef.current);
             if (boldMarksRef.current.length > 0) renderBoldMarks(boldMarksRef.current);
             if (sizeMarksRef.current.length > 0) renderSizeMarks(sizeMarksRef.current);
+            if (remoteCursorsRef.current.size > 0) renderAllRemoteCursors();
             monaco.editor.setTheme('codex-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
-            // 导师端：记录非空选区用于局部改色/加粗/调字号，并把选区实时发给客户
+            // 导师端注册加粗快捷键
             if (!isClientApp) {
-              // ⌘B / Ctrl+B 切换选中文字加粗（handleToggleSelectionBold 只依赖 ref 与 setState，首帧闭包可安全复用）
               editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, handleToggleSelectionBold);
-              editor.onDidChangeCursorSelection(() => {
-                const selections = (editor.getSelections() || []).map((s) => ({
-                  startLineNumber: s.startLineNumber,
-                  startColumn: s.startColumn,
-                  endLineNumber: s.endLineNumber,
-                  endColumn: s.endColumn,
-                }));
+            }
+            // 双端（导师 + 候选人）：点击任意位置或框选时，实时同步光标与选区位置，对方在该位置显示 CoderPad 风格的名字标签
+            editor.onDidChangeCursorSelection(() => {
+              const selections = (editor.getSelections() || []).map((s) => ({
+                startLineNumber: s.startLineNumber,
+                startColumn: s.startColumn,
+                endLineNumber: s.endLineNumber,
+                endColumn: s.endColumn,
+                positionLineNumber: s.positionLineNumber,
+                positionColumn: s.positionColumn,
+              }));
+              if (!isClientApp) {
                 const nonEmpty = selections.filter(
                   (s) => s.startLineNumber !== s.endLineNumber || s.startColumn !== s.endColumn
                 );
@@ -1852,10 +2040,10 @@ export default function App() {
                   setHasSelection(false);
                   setSelectionFontSize(String(DEFAULT_FONT_SIZE));
                 }
-                if (wsRef.current?.readyState !== 1) return;
-                wsRef.current.send(JSON.stringify({ type: 'SEL_SYNC', payload: { selections } }));
-              });
-            }
+              }
+              if (wsRef.current?.readyState !== 1) return;
+              wsRef.current.send(JSON.stringify({ type: 'SEL_SYNC', payload: { selections } }));
+            });
           }}
           options={{
             readOnly: isClientApp,
@@ -1895,12 +2083,54 @@ export default function App() {
         {destroyedMsg && <span style={{ color: '#ef4444', fontSize: '12px' }}>{destroyedMsg}</span>}
 
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
-          {participants.map((p, idx) => (
-            <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <span style={{ width: '12px', height: '12px', borderRadius: '3px', background: p.color || '#00bcd4' }} />
-              <span style={{ color: '#e5e5e5', fontWeight: 500 }}>{p.name}</span>
-            </div>
-          ))}
+          {participants.map((p, idx) => {
+            const isMe = p.id && p.id === myClientIdRef.current;
+            return (
+              <div
+                key={p.id || idx}
+                style={{ display: 'flex', alignItems: 'center', gap: '6px', WebkitAppRegion: 'no-drag' }}
+              >
+                <span style={{ width: '12px', height: '12px', borderRadius: '3px', background: p.color || '#00bcd4' }} />
+                {isMe && editingName ? (
+                  <input
+                    autoFocus
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    onBlur={() => {
+                      if (!commitNameChange(nameDraft)) setEditingName(false);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitNameChange(nameDraft);
+                      if (e.key === 'Escape') setEditingName(false);
+                    }}
+                    placeholder="输入你的名字"
+                    style={{
+                      background: '#1e293b', color: '#f8fafc', border: '1px solid #10b981',
+                      borderRadius: '4px', padding: '1px 6px', fontSize: '12px', width: '96px', outline: 'none',
+                    }}
+                  />
+                ) : (
+                  <span
+                    onClick={() => {
+                      if (isMe) {
+                        setNameDraft(userName);
+                        setEditingName(true);
+                      }
+                    }}
+                    title={isMe ? '点击修改你的名字' : p.name}
+                    style={{
+                      color: '#e5e5e5',
+                      fontWeight: 500,
+                      cursor: isMe ? 'pointer' : 'default',
+                      borderBottom: isMe ? '1px dashed rgba(148, 163, 184, 0.45)' : 'none',
+                    }}
+                  >
+                    {p.name}{isMe ? ' (我)' : ''}
+                  </span>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -2313,9 +2543,119 @@ function parseLink(raw) {
   return null;
 }
 
-// ── 加入入口：客户粘贴导师发的邀请链接 ──
+// ── 进入 Pad 前输入个人名字（当已通过 URL 拿到 room+token，但尚未填写个人名字时显示）──
+function NameGate({
+  roomId,
+  onSubmit,
+  appVersion,
+  updateInfo,
+  checkingUpdate,
+  updateBannerText,
+  onCheckUpdate,
+  onOpenUpdateModal,
+}) {
+  const [name, setName] = useState(() => normalizeCustomName(localStorage.getItem('pad_user_name')) || '');
+  const [error, setError] = useState('');
+
+  const handleConfirm = () => {
+    const clean = normalizeCustomName(name);
+    if (!clean) {
+      setError('请输入你的名字（不能使用默认的 Client / Mentor / Candidate）');
+      return;
+    }
+    onSubmit(clean);
+  };
+
+  return (
+    <div style={{
+      height: '100vh', display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center', gap: '14px',
+      background: '#0d0d0d', color: '#e5e5e5', fontFamily: uiFont, padding: '20px',
+      position: 'relative',
+      WebkitAppRegion: isClientApp ? 'drag' : 'no-drag',
+    }}>
+      {isClientApp && (
+        <div style={{
+          position: 'absolute', top: '14px', right: '18px',
+          display: 'flex', alignItems: 'center', gap: '10px',
+          WebkitAppRegion: 'no-drag',
+        }}>
+          {updateBannerText && (
+            <span style={{ color: '#34d399', fontSize: '12px' }}>{updateBannerText}</span>
+          )}
+          <span style={{ color: '#64748b', fontSize: '12px', fontFamily: codeFont }}>
+            v{appVersion || '1.0.0'}
+          </span>
+          <button
+            onClick={() => (updateInfo?.hasUpdate ? onOpenUpdateModal?.() : onCheckUpdate?.())}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: '6px',
+              background: updateInfo?.hasUpdate ? 'rgba(56, 189, 248, 0.18)' : '#1a1a1a',
+              color: updateInfo?.hasUpdate ? '#38bdf8' : '#cbd5e1',
+              border: `1px solid ${updateInfo?.hasUpdate ? 'rgba(56, 189, 248, 0.5)' : '#333'}`,
+              borderRadius: '6px', padding: '5px 11px', fontSize: '12px', fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            {updateInfo?.hasUpdate && (
+              <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#38bdf8' }} />
+            )}
+            {checkingUpdate
+              ? '检查中…'
+              : updateInfo?.hasUpdate
+                ? `发现新版本 v${updateInfo.latestVersion}`
+                : '检查更新'}
+          </button>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '2px' }}>
+        <BrandLogo size={38} />
+        <div>
+          <div style={{ fontSize: '20px', fontWeight: 700, letterSpacing: '0.3px', color: '#f8fafc' }}>GlassPad</div>
+          <div style={{ fontSize: '12px', color: '#10b981', fontWeight: 500 }}>
+            进入房间 #{roomId}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ color: '#9ca3af', fontSize: '13px' }}>
+        请输入你的名字（点击编辑器任意位置时，其他成员会看到你的名字标签）
+      </div>
+
+      <input
+        autoFocus
+        value={name}
+        onChange={(e) => { setName(e.target.value); setError(''); }}
+        onKeyDown={(e) => { if (e.key === 'Enter') handleConfirm(); }}
+        placeholder="输入你的名字，例如：Alex / 张三"
+        style={{
+          width: '100%', maxWidth: 340, background: '#1f1f1f', border: '1px solid #333',
+          borderRadius: '8px', color: '#e5e5e5', padding: '12px 14px', fontSize: '13.5px',
+          outline: 'none', WebkitAppRegion: 'no-drag',
+        }}
+      />
+
+      <button
+        onClick={handleConfirm}
+        style={{
+          background: '#10b981', color: '#04281f', border: 'none', borderRadius: '6px',
+          padding: '10px 28px', fontSize: '14px', fontWeight: 600, cursor: 'pointer',
+          WebkitAppRegion: 'no-drag',
+        }}
+      >
+        进入 Pad
+      </button>
+
+      {error && <div style={{ color: '#ef4444', fontSize: '13px' }}>{error}</div>}
+    </div>
+  );
+}
+
+// ── 加入入口：客户粘贴导师发的邀请链接 + 输入自己的名字 ──
 function JoinGate({
   onJoin,
+  initialName,
   appVersion,
   updateInfo,
   checkingUpdate,
@@ -2324,15 +2664,21 @@ function JoinGate({
   onOpenUpdateModal,
 }) {
   const [input, setInput] = useState('');
+  const [name, setName] = useState(() => normalizeCustomName(initialName) || normalizeCustomName(localStorage.getItem('pad_user_name')) || '');
   const [error, setError] = useState('');
 
-  const tryJoin = (value) => {
+  const tryJoin = (value, customName = name) => {
     const parsed = parseLink(value);
     if (!parsed) {
       setError('链接无效，请粘贴完整的邀请链接');
       return;
     }
-    onJoin(parsed.room, parsed.token, parsed.user || 'Client', parsed.wsOrigin);
+    const cleanName = normalizeCustomName(customName) || normalizeCustomName(parsed.user);
+    if (!cleanName) {
+      setError('请先在上方输入你的名字');
+      return;
+    }
+    onJoin(parsed.room, parsed.token, cleanName, parsed.wsOrigin);
   };
 
   const pasteFromClipboard = async () => {
@@ -2341,7 +2687,7 @@ function JoinGate({
         ? await window.electronAPI.readClipboardText()
         : await navigator.clipboard.readText();
       setInput(value);
-      tryJoin(value);
+      tryJoin(value, name);
     } catch {
       setError('无法读取剪贴板，请手动粘贴');
     }
@@ -2350,7 +2696,7 @@ function JoinGate({
   return (
     <div style={{
       height: '100vh', display: 'flex', flexDirection: 'column',
-      alignItems: 'center', justifyContent: 'center', gap: '14px',
+      alignItems: 'center', justifyContent: 'center', gap: '12px',
       background: '#0d0d0d', color: '#e5e5e5', fontFamily: uiFont, padding: '20px',
       position: 'relative',
       WebkitAppRegion: isClientApp ? 'drag' : 'no-drag',
@@ -2398,7 +2744,18 @@ function JoinGate({
           <div style={{ fontSize: '12px', color: '#10b981', fontWeight: 500 }}>加入实时提词房间</div>
         </div>
       </div>
-      <div style={{ color: '#9ca3af', fontSize: '13px' }}>复制导师发的邀请链接，点「从剪贴板粘贴」即可加入</div>
+      <div style={{ color: '#9ca3af', fontSize: '13px' }}>输入你的名字并粘贴邀请链接即可加入</div>
+
+      <input
+        value={name}
+        onChange={(e) => { setName(e.target.value); setError(''); }}
+        placeholder="你的名字（例如：Alex / 张三）"
+        style={{
+          width: '100%', maxWidth: 420, background: '#1f1f1f', border: '1px solid #333',
+          borderRadius: '8px', color: '#e5e5e5', padding: '11px 14px', fontSize: '13px',
+          outline: 'none', WebkitAppRegion: 'no-drag',
+        }}
+      />
 
       <input
         value={input}
@@ -2409,10 +2766,10 @@ function JoinGate({
             e.preventDefault();
             setInput(pasted);
             setError('');
-            tryJoin(pasted);
+            tryJoin(pasted, name);
           }
         }}
-        onKeyDown={(e) => { if (e.key === 'Enter') tryJoin(input); }}
+        onKeyDown={(e) => { if (e.key === 'Enter') tryJoin(input, name); }}
         placeholder="https://.../?room=xxxx&token=xxxx"
         style={{
           width: '100%', maxWidth: 420, background: '#1f1f1f', border: '1px solid #333',
@@ -2429,10 +2786,10 @@ function JoinGate({
             padding: '10px 20px', fontSize: '14px', fontWeight: 600, cursor: 'pointer',
           }}
         >
-          从剪贴板粘贴
+          从剪贴板粘贴并加入
         </button>
         <button
-          onClick={() => tryJoin(input)}
+          onClick={() => tryJoin(input, name)}
           style={{
             background: '#1f1f1f', color: '#d4d4d4', border: '1px solid #333', borderRadius: '6px',
             padding: '10px 16px', fontSize: '13px', cursor: 'pointer',

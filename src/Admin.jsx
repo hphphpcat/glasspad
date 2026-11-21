@@ -89,9 +89,9 @@ export default function Admin() {
     }
   };
 
-  // 邀请链接：客户点开即进，带 room + token + user=Client
-  const buildLink = (roomId, token, user) =>
-    `${window.location.origin}/?room=${roomId}&token=${token}&user=${user}`;
+  // 邀请链接：不写死 Client/Mentor 默认名，让成员进入 Pad 时输入自己的名字
+  const buildLink = (roomId, token) =>
+    `${window.location.origin}/?room=${roomId}&token=${token}`;
 
   const fetchRooms = useCallback(async (adminKey, silent = false) => {
     const k = (adminKey ?? key).trim();
@@ -463,19 +463,19 @@ export default function Admin() {
 
               <LinkRow
                 label="发给客户（候选人只读端）："
-                url={buildLink(created.roomId, created.token, 'Client')}
+                url={buildLink(created.roomId, created.token)}
                 color="#60a5fa"
                 copied={copiedTag === 'new-client'}
-                onCopy={() => copy(buildLink(created.roomId, created.token, 'Client'), 'new-client')}
+                onCopy={() => copy(buildLink(created.roomId, created.token), 'new-client')}
               />
               <div style={{ height: '8px' }} />
               <LinkRow
                 label="导师自己（网页提词端）："
-                url={buildLink(created.roomId, created.token, 'Mentor')}
+                url={buildLink(created.roomId, created.token)}
                 color="#fbbf24"
                 copied={copiedTag === 'new-mentor'}
-                onCopy={() => copy(buildLink(created.roomId, created.token, 'Mentor'), 'new-mentor')}
-                openUrl={buildLink(created.roomId, created.token, 'Mentor')}
+                onCopy={() => copy(buildLink(created.roomId, created.token), 'new-mentor')}
+                openUrl={buildLink(created.roomId, created.token)}
               />
             </div>
           )}
@@ -534,8 +534,8 @@ export default function Admin() {
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
             {rooms.map((room) => {
-              const clientUrl = buildLink(room.roomId, room.token, 'Client');
-              const mentorUrl = buildLink(room.roomId, room.token, 'Mentor');
+              const clientUrl = buildLink(room.roomId, room.token);
+              const mentorUrl = buildLink(room.roomId, room.token);
               const isOnline = room.onlineCount > 0;
               const isDestroying = destroyingId === room.roomId;
 
