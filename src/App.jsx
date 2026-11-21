@@ -11,15 +11,117 @@ const RTC_ICE_SERVERS = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
 ];
 
-// 字体颜色快捷预设：空字符串 '' 代表恢复 Monaco 默认语法高亮
+// 字体颜色快捷预设：空字符串 '' 代表清除选中文本的自定义颜色（恢复 Monaco 默认语法高亮）
 const FONT_COLOR_PRESETS = [
-  { label: '默认高亮', value: '', swatch: 'linear-gradient(135deg, #38bdf8 0%, #34d399 50%, #f59e0b 100%)' },
+  { label: '清除选中色', value: '', swatch: 'linear-gradient(135deg, #38bdf8 0%, #34d399 50%, #f59e0b 100%)' },
   { label: '纯白', value: '#f8fafc', swatch: '#f8fafc' },
   { label: '荧光绿', value: '#34d399', swatch: '#34d399' },
   { label: '冰蓝', value: '#38bdf8', swatch: '#38bdf8' },
   { label: '明黄', value: '#facc15', swatch: '#facc15' },
-  { label: '深黑(白底用)', value: '#111827', swatch: '#111827' },
+  { label: '亮红', value: '#f87171', swatch: '#f87171' },
 ];
+
+// 动态注入单色 Monaco inlineClassName 样式，实现任意 Hex 颜色的局部选中着色
+const injectedInlineColorClasses = new Set();
+function getInlineColorClassName(hex) {
+  const clean = String(hex || '').trim().toLowerCase();
+  if (!/^#[0-9a-f]{6}$/.test(clean)) return '';
+  const className = `gp-inline-color-${clean.slice(1)}`;
+  if (!injectedInlineColorClasses.has(className) && typeof document !== 'undefined') {
+    let styleEl = document.getElementById('gp-inline-color-styles');
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'gp-inline-color-styles';
+      document.head.appendChild(styleEl);
+    }
+    styleEl.textContent += `.monaco-editor .view-line span.${className}, .monaco-editor .view-line span.${className} span { color: ${clean} !important; }\n`;
+    injectedInlineColorClasses.add(className);
+  }
+  return className;
+}
+
+// 规范化局部颜色区间：排序、剔除无效项、合并相邻同色区间
+function normalizeColorMarks(marks) {
+  if (!Array.isArray(marks)) return [];
+  const valid = marks
+    .filter((m) => m && Number.isInteger(m.start) && Number.isInteger(m.end) && m.start >= 0 && m.end > m.start && /^#[0-9a-fA-F]{6}$/.test(m.color || ''))
+    .map((m) => ({ start: m.start, end: m.end, color: m.color.toLowerCase() }))
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+
+  const merged = [];
+  for (const seg of valid) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.color === seg.color && prev.end >= seg.start) {
+      prev.end = Math.max(prev.end, seg.end);
+    } else {
+      merged.push({ ...seg });
+    }
+  }
+  return merged;
+}
+
+// 在给定文本区间集合 [start, end) 上应用或清除局部颜色（color 为空串则清除该区间颜色）
+function applyColorToOffsets(marks, ranges, color) {
+  const validRanges = ranges
+    .filter((r) => r && Number.isInteger(r.start) && Number.isInteger(r.end) && r.end > r.start)
+    .sort((a, b) => a.start - b.start);
+  if (validRanges.length === 0) return normalizeColorMarks(marks);
+
+  let next = normalizeColorMarks(marks);
+  for (const r of validRanges) {
+    const carved = [];
+    for (const m of next) {
+      if (m.end <= r.start || m.start >= r.end) {
+        carved.push(m);
+      } else {
+        if (m.start < r.start) carved.push({ start: m.start, end: r.start, color: m.color });
+        if (m.end > r.end) carved.push({ start: r.end, end: m.end, color: m.color });
+      }
+    }
+    if (color && /^#[0-9a-fA-F]{6}$/.test(color)) {
+      carved.push({ start: r.start, end: r.end, color: color.toLowerCase() });
+    }
+    next = normalizeColorMarks(carved);
+  }
+  return next;
+}
+
+// 文本变更时按 Monaco contentChanges 增量偏移更新局部颜色区间
+function shiftColorMarksByChanges(marks, changes) {
+  if (!Array.isArray(marks) || marks.length === 0 || !Array.isArray(changes) || changes.length === 0) {
+    return marks || [];
+  }
+  let current = marks.map((m) => ({ ...m }));
+  // Monaco 的 changes 按文档后到前或顺序给出，逐条以 offset 调整
+  const sortedChanges = [...changes].sort((a, b) => b.rangeOffset - a.rangeOffset);
+  for (const ch of sortedChanges) {
+    const editStart = ch.rangeOffset;
+    const editOldEnd = ch.rangeOffset + ch.rangeLength;
+    const insertedLen = (ch.text || '').length;
+    const delta = insertedLen - ch.rangeLength;
+    const updated = [];
+    for (const m of current) {
+      if (m.end <= editStart) {
+        updated.push(m);
+      } else if (m.start >= editOldEnd) {
+        updated.push({ start: m.start + delta, end: m.end + delta, color: m.color });
+      } else if (m.start >= editStart && m.end <= editOldEnd) {
+        // 整段被替换/删除，移除该着色
+      } else if (m.start < editStart && m.end > editOldEnd) {
+        const newEnd = m.end + delta;
+        if (newEnd > m.start) updated.push({ start: m.start, end: newEnd, color: m.color });
+      } else if (m.start < editStart) {
+        if (editStart > m.start) updated.push({ start: m.start, end: editStart, color: m.color });
+      } else {
+        const newStart = editStart + insertedLen;
+        const newEnd = m.end + delta;
+        if (newEnd > newStart) updated.push({ start: newStart, end: newEnd, color: m.color });
+      }
+    }
+    current = updated;
+  }
+  return normalizeColorMarks(current);
+}
 
 const normalizeLF = (s) => (s || '').replace(/\r\n/g, '\n');
 
@@ -48,7 +150,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.5';
+  let currentVersion = '1.0.6';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -159,16 +261,14 @@ export default function App() {
     () => params.get('user') || (isClientApp ? 'Client' : 'Mentor')
   );
 
-  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）/ 字体颜色（空代表默认语法高亮）
+  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）
   const [opacity, setOpacity] = useState(() => Number(localStorage.getItem('pad_opacity')) || 0.78);
   const [supportsFrost, setSupportsFrost] = useState(false);
   const [frostedGlass, setFrostedGlass] = useState(() => localStorage.getItem('pad_frost_v2') === 'true');
-  const [fontColor, setFontColor] = useState(() => localStorage.getItem('pad_font_color') || '');
-
-  const handleFontColorChange = (nextColor) => {
-    setFontColor(nextColor);
-    localStorage.setItem('pad_font_color', nextColor);
-  };
+  // 导师端局部文字颜色工具条状态（仅作用于选中文本，不全局改色；客户端无修改入口）
+  const [pickerColor, setPickerColor] = useState('#34d399');
+  const [hasSelection, setHasSelection] = useState(false);
+  const [colorTip, setColorTip] = useState('');
 
   const [text, setText] = useState('');
   const [language, setLanguage] = useState('python');
@@ -199,6 +299,8 @@ export default function App() {
   const editorRef = useRef(null);
   const isRemote = useRef(false);
   const remoteSelDecorations = useRef(null); // 对方选区的高亮装饰集合
+  const colorMarksDecorations = useRef(null); // 选中文本局部字色装饰集合
+  const colorMarksRef = useRef([]); // 当前文档的局部字色区间 [{ start, end, color }]
   const latestText = useRef(''); // 最近收到的远端文字（编辑器挂载前到达时用于补写）
 
   // 客户端共享屏幕用到的 WebRTC / Media 引用
@@ -741,8 +843,15 @@ export default function App() {
           latestText.current = clean;
           applyRemoteText(clean);
           setText(clean);
+          if (Array.isArray(payload.colorMarks)) {
+            colorMarksRef.current = normalizeColorMarks(payload.colorMarks);
+            renderColorMarks(colorMarksRef.current);
+          }
           if (payload.language) setLanguage(payload.language);
           if (isClientApp) scrollToBottom();
+        } else if (type === 'COLOR_MARKS_SYNC') {
+          colorMarksRef.current = normalizeColorMarks(payload?.colorMarks || []);
+          renderColorMarks(colorMarksRef.current);
         } else if (type === 'LANG_SYNC') {
           setLanguage(payload.language);
         } else if (type === 'SEL_SYNC') {
@@ -811,6 +920,83 @@ export default function App() {
     );
   };
 
+  // 将局部文字颜色区间渲染为 Monaco inlineClassName 装饰
+  const renderColorMarks = (marks) => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+    if (!colorMarksDecorations.current) {
+      colorMarksDecorations.current = editor.createDecorationsCollection();
+    }
+    const maxLen = model.getValueLength();
+    const decorations = [];
+    for (const m of marks || []) {
+      const start = Math.max(0, Math.min(maxLen, m.start));
+      const end = Math.max(0, Math.min(maxLen, m.end));
+      if (end <= start) continue;
+      const inlineClassName = getInlineColorClassName(m.color);
+      if (!inlineClassName) continue;
+      const from = model.getPositionAt(start);
+      const to = model.getPositionAt(end);
+      decorations.push({
+        range: {
+          startLineNumber: from.lineNumber,
+          startColumn: from.column,
+          endLineNumber: to.lineNumber,
+          endColumn: to.column,
+        },
+        options: {
+          inlineClassName,
+          stickiness: 1,
+        },
+      });
+    }
+    colorMarksDecorations.current.set(decorations);
+  };
+
+  // 导师端：对当前选中的局部文本应用或清除字体颜色，并实时同步给客户端
+  const handleApplySelectionColor = (nextColor) => {
+    if (isClientApp) return;
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+
+    const currentSelections = (editor.getSelections() || []).filter(
+      (s) => s.startLineNumber !== s.endLineNumber || s.startColumn !== s.endColumn
+    );
+    const activeSelections = currentSelections.length > 0 ? currentSelections : [];
+
+    if (activeSelections.length === 0) {
+      setColorTip('请先选中要改色的文字');
+      setTimeout(() => setColorTip(''), 2200);
+      return;
+    }
+
+    const offsetRanges = activeSelections
+      .map((s) => {
+        const a = model.getOffsetAt({ lineNumber: s.startLineNumber, column: s.startColumn });
+        const b = model.getOffsetAt({ lineNumber: s.endLineNumber, column: s.endColumn });
+        return { start: Math.min(a, b), end: Math.max(a, b) };
+      })
+      .filter((r) => r.end > r.start);
+
+    if (offsetRanges.length === 0) {
+      setColorTip('请先选中要改色的文字');
+      setTimeout(() => setColorTip(''), 2200);
+      return;
+    }
+
+    if (nextColor) setPickerColor(nextColor);
+    const nextMarks = applyColorToOffsets(colorMarksRef.current, offsetRanges, nextColor);
+    colorMarksRef.current = nextMarks;
+    renderColorMarks(nextMarks);
+    setColorTip('');
+    if (wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify({ type: 'COLOR_MARKS_SYNC', payload: { colorMarks: nextMarks } }));
+    }
+    editor.focus();
+  };
+
   // 远端文字增量写入：只替换前后缀之间变化的部分，避免整体 setValue 清掉客户的选区
   const applyRemoteText = (newText) => {
     const model = editorRef.current?.getModel();
@@ -839,26 +1025,34 @@ export default function App() {
     isRemote.current = false;
   };
 
-  const sendText = (value) => {
+  const sendText = (value, colorMarks) => {
     if (wsRef.current?.readyState === 1) {
-      wsRef.current.send(JSON.stringify({ type: 'TEXT_SYNC', payload: { text: value } }));
+      const payload = Array.isArray(colorMarks) ? { text: value, colorMarks } : { text: value };
+      wsRef.current.send(JSON.stringify({ type: 'TEXT_SYNC', payload }));
     }
   };
 
-  const handleTextChange = (val) => {
+  const handleTextChange = (val, ev) => {
     if (isClientApp) return; // 客户端只读，不发送
     if (isRemote.current) {
       isRemote.current = false;
       return;
     }
     const clean = normalizeLF(val);
+    if (ev?.changes?.length && colorMarksRef.current.length > 0) {
+      const shifted = shiftColorMarksByChanges(colorMarksRef.current, ev.changes);
+      colorMarksRef.current = shifted;
+      renderColorMarks(shifted);
+    }
     setText(clean);
-    sendText(clean);
+    sendText(clean, colorMarksRef.current);
   };
 
   const clearPad = () => {
+    colorMarksRef.current = [];
+    renderColorMarks([]);
     setText('');
-    sendText('');
+    sendText('', []);
   };
 
   // 无 token：显示「粘贴邀请链接」入口
@@ -1020,9 +1214,6 @@ export default function App() {
                 />
               </label>
 
-              {/* 字体颜色快捷切换 + 自由取色器 */}
-              <FontColorPicker fontColor={fontColor} onChange={handleFontColorChange} />
-
               {supportsFrost && (
                 <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontWeight: 500, color: frostedGlass ? '#10b981' : '#cbd5e1' }}>
                   <input
@@ -1079,7 +1270,16 @@ export default function App() {
             )}
 
             <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <FontColorPicker fontColor={fontColor} onChange={handleFontColorChange} />
+              {colorTip && (
+                <span style={{ color: '#f59e0b', fontSize: '11.5px', whiteSpace: 'nowrap' }}>
+                  {colorTip}
+                </span>
+              )}
+              <SelectionColorPicker
+                pickerColor={pickerColor}
+                hasSelection={hasSelection}
+                onApplyColor={handleApplySelectionColor}
+              />
               <select
                 value={language}
                 onChange={(e) => {
@@ -1183,15 +1383,13 @@ export default function App() {
           </div>
         )}
 
-        {/* 提词编辑器区（客户端只读，支持一键自定义字体颜色） */}
+        {/* 提词编辑器区（客户端只读，实时渲染导师标注的局部文字颜色） */}
         <div
-          className={fontColor ? 'gp-custom-font-color' : ''}
           style={{
             flex: 1,
             minWidth: 0,
             position: 'relative',
             paddingTop: '8px',
-            '--gp-font-color': fontColor || '#e2e8f0',
           }}
         >
           <Editor
@@ -1220,20 +1418,32 @@ export default function App() {
           }}
           onMount={(editor, monaco) => {
             editorRef.current = editor;
-            // WS 的 INIT 可能早于 Monaco 加载完成到达，挂载时补写最新文字
-            if (isClientApp && latestText.current) applyRemoteText(latestText.current);
+            // WS 的 INIT 可能早于 Monaco 加载完成到达，挂载时补写最新文字与局部颜色
+            if (isClientApp && latestText.current) {
+              applyRemoteText(latestText.current);
+            } else if (!isClientApp && latestText.current) {
+              const model = editor.getModel();
+              if (model && model.getValue() !== latestText.current) {
+                applyRemoteText(latestText.current);
+              }
+            }
+            if (colorMarksRef.current.length > 0) renderColorMarks(colorMarksRef.current);
             monaco.editor.setTheme('codex-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
-            // 导师端：把自己的选区实时发给客户
+            // 导师端：记录非空选区用于局部改色，并把选区实时发给客户
             if (!isClientApp) {
               editor.onDidChangeCursorSelection(() => {
-                if (wsRef.current?.readyState !== 1) return;
-                const selections = editor.getSelections().map((s) => ({
+                const selections = (editor.getSelections() || []).map((s) => ({
                   startLineNumber: s.startLineNumber,
                   startColumn: s.startColumn,
                   endLineNumber: s.endLineNumber,
                   endColumn: s.endColumn,
                 }));
+                const nonEmpty = selections.filter(
+                  (s) => s.startLineNumber !== s.endLineNumber || s.startColumn !== s.endColumn
+                );
+                setHasSelection(nonEmpty.length > 0);
+                if (wsRef.current?.readyState !== 1) return;
                 wsRef.current.send(JSON.stringify({ type: 'SEL_SYNC', payload: { selections } }));
               });
             }
@@ -1294,8 +1504,8 @@ export default function App() {
   );
 }
 
-// ── 字体颜色选择器：支持一键切换默认语法高亮、常用高对比度预设色及任意自定义颜色 ──
-function FontColorPicker({ fontColor, onChange }) {
+// ── 导师端选中文本局部字色选择器：仅对当前选中的文字着色或清除，不影响未选中内容 ──
+function SelectionColorPicker({ pickerColor, hasSelection, onApplyColor }) {
   return (
     <div
       style={{
@@ -1303,40 +1513,37 @@ function FontColorPicker({ fontColor, onChange }) {
         alignItems: 'center',
         gap: '5px',
         background: 'rgba(15, 23, 34, 0.65)',
-        border: '1px solid #334155',
+        border: `1px solid ${hasSelection ? 'rgba(16, 185, 129, 0.55)' : '#334155'}`,
         borderRadius: '6px',
         padding: '3px 7px',
         WebkitAppRegion: 'no-drag',
       }}
-      title="切换提词器字体颜色（最左侧彩点恢复默认语法高亮，最右侧可自由取色）"
+      title="先在编辑器中选中部分文字，再点击色点为选中内容改色（最左侧彩点清除选中色，最右侧自由取色）"
     >
-      <span style={{ fontSize: '11.5px', color: '#cbd5e1', fontWeight: 500, marginRight: '2px' }}>
-        字色
+      <span style={{ fontSize: '11.5px', color: hasSelection ? '#34d399' : '#94a3b8', fontWeight: 500, marginRight: '2px' }}>
+        选中字色
       </span>
-      {FONT_COLOR_PRESETS.map((preset) => {
-        const active = (fontColor || '') === preset.value;
-        return (
-          <button
-            key={preset.label}
-            type="button"
-            onClick={() => onChange(preset.value)}
-            title={preset.label}
-            style={{
-              width: '14px',
-              height: '14px',
-              borderRadius: '50%',
-              padding: 0,
-              background: preset.swatch,
-              border: active ? '2px solid #10b981' : '1px solid rgba(255,255,255,0.35)',
-              boxShadow: active ? '0 0 0 1px rgba(16,185,129,0.5)' : 'none',
-              cursor: 'pointer',
-              flexShrink: 0,
-            }}
-          />
-        );
-      })}
+      {FONT_COLOR_PRESETS.map((preset) => (
+        <button
+          key={preset.label}
+          type="button"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => onApplyColor(preset.value)}
+          title={preset.label}
+          style={{
+            width: '14px',
+            height: '14px',
+            borderRadius: '50%',
+            padding: 0,
+            background: preset.swatch,
+            border: '1px solid rgba(255,255,255,0.4)',
+            cursor: 'pointer',
+            flexShrink: 0,
+          }}
+        />
+      ))}
       <label
-        title="点击自定义任意字体颜色"
+        title="为选中文字自定义任意颜色"
         style={{
           display: 'inline-flex',
           alignItems: 'center',
@@ -1350,8 +1557,8 @@ function FontColorPicker({ fontColor, onChange }) {
       >
         <input
           type="color"
-          value={fontColor && /^#[0-9a-fA-F]{6}$/.test(fontColor) ? fontColor : '#34d399'}
-          onChange={(e) => onChange(e.target.value)}
+          value={pickerColor && /^#[0-9a-fA-F]{6}$/.test(pickerColor) ? pickerColor : '#34d399'}
+          onChange={(e) => onApplyColor(e.target.value)}
           style={{
             opacity: 0,
             position: 'absolute',
@@ -1367,9 +1574,9 @@ function FontColorPicker({ fontColor, onChange }) {
           style={{
             fontSize: '11px',
             lineHeight: 1,
-            color: fontColor ? fontColor : '#94a3b8',
+            color: pickerColor || '#94a3b8',
             fontWeight: 700,
-            borderBottom: `2px solid ${fontColor || '#94a3b8'}`,
+            borderBottom: `2px solid ${pickerColor || '#94a3b8'}`,
           }}
         >
           A

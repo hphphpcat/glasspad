@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.5';
+let pkgVersion = '1.0.6';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.5';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.6';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增「⚡ 1 秒极速热更新」：直接从 Railway 高速节点秒级热更，免下载 98MB 安装包、不丢 macOS 录屏权限\n2. 新增顶栏「字色」功能：支持一键切换纯白/荧光绿/冰蓝/明黄/深黑(白底用)、恢复默认语法高亮及自由取色器\n3. macOS 启动与更新自动执行 xattr -cr 及 ad-hoc 签名修复（防提示已损坏）',
+  notes: process.env.RELEASE_NOTES || '1. 字体颜色升级为「选中文本局部改色」：导师端选中任意文字即可单独着色并实时同步到客户端，不再全局覆盖\n2. 客户端顶栏移除字色修改控件，仅实时呈现导师标注的局部颜色\n3. 支持「⚡ 1 秒极速热更新」：直接从 Railway 高速节点秒级热更',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -100,6 +100,21 @@ function loadRelease() {
   }
 }
 
+function sanitizeColorMarks(raw) {
+  if (!Array.isArray(raw)) return [];
+  const list = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const start = Number(item.start);
+    const end = Number(item.end);
+    const color = typeof item.color === 'string' ? item.color.trim() : '';
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start) continue;
+    if (!/^#[0-9a-fA-F]{6}$/.test(color)) continue;
+    list.push({ start, end, color: color.toLowerCase() });
+  }
+  return list;
+}
+
 function persistRooms() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -109,6 +124,7 @@ function persistRooms() {
         token: room.token,
         note: room.note || '',
         text: room.text,
+        colorMarks: room.colorMarks || [],
         language: room.language,
         createdAt: room.createdAt || room.lastActive,
         lastActive: room.lastActive,
@@ -129,6 +145,7 @@ function loadRooms() {
         token: r.token,
         note: r.note || '',
         text: r.text || '',
+        colorMarks: sanitizeColorMarks(r.colorMarks),
         language: r.language || 'python',
         clients: new Map(),
         sharerId: null,
@@ -154,6 +171,7 @@ function getOrCreateRoom(roomId, token, note = '') {
       token: token || randomToken(),
       note: note || '',
       text: '',
+      colorMarks: [],
       language: 'python',
       clients: new Map(),
       sharerId: null,
@@ -423,12 +441,13 @@ wss.on('connection', (ws, req) => {
     });
   };
 
-  // 下发当前房间文字内容、自身的 clientId 以及当前屏幕共享状态
+  // 下发当前房间文字内容、局部字体颜色标记、自身的 clientId 以及当前屏幕共享状态
   ws.send(JSON.stringify({
     type: 'INIT',
     payload: {
       clientId,
       text: room.text,
+      colorMarks: room.colorMarks || [],
       language: room.language,
       screenShare: {
         active: Boolean(room.sharerId),
@@ -446,11 +465,26 @@ wss.on('connection', (ws, req) => {
 
     if (msg.type === 'TEXT_SYNC') {
       room.text = msg.payload.text;
+      if (Array.isArray(msg.payload.colorMarks)) {
+        room.colorMarks = sanitizeColorMarks(msg.payload.colorMarks);
+      }
+      room.lastActive = Date.now();
+      persistRooms();
+      const outPayload = Array.isArray(msg.payload.colorMarks)
+        ? { text: room.text, colorMarks: room.colorMarks }
+        : { text: room.text };
+      room.clients.forEach((_, c) => {
+        if (c !== ws && c.readyState === 1) {
+          c.send(JSON.stringify({ type: 'TEXT_SYNC', payload: outPayload }));
+        }
+      });
+    } else if (msg.type === 'COLOR_MARKS_SYNC') {
+      room.colorMarks = sanitizeColorMarks(msg.payload?.colorMarks);
       room.lastActive = Date.now();
       persistRooms();
       room.clients.forEach((_, c) => {
         if (c !== ws && c.readyState === 1) {
-          c.send(JSON.stringify({ type: 'TEXT_SYNC', payload: msg.payload }));
+          c.send(JSON.stringify({ type: 'COLOR_MARKS_SYNC', payload: { colorMarks: room.colorMarks } }));
         }
       });
     } else if (msg.type === 'LANG_SYNC') {
