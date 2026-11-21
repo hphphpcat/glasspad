@@ -289,15 +289,43 @@ export default function App() {
     if (!session || !viewerId) return;
     removeViewerPeer(viewerId);
 
-    const pc = new RTCPeerConnection({ iceServers: RTC_ICE_SERVERS });
+    const pc = new RTCPeerConnection({
+      iceServers: RTC_ICE_SERVERS,
+      bundlePolicy: 'max-bundle',
+    });
     const entry = { pc, pendingIce: [] };
     session.peers.set(viewerId, entry);
 
+    const sharedStream = session.outboundStream || session.displayStream;
+
     if (session.videoTrack) {
-      pc.addTrack(session.videoTrack, session.displayStream);
+      const videoSender = pc.addTrack(session.videoTrack, sharedStream);
+      // 编码器低延迟与代码清晰度优先：限制最大 2.5Mbps / 30fps，弱网宁可降帧率也不模糊代码文字
+      try {
+        const params = videoSender.getParameters() || {};
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}];
+        }
+        params.encodings[0].maxBitrate = 2_500_000;
+        params.encodings[0].maxFramerate = 30;
+        params.encodings[0].priority = 'high';
+        params.encodings[0].networkPriority = 'high';
+        params.degradationPreference = 'maintain-resolution';
+        videoSender.setParameters(params).catch(() => {});
+      } catch {}
     }
     if (session.audioTrack) {
-      pc.addTrack(session.audioTrack, session.displayStream);
+      const audioSender = pc.addTrack(session.audioTrack, sharedStream);
+      try {
+        const params = audioSender.getParameters() || {};
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}];
+        }
+        params.encodings[0].maxBitrate = 96_000;
+        params.encodings[0].priority = 'high';
+        params.encodings[0].networkPriority = 'high';
+        audioSender.setParameters(params).catch(() => {});
+      } catch {}
     }
 
     pc.onicecandidate = (ev) => {
@@ -361,12 +389,23 @@ export default function App() {
 
     try {
       // 1. 直接调用 getDisplayMedia 触发系统底层 desktopCapturer.getSources：
-      //    在 macOS 上只有真正发起一次抓屏调用，系统才会把 GlassPad 自动注册进「录屏与系统录音」列表
+      //    限制最大 1920x1080 @ 30fps，避免 Retina/4K 全分辨率软编排队积压造成音画延迟；
+      //    系统内录音频关闭回声消除/降噪/自动增益，保持原始低延迟低失真系统声
       let displayStream;
       try {
         displayStream = await navigator.mediaDevices.getDisplayMedia({
-          video: true,
-          audio: true,
+          video: {
+            width: { ideal: 1920, max: 1920 },
+            height: { ideal: 1080, max: 1080 },
+            frameRate: { ideal: 30, max: 30 },
+          },
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 2,
+            sampleRate: 48000,
+          },
         });
       } catch (captureErr) {
         if (window.electronAPI?.getMediaPermissionStatus) {
@@ -384,13 +423,25 @@ export default function App() {
       let micStream = null;
       try {
         micStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 48000,
+            latency: 0.01,
+          },
         });
       } catch {
         // 无麦克风或未授权时继续仅共享屏幕+系统音频
       }
 
       const videoTrack = displayStream.getVideoTracks()[0] || null;
+      if (videoTrack) {
+        // 明确告知编码器当前是代码/文字屏幕内容，优先保证文字清晰锐利
+        try {
+          if ('contentHint' in videoTrack) videoTrack.contentHint = 'detail';
+        } catch {}
+      }
       const sysAudioTrack = displayStream.getAudioTracks()[0] || null;
       const micAudioTrack = micStream?.getAudioTracks()[0] || null;
 
@@ -400,7 +451,8 @@ export default function App() {
 
       if (sysAudioTrack || micAudioTrack) {
         try {
-          audioCtx = new AudioContext();
+          // 强制 interactive 极低延迟缓冲 + 48000Hz 对齐 WebRTC Opus 原生采样率，消除重采样延迟
+          audioCtx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
           await audioCtx.resume();
           const dest = audioCtx.createMediaStreamDestination();
           if (sysAudioTrack) {
@@ -413,15 +465,23 @@ export default function App() {
             micGain.connect(dest);
           }
           mixedAudioTrack = dest.stream.getAudioTracks()[0] || null;
+          if (mixedAudioTrack && 'contentHint' in mixedAudioTrack) {
+            try { mixedAudioTrack.contentHint = 'speech'; } catch {}
+          }
         } catch {
           mixedAudioTrack = sysAudioTrack || null;
         }
       }
 
+      const outboundStream = new MediaStream();
+      if (videoTrack) outboundStream.addTrack(videoTrack);
+      if (mixedAudioTrack) outboundStream.addTrack(mixedAudioTrack);
+
       const session = {
         stopped: false,
         displayStream,
         micStream,
+        outboundStream,
         audioCtx,
         micGain,
         videoTrack,
@@ -500,12 +560,21 @@ export default function App() {
     try {
       if (sdp && sdp.type === 'offer') {
         closeViewerConnection();
-        const pc = new RTCPeerConnection({ iceServers: RTC_ICE_SERVERS });
+        const pc = new RTCPeerConnection({
+          iceServers: RTC_ICE_SERVERS,
+          bundlePolicy: 'max-bundle',
+        });
         const remoteStream = new MediaStream();
         const viewerState = { pc, sharerId: from, pendingIce: [], stream: remoteStream };
         viewerPcRef.current = viewerState;
 
         pc.ontrack = (ev) => {
+          // 观看端压低 WebRTC JitterBuffer 延迟（目标 50ms），保持音画实时紧跟
+          try {
+            if (ev.receiver && 'playoutDelayHint' in ev.receiver) {
+              ev.receiver.playoutDelayHint = 0.05;
+            }
+          } catch {}
           if (ev.streams && ev.streams[0]) {
             ev.streams[0].getTracks().forEach((t) => remoteStream.addTrack(t));
           } else if (ev.track) {
