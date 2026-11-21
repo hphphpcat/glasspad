@@ -413,9 +413,10 @@ async function applyMacDmgUpdate(dmgPath) {
       }
     }
 
-    // 使用系统 ditto 覆盖更新包并清除 Gatekeeper 隔离标记
+    // 使用系统 ditto 覆盖更新包、清除 Gatekeeper 隔离标记，并执行 ad-hoc 重签名防止提示“已损坏”
     await execFileAsync('ditto', [srcApp, targetApp]);
     await execFileAsync('xattr', ['-cr', targetApp]).catch(() => {});
+    await execFileAsync('codesign', ['--force', '--deep', '--sign', '-', targetApp]).catch(() => {});
 
     // 卸载 dmg 并清理临时安装包
     await execFileAsync('hdiutil', ['detach', mountDir, '-force', '-quiet']).catch(() => {});
@@ -585,8 +586,32 @@ function registerShortcuts() {
   globalShortcut.register('CommandOrControl+Q', () => app.quit());
 }
 
+// macOS 启动时自动清除当前 App Bundle 与 /Applications/GlassPad.app 的 com.apple.quarantine 隔离属性
+function clearMacQuarantineOnLaunch() {
+  if (process.platform !== 'darwin') return;
+  try {
+    const exePath = app.getPath('exe');
+    const appIdx = exePath.indexOf('.app/');
+    const targets = new Set(['/Applications/GlassPad.app']);
+    if (appIdx !== -1) {
+      const bundlePath = exePath.slice(0, appIdx + 4);
+      if (!bundlePath.startsWith('/Volumes/')) {
+        targets.add(bundlePath);
+      }
+    }
+    targets.forEach((target) => {
+      if (fs.existsSync(target)) {
+        execFile('xattr', ['-cr', target], () => {});
+      }
+    });
+  } catch {}
+}
+
 app.whenReady().then(() => {
-  if (process.platform === 'darwin') app.dock.hide(); // 隐藏 Mac Dock 图标
+  if (process.platform === 'darwin') {
+    app.dock.hide(); // 隐藏 Mac Dock 图标
+    clearMacQuarantineOnLaunch();
+  }
   setupSilentScreenCapture();
   createWindow();
   registerShortcuts();

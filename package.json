@@ -1,6 +1,6 @@
 {
   "name": "codex-clone",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "Codex Interview 1:1 复刻：React + Electron + WebSocket 实时协同",
   "main": "electron/main.js",
@@ -36,6 +36,7 @@
   "build": {
     "appId": "com.glasspad.app",
     "productName": "GlassPad",
+    "afterPack": "scripts/afterPack.js",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -71,13 +72,19 @@
       "contents": [
         {
           "x": 130,
-          "y": 220
+          "y": 180
         },
         {
           "x": 410,
-          "y": 220,
+          "y": 180,
           "type": "link",
           "path": "/Applications"
+        },
+        {
+          "x": 270,
+          "y": 340,
+          "type": "file",
+          "path": "build/首次打开防损坏修复.command"
         }
       ]
     }

@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.2';
+let pkgVersion = '1.0.3';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.2';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.3';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增客户端内免浏览器一键静默下载、自动替换安装与重启\n2. 优化屏幕共享 1080p@30fps 与 48kHz 低延迟音画同步',
+  notes: process.env.RELEASE_NOTES || '1. macOS 启动与更新自动执行 xattr -cr 及 ad-hoc 签名修复（防提示已损坏）\n2. 新增客户端内免浏览器一键静默下载、自动替换安装与重启\n3. 优化屏幕共享 1080p@30fps 与 48kHz 低延迟音画同步',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
