@@ -14,6 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const https = require('https');
 const http = require('http');
+const { execFile, spawn } = require('child_process');
 
 let mainWindow;
 const MOVE_STEP = 40;
@@ -281,6 +282,244 @@ ipcMain.handle('OPEN_EXTERNAL_URL', (_e, targetUrl) => {
   const s = String(targetUrl || '').trim();
   if (/^https?:\/\//i.test(s)) {
     return shell.openExternal(s);
+  }
+});
+
+// 向渲染进程推送自动更新进度与状态
+function sendUpdateProgress(payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('UPDATE_PROGRESS', payload);
+  }
+}
+
+// 流式下载文件到本地（支持 GitHub Release 302 多跳重定向与实时进度回调）
+function downloadFileWithProgress(targetUrl, destPath, onProgress, redirects = 6) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(targetUrl);
+    } catch {
+      return reject(new Error('无效的下载链接'));
+    }
+    const client = parsed.protocol === 'https:' ? https : http;
+    const req = client.get(
+      targetUrl,
+      {
+        headers: {
+          'User-Agent': `GlassPad/${app.getVersion()} (${process.platform})`,
+          Accept: '*/*',
+        },
+        timeout: 30000,
+      },
+      (res) => {
+        if (
+          res.statusCode >= 300 &&
+          res.statusCode < 400 &&
+          res.headers.location &&
+          redirects > 0
+        ) {
+          res.resume();
+          const nextUrl = new URL(res.headers.location, targetUrl).toString();
+          return resolve(
+            downloadFileWithProgress(nextUrl, destPath, onProgress, redirects - 1)
+          );
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`下载失败 (HTTP ${res.statusCode})`));
+        }
+
+        const totalBytes = parseInt(res.headers['content-length'] || '0', 10) || 0;
+        let receivedBytes = 0;
+        let lastEmit = 0;
+        const fileStream = fs.createWriteStream(destPath);
+
+        res.on('data', (chunk) => {
+          receivedBytes += chunk.length;
+          const now = Date.now();
+          if (now - lastEmit >= 120 || (totalBytes && receivedBytes === totalBytes)) {
+            lastEmit = now;
+            const percent = totalBytes > 0 ? Math.min(99, Math.round((receivedBytes / totalBytes) * 100)) : 0;
+            onProgress?.({ percent, receivedBytes, totalBytes });
+          }
+        });
+
+        res.pipe(fileStream);
+
+        fileStream.on('finish', () => {
+          fileStream.close(() => {
+            onProgress?.({ percent: 100, receivedBytes, totalBytes: totalBytes || receivedBytes });
+            resolve(destPath);
+          });
+        });
+
+        fileStream.on('error', (err) => {
+          fs.unlink(destPath, () => {});
+          reject(err);
+        });
+      }
+    );
+
+    req.on('timeout', () => {
+      req.destroy(new Error('下载连接超时'));
+    });
+    req.on('error', (err) => {
+      fs.unlink(destPath, () => {});
+      reject(err);
+    });
+  });
+}
+
+function execFileAsync(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      resolve(stdout);
+    });
+  });
+}
+
+// macOS：静默挂载 .dmg -> 用 ditto 覆盖当前 GlassPad.app（或 /Applications/GlassPad.app） -> 清除隔离属性 -> 自动重启
+async function applyMacDmgUpdate(dmgPath) {
+  const mountDir = path.join(os.tmpdir(), `glasspad_mnt_${Date.now()}`);
+  fs.mkdirSync(mountDir, { recursive: true });
+
+  await execFileAsync('hdiutil', [
+    'attach',
+    dmgPath,
+    '-mountpoint',
+    mountDir,
+    '-nobrowse',
+    '-quiet',
+  ]);
+
+  try {
+    const entries = fs.readdirSync(mountDir);
+    const appName = entries.find((item) => item.endsWith('.app'));
+    if (!appName) {
+      throw new Error('更新包内未找到 GlassPad.app');
+    }
+    const srcApp = path.join(mountDir, appName);
+
+    // 定位当前正在运行的 .app 路径（如 /Applications/GlassPad.app/Contents/MacOS/GlassPad）
+    const exePath = app.getPath('exe');
+    const appIdx = exePath.indexOf('.app/');
+    let targetApp = '/Applications/GlassPad.app';
+    if (appIdx !== -1) {
+      const currentBundle = exePath.slice(0, appIdx + 4);
+      // 若当前是从只读卷（如 /Volumes/GlassPad）直接运行的，则安装到 /Applications/GlassPad.app
+      if (!currentBundle.startsWith('/Volumes/')) {
+        targetApp = currentBundle;
+      }
+    }
+
+    // 使用系统 ditto 覆盖更新包并清除 Gatekeeper 隔离标记
+    await execFileAsync('ditto', [srcApp, targetApp]);
+    await execFileAsync('xattr', ['-cr', targetApp]).catch(() => {});
+
+    // 卸载 dmg 并清理临时安装包
+    await execFileAsync('hdiutil', ['detach', mountDir, '-force', '-quiet']).catch(() => {});
+    fs.unlink(dmgPath, () => {});
+
+    // 重新拉起更新后的客户端并退出当前旧进程
+    const relaunchExec = path.join(targetApp, 'Contents', 'MacOS', path.basename(exePath));
+    if (fs.existsSync(relaunchExec)) {
+      app.relaunch({ execPath: relaunchExec });
+    } else {
+      app.relaunch();
+    }
+    app.exit(0);
+  } catch (err) {
+    await execFileAsync('hdiutil', ['detach', mountDir, '-force', '-quiet']).catch(() => {});
+    throw err;
+  }
+}
+
+// Windows：生成后台静默替换脚本，待当前进程退出后覆盖原 portable .exe 并自动重启新版本
+async function applyWinExeUpdate(newExePath) {
+  const currentExe = process.env.PORTABLE_EXECUTABLE_FILE || app.getPath('exe');
+  const batPath = path.join(os.tmpdir(), `glasspad_update_${Date.now()}.bat`);
+  const batContent = [
+    '@echo off',
+    'chcp 65001 >nul',
+    'timeout /t 2 /nobreak >nul',
+    ':retry',
+    `move /y "${newExePath}" "${currentExe}" >nul 2>&1`,
+    'if errorlevel 1 (',
+    '  timeout /t 1 /nobreak >nul',
+    '  goto retry',
+    ')',
+    `start "" "${currentExe}"`,
+    'del "%~f0"',
+  ].join('\r\n');
+
+  fs.writeFileSync(batPath, batContent, 'utf8');
+  const child = spawn('cmd.exe', ['/c', batPath], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+  app.exit(0);
+}
+
+// 软件内一键下载并自动替换更新（无需跳转浏览器）
+let isUpdatingInApp = false;
+ipcMain.handle('DOWNLOAD_AND_INSTALL_UPDATE', async (_e, downloadUrl) => {
+  if (isUpdatingInApp) {
+    return { ok: false, error: '更新正在进行中' };
+  }
+  const url = String(downloadUrl || '').trim();
+  if (!/^https?:\/\//i.test(url)) {
+    return { ok: false, error: '无效的更新包地址' };
+  }
+
+  isUpdatingInApp = true;
+  const ext = process.platform === 'darwin' ? '.dmg' : '.exe';
+  const tempFile = path.join(os.tmpdir(), `GlassPad_Update_${Date.now()}${ext}`);
+
+  try {
+    sendUpdateProgress({
+      stage: 'downloading',
+      percent: 0,
+      message: '正在连接更新服务器…',
+    });
+
+    await downloadFileWithProgress(url, tempFile, ({ percent, receivedBytes, totalBytes }) => {
+      const mbDone = (receivedBytes / (1024 * 1024)).toFixed(1);
+      const mbTotal = totalBytes ? (totalBytes / (1024 * 1024)).toFixed(1) : '?';
+      sendUpdateProgress({
+        stage: 'downloading',
+        percent,
+        receivedBytes,
+        totalBytes,
+        message: `正在下载更新包… ${percent}% (${mbDone} MB / ${mbTotal} MB)`,
+      });
+    });
+
+    sendUpdateProgress({
+      stage: 'installing',
+      percent: 100,
+      message: '下载完成，正在自动安装并重启 GlassPad…',
+    });
+
+    if (process.platform === 'darwin') {
+      await applyMacDmgUpdate(tempFile);
+    } else if (process.platform === 'win32') {
+      await applyWinExeUpdate(tempFile);
+    } else {
+      shell.openExternal(url);
+    }
+    return { ok: true };
+  } catch (err) {
+    isUpdatingInApp = false;
+    const msg = err.message || '自动更新失败';
+    sendUpdateProgress({
+      stage: 'error',
+      percent: 0,
+      message: msg,
+    });
+    return { ok: false, error: msg };
   }
 });
 

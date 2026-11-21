@@ -1258,10 +1258,48 @@ export default function App() {
   );
 }
 
-// ── 更新详情弹窗：展示最新版本号、更新日志与 Win/Mac 一键下载 ──
+// ── 更新详情弹窗：展示最新版本号、更新日志与软件内免浏览器自动下载替换重启 ──
 function UpdateModal({ updateInfo, onClose }) {
   const platformLabel = isWindows ? 'Windows (.exe)' : 'macOS (.dmg)';
   const primaryUrl = updateInfo.downloadUrl || (isWindows ? updateInfo.winUrl : updateInfo.macUrl) || '';
+  const canInAppUpdate = Boolean(window.electronAPI?.downloadAndInstallUpdate && primaryUrl);
+
+  const [updating, setUpdating] = useState(false);
+  const [progress, setProgress] = useState({ stage: '', percent: 0, message: '' });
+  const [updateErr, setUpdateErr] = useState('');
+
+  useEffect(() => {
+    if (!window.electronAPI?.onUpdateProgress) return;
+    const off = window.electronAPI.onUpdateProgress((data) => {
+      if (!data) return;
+      setProgress({
+        stage: data.stage || '',
+        percent: typeof data.percent === 'number' ? data.percent : 0,
+        message: data.message || '',
+      });
+      if (data.stage === 'error') {
+        setUpdating(false);
+        setUpdateErr(data.message || '自动更新失败，请使用浏览器下载');
+      }
+    });
+    return () => off?.();
+  }, []);
+
+  const handleStartAutoUpdate = async () => {
+    if (!primaryUrl || updating) return;
+    if (!canInAppUpdate) {
+      openDownloadUrl(primaryUrl);
+      return;
+    }
+    setUpdating(true);
+    setUpdateErr('');
+    setProgress({ stage: 'downloading', percent: 0, message: '正在连接更新服务器…' });
+    const res = await window.electronAPI.downloadAndInstallUpdate(primaryUrl);
+    if (!res?.ok) {
+      setUpdating(false);
+      setUpdateErr(res?.error || '自动更新失败，请点击下方浏览器下载');
+    }
+  };
 
   return (
     <div
@@ -1271,12 +1309,12 @@ function UpdateModal({ updateInfo, onClose }) {
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         padding: '20px', fontFamily: uiFont, WebkitAppRegion: 'no-drag',
       }}
-      onClick={() => { if (!updateInfo.forceUpdate) onClose(); }}
+      onClick={() => { if (!updateInfo.forceUpdate && !updating) onClose(); }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          width: '100%', maxWidth: '420px', background: '#121721',
+          width: '100%', maxWidth: '430px', background: '#121721',
           border: '1px solid rgba(56, 189, 248, 0.4)', borderRadius: '12px',
           padding: '20px', color: '#e2e8f0', boxShadow: '0 20px 50px rgba(0,0,0,0.6)',
           display: 'flex', flexDirection: 'column', gap: '14px',
@@ -1294,7 +1332,7 @@ function UpdateModal({ updateInfo, onClose }) {
               </div>
             </div>
           </div>
-          {!updateInfo.forceUpdate && (
+          {!updateInfo.forceUpdate && !updating && (
             <button
               onClick={onClose}
               style={{
@@ -1321,8 +1359,37 @@ function UpdateModal({ updateInfo, onClose }) {
           </div>
         )}
 
+        {/* 软件内静默下载进度条 */}
+        {(updating || progress.stage === 'downloading' || progress.stage === 'installing') && (
+          <div style={{
+            background: '#0b0e13', border: '1px solid #1e293b', borderRadius: '8px',
+            padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '8px',
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#38bdf8' }}>
+              <span>{progress.message || '正在下载更新…'}</span>
+              <span style={{ fontFamily: codeFont }}>{progress.percent}%</span>
+            </div>
+            <div style={{
+              width: '100%', height: '6px', background: '#1e293b',
+              borderRadius: '999px', overflow: 'hidden',
+            }}>
+              <div style={{
+                width: `${Math.max(2, Math.min(100, progress.percent || 0))}%`,
+                height: '100%', background: 'linear-gradient(90deg, #10b981, #38bdf8)',
+                transition: 'width 0.15s ease',
+              }} />
+            </div>
+          </div>
+        )}
+
+        {updateErr && (
+          <div style={{ fontSize: '12px', color: '#f87171', lineHeight: 1.4 }}>
+            {updateErr}
+          </div>
+        )}
+
         <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', flexWrap: 'wrap', marginTop: '4px' }}>
-          {!updateInfo.forceUpdate && (
+          {!updateInfo.forceUpdate && !updating && (
             <button
               onClick={onClose}
               style={{
@@ -1334,16 +1401,34 @@ function UpdateModal({ updateInfo, onClose }) {
             </button>
           )}
 
-          {primaryUrl ? (
+          {primaryUrl && canInAppUpdate && (
             <button
               onClick={() => openDownloadUrl(primaryUrl)}
               style={{
-                background: '#10b981', color: '#032219', border: 'none',
+                background: 'transparent', color: '#94a3b8', border: '1px solid #334155',
+                borderRadius: '7px', padding: '8px 12px', fontSize: '12px', cursor: 'pointer',
+              }}
+              title="若自动更新受网络限制，可改用系统浏览器下载"
+            >
+              浏览器下载 ↗
+            </button>
+          )}
+
+          {primaryUrl ? (
+            <button
+              onClick={handleStartAutoUpdate}
+              disabled={updating}
+              style={{
+                background: updating ? '#065f46' : '#10b981',
+                color: updating ? '#a7f3d0' : '#032219',
+                border: 'none',
                 borderRadius: '7px', padding: '8px 16px', fontSize: '13px',
-                fontWeight: 700, cursor: 'pointer',
+                fontWeight: 700, cursor: updating ? 'default' : 'pointer',
               }}
             >
-              立即下载 {platformLabel} ↗
+              {updating
+                ? (progress.stage === 'installing' ? '正在安装并重启…' : `正在自动更新 (${progress.percent}%)…`)
+                : (canInAppUpdate ? '立即自动更新并重启' : `立即下载 ${platformLabel} ↗`)}
             </button>
           ) : (
             <span style={{ fontSize: '12px', color: '#f59e0b', alignSelf: 'center' }}>
