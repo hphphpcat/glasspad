@@ -47,13 +47,17 @@ async function performUpdateCheck(customBase) {
   if (window.electronAPI?.checkForUpdates) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
-  // 浏览器环境或旧版 preload 兜底直接 fetch /api/version
-  let currentVersion = '1.0.1';
+  // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
+  let currentVersion = '1.0.5';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
       if (info?.version) currentVersion = info.version;
     } catch {}
+  }
+  const hotVer = localStorage.getItem('pad_hot_version') || '';
+  if (hotVer && compareSemverClient(hotVer, currentVersion) > 0) {
+    currentVersion = hotVer;
   }
   let checkUrl = `${DEFAULT_SERVER_HTTP}/api/version`;
   if (targetBase) {
@@ -1375,10 +1379,11 @@ function FontColorPicker({ fontColor, onChange }) {
   );
 }
 
-// ── 更新详情弹窗：展示最新版本号、更新日志与软件内免浏览器自动下载替换重启 ──
+// ── 更新详情弹窗：展示最新版本号、更新日志与 1 秒极速热更新（免下载 98MB 安装包） ──
 function UpdateModal({ updateInfo, onClose }) {
   const platformLabel = isWindows ? 'Windows (.exe)' : 'macOS (.dmg)';
   const primaryUrl = updateInfo.downloadUrl || (isWindows ? updateInfo.winUrl : updateInfo.macUrl) || '';
+  const canHotUpdate = Boolean(window.electronAPI?.applyHotUpdate);
   const canInAppUpdate = Boolean(window.electronAPI?.downloadAndInstallUpdate && primaryUrl);
 
   const [updating, setUpdating] = useState(false);
@@ -1402,8 +1407,25 @@ function UpdateModal({ updateInfo, onClose }) {
     return () => off?.();
   }, []);
 
+  // 1 秒极速热更新（直接走 Railway 高速节点同步最新前端代码，不走 GitHub 98MB 慢速整包下载）
   const handleStartAutoUpdate = async () => {
-    if (!primaryUrl || updating) return;
+    if (updating) return;
+    if (canHotUpdate) {
+      setUpdating(true);
+      setUpdateErr('');
+      setProgress({ stage: 'downloading', percent: 35, message: '正在从 Railway 高速节点极速热更新…' });
+      localStorage.setItem('pad_hot_version', updateInfo.latestVersion || '');
+      const res = await window.electronAPI.applyHotUpdate(updateInfo.latestVersion);
+      if (res?.ok) {
+        setTimeout(() => onClose?.(), 350);
+        return;
+      }
+      setUpdating(false);
+      setUpdateErr(res?.error || '极速热更新失败，请点击下方安装包更新');
+      return;
+    }
+
+    if (!primaryUrl) return;
     if (!canInAppUpdate) {
       openDownloadUrl(primaryUrl);
       return;
@@ -1415,6 +1437,24 @@ function UpdateModal({ updateInfo, onClose }) {
     if (!res?.ok) {
       setUpdating(false);
       setUpdateErr(res?.error || '自动更新失败，请点击下方浏览器下载');
+    }
+  };
+
+  // 完整安装包覆盖更新（仅当底层 Electron 壳变动或用户主动需要重装整包时使用）
+  const handleFullInstallerUpdate = async () => {
+    if (!primaryUrl || updating) return;
+    if (!canInAppUpdate) {
+      openDownloadUrl(primaryUrl);
+      return;
+    }
+    setUpdating(true);
+    setUpdateErr('');
+    setProgress({ stage: 'downloading', percent: 0, message: '正在下载完整安装包…' });
+    const res = await window.electronAPI.downloadAndInstallUpdate(primaryUrl);
+    if (!res?.ok) {
+      setUpdating(false);
+      setUpdateErr(res?.error || '完整包下载失败，正在打开浏览器下载…');
+      openDownloadUrl(primaryUrl);
     }
   };
 
@@ -1518,20 +1558,21 @@ function UpdateModal({ updateInfo, onClose }) {
             </button>
           )}
 
-          {primaryUrl && canInAppUpdate && (
+          {primaryUrl && (canHotUpdate || canInAppUpdate) && (
             <button
-              onClick={() => openDownloadUrl(primaryUrl)}
+              onClick={handleFullInstallerUpdate}
+              disabled={updating}
               style={{
                 background: 'transparent', color: '#94a3b8', border: '1px solid #334155',
                 borderRadius: '7px', padding: '8px 12px', fontSize: '12px', cursor: 'pointer',
               }}
-              title="若自动更新受网络限制，可改用系统浏览器下载"
+              title="从 GitHub 下载完整安装包并覆盖替换应用"
             >
-              浏览器下载 ↗
+              完整安装包更新
             </button>
           )}
 
-          {primaryUrl ? (
+          {(canHotUpdate || primaryUrl) ? (
             <button
               onClick={handleStartAutoUpdate}
               disabled={updating}
@@ -1544,8 +1585,10 @@ function UpdateModal({ updateInfo, onClose }) {
               }}
             >
               {updating
-                ? (progress.stage === 'installing' ? '正在安装并重启…' : `正在自动更新 (${progress.percent}%)…`)
-                : (canInAppUpdate ? '立即自动更新并重启' : `立即下载 ${platformLabel} ↗`)}
+                ? (progress.stage === 'installing' ? '正在刷新生效…' : `正在更新 (${progress.percent}%)…`)
+                : (canHotUpdate
+                  ? '⚡ 1 秒极速热更新'
+                  : (canInAppUpdate ? '立即自动更新并重启' : `立即下载 ${platformLabel} ↗`))}
             </button>
           ) : (
             <span style={{ fontSize: '12px', color: '#f59e0b', alignSelf: 'center' }}>

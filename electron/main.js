@@ -116,7 +116,37 @@ function resolveVersionCheckUrl(customBase) {
   }
 }
 
-// 检测系统是否支持原生毛玻璃（macOS 或 Windows 11 22H2 Build 22621+）
+// 读取客户端當前生效的版本号（对比安装包内置版本与热更新记录版本，取较大者）
+function getHotMetaPath() {
+  return path.join(app.getPath('userData'), 'hot_version.json');
+}
+
+function getEffectiveAppVersion() {
+  const pkgVer = app.getVersion();
+  try {
+    const metaPath = getHotMetaPath();
+    if (fs.existsSync(metaPath)) {
+      const saved = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      if (saved?.version && compareSemver(saved.version, pkgVer) > 0) {
+        return String(saved.version).trim();
+      }
+    }
+  } catch {}
+  return pkgVer;
+}
+
+function isUsingHotRemoteBundle() {
+  try {
+    const metaPath = getHotMetaPath();
+    if (fs.existsSync(metaPath)) {
+      const saved = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      if (saved?.version && compareSemver(saved.version, app.getVersion()) >= 0 && saved.useRemote) {
+        return true;
+      }
+    }
+  } catch {}
+  return false;
+}
 function checkFrostedGlassSupport() {
   if (process.platform === 'darwin') return true;
   if (process.platform === 'win32') {
@@ -183,24 +213,25 @@ function createWindow() {
     mainWindow.setContentProtection(true);
   });
 
-  // 加载前端：若设置了 ELECTRON_START_URL 则连指定 URL；否则优先加载打包进客户端的本地 dist/index.html
-  // （本地已内置 Monaco 编辑器与 worker，无需从远端或 jsdelivr CDN 拉取，彻底解决 Windows 版卡 Loading/白屏）
+  // 加载前端：若已通过 1 秒极速热更新升级到更高版本，则直接加载线上 Railway 最新前端（若断网则自动回退本地内置 dist）
   const startUrl = process.env.ELECTRON_START_URL;
   const localDistHtml = path.join(__dirname, '..', 'dist', 'index.html');
-  if (!startUrl && fs.existsSync(localDistHtml)) {
-    mainWindow.loadFile(localDistHtml);
-  } else {
-    const remoteUrl = startUrl || 'https://glasspad.up.railway.app/';
-    let retries = 0;
-    mainWindow.webContents.on('did-fail-load', (_e, code, desc) => {
-      // 前端未就绪时（连接拒绝）自动重试，避免白屏
-      if (retries++ < 10) {
-        setTimeout(() => mainWindow.loadURL(remoteUrl), 800);
-      } else {
-        console.error('前端加载失败：', code, desc);
-      }
-    });
+  const remoteUrl = startUrl || `${DEFAULT_UPDATE_BASE}/`;
+  const useRemote = Boolean(startUrl) || isUsingHotRemoteBundle() || !fs.existsSync(localDistHtml);
+
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc) => {
+    // 若加载远端热更新页面遇到断网，自动回退本地内置 dist/index.html，保证永不白屏
+    if (fs.existsSync(localDistHtml)) {
+      mainWindow.loadFile(localDistHtml);
+    } else {
+      console.error('前端加载失败：', code, desc);
+    }
+  });
+
+  if (useRemote) {
     mainWindow.loadURL(remoteUrl);
+  } else {
+    mainWindow.loadFile(localDistHtml);
   }
 }
 
@@ -231,16 +262,17 @@ ipcMain.handle('OPEN_PRIVACY_SETTINGS', (_e, type) => {
   shell.openExternal(`x-apple.systempreferences:com.apple.preference.security?${anchor}`);
 });
 
-// 获取当前客户端版本号与系统平台
+// 获取当前客户端版本号与系统平台（优先返回热更新后的生效版本号）
 ipcMain.handle('GET_APP_VERSION', () => ({
-  version: app.getVersion(),
+  version: getEffectiveAppVersion(),
+  baseVersion: app.getVersion(),
   platform: process.platform,
   arch: process.arch,
 }));
 
 // 检查更新：向后端 /api/version 或自定义 JSON 接口拉取最新版本信息
 ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
-  const currentVersion = app.getVersion();
+  const currentVersion = getEffectiveAppVersion();
   const baseUrl = resolveVersionCheckUrl(customBase);
   const checkUrl = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`;
   try {
@@ -274,6 +306,50 @@ ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
       error: err.message || '检查更新失败',
       checkUrl: baseUrl,
     };
+  }
+});
+
+// 1 秒极速热更新：无需从 GitHub 下载 98MB 安装包，直接将客户端切换到 Railway 最新版前端资源并立即生效
+ipcMain.handle('APPLY_HOT_UPDATE', async (_e, targetVersion) => {
+  try {
+    const ver = String(targetVersion || '').trim().replace(/^v/i, '') || app.getVersion();
+    sendUpdateProgress({
+      stage: 'downloading',
+      percent: 45,
+      message: '正在从 Railway 高速节点同步增量热更新…',
+    });
+
+    const metaPath = getHotMetaPath();
+    fs.mkdirSync(path.dirname(metaPath), { recursive: true });
+    fs.writeFileSync(
+      metaPath,
+      JSON.stringify({ version: ver, useRemote: true, updatedAt: Date.now() }, null, 2),
+      'utf8'
+    );
+
+    sendUpdateProgress({
+      stage: 'installing',
+      percent: 100,
+      message: `已热更新至 v${ver}，正在刷新界面…`,
+    });
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      await mainWindow.webContents.session.clearCache().catch(() => {});
+      // 保留当前房间 URL 参数（若已在房间内），无缝热切换至线上最新版
+      let currentSearch = '';
+      try {
+        const curUrl = new URL(mainWindow.webContents.getURL());
+        currentSearch = curUrl.search || '';
+      } catch {}
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.loadURL(`${DEFAULT_UPDATE_BASE}/${currentSearch}`);
+        }
+      }, 250);
+    }
+    return { ok: true, version: ver };
+  } catch (err) {
+    return { ok: false, error: err.message || '极速热更新失败' };
   }
 });
 

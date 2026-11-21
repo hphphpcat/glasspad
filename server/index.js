@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.4';
+let pkgVersion = '1.0.5';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.4';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.5';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增顶栏「字色」功能：支持一键切换纯白/荧光绿/冰蓝/明黄/深黑(白底用)、恢复默认语法高亮及自由取色器\n2. macOS 启动与更新自动执行 xattr -cr 及 ad-hoc 签名修复（防提示已损坏）\n3. 客户端内免浏览器一键静默下载、自动替换安装与重启',
+  notes: process.env.RELEASE_NOTES || '1. 新增「⚡ 1 秒极速热更新」：直接从 Railway 高速节点秒级热更，免下载 98MB 安装包、不丢 macOS 录屏权限\n2. 新增顶栏「字色」功能：支持一键切换纯白/荧光绿/冰蓝/明黄/深黑(白底用)、恢复默认语法高亮及自由取色器\n3. macOS 启动与更新自动执行 xattr -cr 及 ad-hoc 签名修复（防提示已损坏）',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };

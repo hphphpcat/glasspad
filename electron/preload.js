@@ -10,10 +10,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 屏幕共享权限检测与系统设置跳转
   getMediaPermissionStatus: () => ipcRenderer.invoke('GET_MEDIA_PERMISSION_STATUS'),
   openPrivacySettings: (type) => ipcRenderer.invoke('OPEN_PRIVACY_SETTINGS', type),
-  // 客户端版本获取、检查更新与软件内静默自更新
+  // 客户端版本获取、检查更新与软件内静默自更新（含 1 秒极速热更新）
   getAppVersion: () => ipcRenderer.invoke('GET_APP_VERSION'),
   checkForUpdates: (customBase) => ipcRenderer.invoke('CHECK_FOR_UPDATES', customBase),
   openExternalUrl: (url) => ipcRenderer.invoke('OPEN_EXTERNAL_URL', url),
+  applyHotUpdate: (targetVersion) => ipcRenderer.invoke('APPLY_HOT_UPDATE', targetVersion),
   downloadAndInstallUpdate: (url) => ipcRenderer.invoke('DOWNLOAD_AND_INSTALL_UPDATE', url),
   onUpdateProgress: (cb) => {
     const handler = (_e, data) => cb?.(data);
