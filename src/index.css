@@ -12,3 +12,13 @@ html, body, #root {
   background-color: rgba(245, 158, 11, 0.45);
   border-radius: 2px;
 }
+
+/* 当用户选择了自定义字体颜色时，覆盖 Monaco 编辑器正文及语法 token 颜色，便于在浅底/深底窗口上清晰阅读 */
+.gp-custom-font-color .monaco-editor .view-lines,
+.gp-custom-font-color .monaco-editor .view-line span {
+  color: var(--gp-font-color) !important;
+}
+.gp-custom-font-color .monaco-editor .margin-view-overlays .line-numbers {
+  color: var(--gp-font-color) !important;
+  opacity: 0.55;
+}

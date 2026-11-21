@@ -11,6 +11,16 @@ const RTC_ICE_SERVERS = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
 ];
 
+// 字体颜色快捷预设：空字符串 '' 代表恢复 Monaco 默认语法高亮
+const FONT_COLOR_PRESETS = [
+  { label: '默认高亮', value: '', swatch: 'linear-gradient(135deg, #38bdf8 0%, #34d399 50%, #f59e0b 100%)' },
+  { label: '纯白', value: '#f8fafc', swatch: '#f8fafc' },
+  { label: '荧光绿', value: '#34d399', swatch: '#34d399' },
+  { label: '冰蓝', value: '#38bdf8', swatch: '#38bdf8' },
+  { label: '明黄', value: '#facc15', swatch: '#facc15' },
+  { label: '深黑(白底用)', value: '#111827', swatch: '#111827' },
+];
+
 const normalizeLF = (s) => (s || '').replace(/\r\n/g, '\n');
 
 const DEFAULT_SERVER_HTTP = 'https://glasspad.up.railway.app';
@@ -145,10 +155,16 @@ export default function App() {
     () => params.get('user') || (isClientApp ? 'Client' : 'Mentor')
   );
 
-  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）
+  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）/ 字体颜色（空代表默认语法高亮）
   const [opacity, setOpacity] = useState(() => Number(localStorage.getItem('pad_opacity')) || 0.78);
   const [supportsFrost, setSupportsFrost] = useState(false);
   const [frostedGlass, setFrostedGlass] = useState(() => localStorage.getItem('pad_frost_v2') === 'true');
+  const [fontColor, setFontColor] = useState(() => localStorage.getItem('pad_font_color') || '');
+
+  const handleFontColorChange = (nextColor) => {
+    setFontColor(nextColor);
+    localStorage.setItem('pad_font_color', nextColor);
+  };
 
   const [text, setText] = useState('');
   const [language, setLanguage] = useState('python');
@@ -999,6 +1015,10 @@ export default function App() {
                   style={{ width: '64px', cursor: 'pointer', accentColor: '#10b981' }}
                 />
               </label>
+
+              {/* 字体颜色快捷切换 + 自由取色器 */}
+              <FontColorPicker fontColor={fontColor} onChange={handleFontColorChange} />
+
               {supportsFrost && (
                 <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontWeight: 500, color: frostedGlass ? '#10b981' : '#cbd5e1' }}>
                   <input
@@ -1054,24 +1074,27 @@ export default function App() {
               </span>
             )}
 
-            <select
-              value={language}
-              onChange={(e) => {
-                const lang = e.target.value;
-                setLanguage(lang);
-                wsRef.current?.send(JSON.stringify({ type: 'LANG_SYNC', payload: { language: lang } }));
-              }}
-              style={{
-                marginLeft: 'auto', background: 'transparent', color: '#9ca3af',
-                border: 'none', fontSize: '13px', outline: 'none', cursor: 'pointer',
-              }}
-            >
-              <option value="python" style={{ background: '#141414' }}>Python</option>
-              <option value="plaintext" style={{ background: '#141414' }}>Plain Text (BQ 提词)</option>
-              <option value="cpp" style={{ background: '#141414' }}>C++</option>
-              <option value="java" style={{ background: '#141414' }}>Java</option>
-              <option value="javascript" style={{ background: '#141414' }}>JavaScript</option>
-            </select>
+            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <FontColorPicker fontColor={fontColor} onChange={handleFontColorChange} />
+              <select
+                value={language}
+                onChange={(e) => {
+                  const lang = e.target.value;
+                  setLanguage(lang);
+                  wsRef.current?.send(JSON.stringify({ type: 'LANG_SYNC', payload: { language: lang } }));
+                }}
+                style={{
+                  background: 'transparent', color: '#9ca3af',
+                  border: 'none', fontSize: '13px', outline: 'none', cursor: 'pointer',
+                }}
+              >
+                <option value="python" style={{ background: '#141414' }}>Python</option>
+                <option value="plaintext" style={{ background: '#141414' }}>Plain Text (BQ 提词)</option>
+                <option value="cpp" style={{ background: '#141414' }}>C++</option>
+                <option value="java" style={{ background: '#141414' }}>Java</option>
+                <option value="javascript" style={{ background: '#141414' }}>JavaScript</option>
+              </select>
+            </div>
           </>
         )}
       </div>
@@ -1156,8 +1179,17 @@ export default function App() {
           </div>
         )}
 
-        {/* 提词编辑器区（客户端只读） */}
-        <div style={{ flex: 1, minWidth: 0, position: 'relative', paddingTop: '8px' }}>
+        {/* 提词编辑器区（客户端只读，支持一键自定义字体颜色） */}
+        <div
+          className={fontColor ? 'gp-custom-font-color' : ''}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            position: 'relative',
+            paddingTop: '8px',
+            '--gp-font-color': fontColor || '#e2e8f0',
+          }}
+        >
           <Editor
             height="100%"
           theme="codex-transparent"
@@ -1254,6 +1286,91 @@ export default function App() {
           onClose={() => setShowUpdateModal(false)}
         />
       )}
+    </div>
+  );
+}
+
+// ── 字体颜色选择器：支持一键切换默认语法高亮、常用高对比度预设色及任意自定义颜色 ──
+function FontColorPicker({ fontColor, onChange }) {
+  return (
+    <div
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '5px',
+        background: 'rgba(15, 23, 34, 0.65)',
+        border: '1px solid #334155',
+        borderRadius: '6px',
+        padding: '3px 7px',
+        WebkitAppRegion: 'no-drag',
+      }}
+      title="切换提词器字体颜色（最左侧彩点恢复默认语法高亮，最右侧可自由取色）"
+    >
+      <span style={{ fontSize: '11.5px', color: '#cbd5e1', fontWeight: 500, marginRight: '2px' }}>
+        字色
+      </span>
+      {FONT_COLOR_PRESETS.map((preset) => {
+        const active = (fontColor || '') === preset.value;
+        return (
+          <button
+            key={preset.label}
+            type="button"
+            onClick={() => onChange(preset.value)}
+            title={preset.label}
+            style={{
+              width: '14px',
+              height: '14px',
+              borderRadius: '50%',
+              padding: 0,
+              background: preset.swatch,
+              border: active ? '2px solid #10b981' : '1px solid rgba(255,255,255,0.35)',
+              boxShadow: active ? '0 0 0 1px rgba(16,185,129,0.5)' : 'none',
+              cursor: 'pointer',
+              flexShrink: 0,
+            }}
+          />
+        );
+      })}
+      <label
+        title="点击自定义任意字体颜色"
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: '16px',
+          height: '16px',
+          cursor: 'pointer',
+          position: 'relative',
+          marginLeft: '1px',
+        }}
+      >
+        <input
+          type="color"
+          value={fontColor && /^#[0-9a-fA-F]{6}$/.test(fontColor) ? fontColor : '#34d399'}
+          onChange={(e) => onChange(e.target.value)}
+          style={{
+            opacity: 0,
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            cursor: 'pointer',
+            border: 'none',
+            padding: 0,
+          }}
+        />
+        <span
+          style={{
+            fontSize: '11px',
+            lineHeight: 1,
+            color: fontColor ? fontColor : '#94a3b8',
+            fontWeight: 700,
+            borderBottom: `2px solid ${fontColor || '#94a3b8'}`,
+          }}
+        >
+          A
+        </span>
+      </label>
     </div>
   );
 }
