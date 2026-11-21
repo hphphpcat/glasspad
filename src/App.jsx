@@ -11,14 +11,141 @@ const RTC_ICE_SERVERS = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
 ];
 
-// 编辑器字号范围与默认值（支持 A- / A+ 按钮及 ⌘/Ctrl + +/-/0 快捷键放大缩小）
+// 选中文字局部字号范围与默认值（支持 A- / A+ 按钮及 ⌘/Ctrl + +/-/0 快捷键仅对选中文字放大缩小）
 const DEFAULT_FONT_SIZE = 15;
 const MIN_FONT_SIZE = 11;
-const MAX_FONT_SIZE = 32;
+const MAX_FONT_SIZE = 28;
 function clampFontSize(val) {
   const n = Math.round(Number(val));
   if (!Number.isFinite(n)) return DEFAULT_FONT_SIZE;
   return Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, n));
+}
+
+// 动态注入局部字号 Monaco inlineClassName 样式，实现选中文字单独放大/缩小
+const injectedInlineSizeClasses = new Set();
+function getInlineSizeClassName(size) {
+  const s = clampFontSize(size);
+  if (s === DEFAULT_FONT_SIZE) return '';
+  const className = `gp-inline-size-${s}`;
+  if (!injectedInlineSizeClasses.has(className) && typeof document !== 'undefined') {
+    let styleEl = document.getElementById('gp-inline-size-styles');
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'gp-inline-size-styles';
+      document.head.appendChild(styleEl);
+    }
+    styleEl.textContent += `.monaco-editor .view-line span.${className}, .monaco-editor .view-line span.${className} span { font-size: ${s}px !important; }\n`;
+    injectedInlineSizeClasses.add(className);
+  }
+  return className;
+}
+
+// 规范化局部字号区间：排序、剔除无效或等于默认字号的项、合并相邻同字号区间
+function normalizeSizeMarks(marks) {
+  if (!Array.isArray(marks)) return [];
+  const valid = marks
+    .filter((m) => m && Number.isInteger(m.start) && Number.isInteger(m.end) && m.start >= 0 && m.end > m.start && Number.isFinite(Number(m.size)))
+    .map((m) => ({ start: m.start, end: m.end, size: clampFontSize(m.size) }))
+    .filter((m) => m.size !== DEFAULT_FONT_SIZE)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+
+  const merged = [];
+  for (const seg of valid) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.size === seg.size && prev.end >= seg.start) {
+      prev.end = Math.max(prev.end, seg.end);
+    } else {
+      merged.push({ ...seg });
+    }
+  }
+  return merged;
+}
+
+// 在给定文本区间集合 [start, end) 上按 delta 增减字号或重置为默认字号（delta === 0 重置）
+function applySizeDeltaToOffsets(marks, ranges, delta) {
+  const validRanges = ranges
+    .filter((r) => r && Number.isInteger(r.start) && Number.isInteger(r.end) && r.end > r.start)
+    .sort((a, b) => a.start - b.start);
+  if (validRanges.length === 0) return normalizeSizeMarks(marks);
+
+  let next = normalizeSizeMarks(marks);
+  for (const r of validRanges) {
+    // 若重置为默认字号，直接挖空该区间即可
+    if (delta === 0) {
+      const carved = [];
+      for (const m of next) {
+        if (m.end <= r.start || m.start >= r.end) {
+          carved.push(m);
+        } else {
+          if (m.start < r.start) carved.push({ start: m.start, end: r.start, size: m.size });
+          if (m.end > r.end) carved.push({ start: r.end, end: m.end, size: m.size });
+        }
+      }
+      next = normalizeSizeMarks(carved);
+      continue;
+    }
+
+    // 找出区间内当前的基准字号（若已有局部字号则取第一段重叠的字号，否则取默认字号）
+    let baseSize = DEFAULT_FONT_SIZE;
+    for (const m of next) {
+      if (m.end > r.start && m.start < r.end) {
+        baseSize = m.size;
+        break;
+      }
+    }
+    const targetSize = clampFontSize(baseSize + delta);
+
+    const carved = [];
+    for (const m of next) {
+      if (m.end <= r.start || m.start >= r.end) {
+        carved.push(m);
+      } else {
+        if (m.start < r.start) carved.push({ start: m.start, end: r.start, size: m.size });
+        if (m.end > r.end) carved.push({ start: r.end, end: m.end, size: m.size });
+      }
+    }
+    if (targetSize !== DEFAULT_FONT_SIZE) {
+      carved.push({ start: r.start, end: r.end, size: targetSize });
+    }
+    next = normalizeSizeMarks(carved);
+  }
+  return next;
+}
+
+// 文本变更时按 Monaco contentChanges 增量偏移更新局部字号区间
+function shiftSizeMarksByChanges(marks, changes) {
+  if (!Array.isArray(marks) || marks.length === 0 || !Array.isArray(changes) || changes.length === 0) {
+    return marks || [];
+  }
+  let current = marks.map((m) => ({ ...m }));
+  const sortedChanges = [...changes].sort((a, b) => b.rangeOffset - a.rangeOffset);
+  for (const ch of sortedChanges) {
+    const editStart = ch.rangeOffset;
+    const editOldEnd = ch.rangeOffset + ch.rangeLength;
+    const insertedLen = (ch.text || '').length;
+    const delta = insertedLen - ch.rangeLength;
+    const updated = [];
+    for (const m of current) {
+      if (m.end <= editStart) {
+        updated.push(m);
+      } else if (m.start >= editOldEnd) {
+        updated.push({ start: m.start + delta, end: m.end + delta, size: m.size });
+      } else if (m.start >= editStart && m.end <= editOldEnd) {
+        // 整段被替换/删除
+      } else if (m.start < editStart && m.end > editOldEnd) {
+        const newEnd = m.end + delta;
+        if (newEnd > m.start) updated.push({ start: m.start, end: newEnd, size: m.size });
+      } else if (m.start < editStart) {
+        if (editStart > m.start) updated.push({ start: m.start, end: editStart, size: m.size });
+      } else {
+        const newStart = editStart + insertedLen;
+        const newEnd = m.end + delta;
+        if (newEnd > newStart) updated.push({ start: newStart, end: newEnd, size: m.size });
+      }
+    }
+    current = updated;
+  }
+  return normalizeSizeMarks(current);
 }
 
 // 字体颜色快捷预设：空字符串 '' 代表清除选中文本的自定义颜色（恢复 Monaco 默认语法高亮）
@@ -180,7 +307,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.8';
+  let currentVersion = '1.0.9';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -291,12 +418,12 @@ export default function App() {
     () => params.get('user') || (isClientApp ? 'Client' : 'Mentor')
   );
 
-  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）/ 字体大小（A- / A+ 放大缩小）
+  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）
   const [opacity, setOpacity] = useState(() => Number(localStorage.getItem('pad_opacity')) || 0.78);
   const [supportsFrost, setSupportsFrost] = useState(false);
   const [frostedGlass, setFrostedGlass] = useState(() => localStorage.getItem('pad_frost_v2') === 'true');
-  const [fontSize, setFontSize] = useState(() => clampFontSize(localStorage.getItem('pad_font_size') || DEFAULT_FONT_SIZE));
-  // 导师端局部文字颜色工具条状态（仅作用于选中文本，不全局改色；客户端无修改入口）
+  // 导师端局部文字样式工具条状态（字号/加粗/颜色均仅作用于选中文本，客户端无修改入口）
+  const [selectionFontSize, setSelectionFontSize] = useState(DEFAULT_FONT_SIZE);
   const [pickerColor, setPickerColor] = useState('#34d399');
   const [hasSelection, setHasSelection] = useState(false);
   const [colorTip, setColorTip] = useState('');
@@ -334,6 +461,8 @@ export default function App() {
   const colorMarksRef = useRef([]); // 当前文档的局部字色区间 [{ start, end, color }]
   const boldMarksDecorations = useRef(null); // 选中文本加粗装饰集合
   const boldMarksRef = useRef([]); // 当前文档的加粗区间（内部格式 { start, end, color: BOLD_SENTINEL }）
+  const sizeMarksDecorations = useRef(null); // 选中文本局部字号装饰集合
+  const sizeMarksRef = useRef([]); // 当前文档的局部字号区间 [{ start, end, size }]
   const latestText = useRef(''); // 最近收到的远端文字（编辑器挂载前到达时用于补写）
 
   // 客户端共享屏幕用到的 WebRTC / Media 引用
@@ -388,25 +517,10 @@ export default function App() {
     }
   };
 
-  // 桌面端：透明度记忆 + ⌘[ / ⌘] 调节；双端：字号记忆 + ⌘/Ctrl + +/-/0 放大缩小
+  // 桌面端：透明度记忆 + ⌘[ / ⌘] 调节；导师端：⌘/Ctrl + +/-/0 对选中文字放大/缩小/重置
   useEffect(() => {
     localStorage.setItem('pad_opacity', String(opacity));
   }, [opacity]);
-
-  useEffect(() => {
-    localStorage.setItem('pad_font_size', String(fontSize));
-  }, [fontSize]);
-
-  const changeFontSize = (nextOrUpdater) => {
-    setFontSize((prev) => {
-      const raw = typeof nextOrUpdater === 'function' ? nextOrUpdater(prev) : nextOrUpdater;
-      const next = clampFontSize(raw);
-      if (!isClientApp && wsRef.current?.readyState === 1) {
-        wsRef.current.send(JSON.stringify({ type: 'FONT_SIZE_SYNC', payload: { fontSize: next } }));
-      }
-      return next;
-    });
-  };
 
   useEffect(() => {
     const onKey = (e) => {
@@ -417,15 +531,15 @@ export default function App() {
       } else if (isClientApp && e.key === ']') {
         e.preventDefault();
         setOpacity((p) => Math.min(1, Number((p + 0.08).toFixed(2))));
-      } else if (e.key === '=' || e.key === '+') {
+      } else if (!isClientApp && (e.key === '=' || e.key === '+')) {
         e.preventDefault();
-        changeFontSize((s) => s + 1);
-      } else if (e.key === '-' || e.key === '_') {
+        handleAdjustSelectionSize(2);
+      } else if (!isClientApp && (e.key === '-' || e.key === '_')) {
         e.preventDefault();
-        changeFontSize((s) => s - 1);
-      } else if (e.key === '0') {
+        handleAdjustSelectionSize(-2);
+      } else if (!isClientApp && e.key === '0') {
         e.preventDefault();
-        changeFontSize(DEFAULT_FONT_SIZE);
+        handleAdjustSelectionSize(0);
       }
     };
     window.addEventListener('keydown', onKey);
@@ -907,8 +1021,11 @@ export default function App() {
             boldMarksRef.current = normalizeColorMarks(boldToInternal(payload.boldMarks));
             renderBoldMarks(boldMarksRef.current);
           }
+          if (Array.isArray(payload.sizeMarks)) {
+            sizeMarksRef.current = normalizeSizeMarks(payload.sizeMarks);
+            renderSizeMarks(sizeMarksRef.current);
+          }
           if (payload.language) setLanguage(payload.language);
-          if (payload.fontSize) setFontSize(clampFontSize(payload.fontSize));
           if (isClientApp) scrollToBottom();
         } else if (type === 'COLOR_MARKS_SYNC') {
           colorMarksRef.current = normalizeColorMarks(payload?.colorMarks || []);
@@ -916,8 +1033,9 @@ export default function App() {
         } else if (type === 'BOLD_MARKS_SYNC') {
           boldMarksRef.current = normalizeColorMarks(boldToInternal(payload?.boldMarks || []));
           renderBoldMarks(boldMarksRef.current);
-        } else if (type === 'FONT_SIZE_SYNC') {
-          if (payload?.fontSize) setFontSize(clampFontSize(payload.fontSize));
+        } else if (type === 'SIZE_MARKS_SYNC') {
+          sizeMarksRef.current = normalizeSizeMarks(payload?.sizeMarks || []);
+          renderSizeMarks(sizeMarksRef.current);
         } else if (type === 'LANG_SYNC') {
           setLanguage(payload.language);
         } else if (type === 'SEL_SYNC') {
@@ -1049,6 +1167,74 @@ export default function App() {
     boldMarksDecorations.current.set(decorations);
   };
 
+  // 将局部字号区间渲染为 Monaco inlineClassName 装饰
+  const renderSizeMarks = (marks) => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+    if (!sizeMarksDecorations.current) {
+      sizeMarksDecorations.current = editor.createDecorationsCollection();
+    }
+    const maxLen = model.getValueLength();
+    const decorations = [];
+    for (const m of marks || []) {
+      const start = Math.max(0, Math.min(maxLen, m.start));
+      const end = Math.max(0, Math.min(maxLen, m.end));
+      if (end <= start) continue;
+      const inlineClassName = getInlineSizeClassName(m.size);
+      if (!inlineClassName) continue;
+      const from = model.getPositionAt(start);
+      const to = model.getPositionAt(end);
+      decorations.push({
+        range: {
+          startLineNumber: from.lineNumber,
+          startColumn: from.column,
+          endLineNumber: to.lineNumber,
+          endColumn: to.column,
+        },
+        options: { inlineClassName, stickiness: 1 },
+      });
+    }
+    sizeMarksDecorations.current.set(decorations);
+  };
+
+  // 导师端：对选中文字放大/缩小/重置字号（delta > 0 放大，delta < 0 缩小，delta === 0 恢复默认 15px），并实时同步给客户端
+  const handleAdjustSelectionSize = (delta) => {
+    if (isClientApp) return;
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+
+    const offsetRanges = (editor.getSelections() || [])
+      .map((s) => {
+        const a = model.getOffsetAt({ lineNumber: s.startLineNumber, column: s.startColumn });
+        const b = model.getOffsetAt({ lineNumber: s.endLineNumber, column: s.endColumn });
+        return { start: Math.min(a, b), end: Math.max(a, b) };
+      })
+      .filter((r) => r.end > r.start);
+
+    if (offsetRanges.length === 0) {
+      setColorTip('请先选中要调字号的文字');
+      setTimeout(() => setColorTip(''), 2200);
+      return;
+    }
+
+    const nextMarks = applySizeDeltaToOffsets(sizeMarksRef.current, offsetRanges, delta);
+    sizeMarksRef.current = nextMarks;
+    renderSizeMarks(nextMarks);
+
+    // 更新顶栏显示当前选区字号
+    const firstRange = offsetRanges[0];
+    const hit = nextMarks.find((m) => m.end > firstRange.start && m.start < firstRange.end);
+    setSelectionFontSize(hit ? hit.size : DEFAULT_FONT_SIZE);
+
+    setColorTip('');
+    if (wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify({ type: 'SIZE_MARKS_SYNC', payload: { sizeMarks: nextMarks } }));
+    }
+    editor.focus();
+  };
+
   // 导师端：选中文字切换加粗（选区已全部加粗则取消，否则加粗），并实时同步给客户端
   const handleToggleSelectionBold = () => {
     if (isClientApp) return;
@@ -1152,11 +1338,12 @@ export default function App() {
     isRemote.current = false;
   };
 
-  const sendText = (value, colorMarks, boldMarks) => {
+  const sendText = (value, colorMarks, boldMarks, sizeMarks) => {
     if (wsRef.current?.readyState === 1) {
       const payload = { text: value };
       if (Array.isArray(colorMarks)) payload.colorMarks = colorMarks;
       if (Array.isArray(boldMarks)) payload.boldMarks = boldToWire(boldMarks);
+      if (Array.isArray(sizeMarks)) payload.sizeMarks = sizeMarks;
       wsRef.current.send(JSON.stringify({ type: 'TEXT_SYNC', payload }));
     }
   };
@@ -1178,17 +1365,25 @@ export default function App() {
       boldMarksRef.current = shiftedBold;
       renderBoldMarks(shiftedBold);
     }
+    if (ev?.changes?.length && sizeMarksRef.current.length > 0) {
+      const shiftedSize = shiftSizeMarksByChanges(sizeMarksRef.current, ev.changes);
+      sizeMarksRef.current = shiftedSize;
+      renderSizeMarks(shiftedSize);
+    }
     setText(clean);
-    sendText(clean, colorMarksRef.current, boldMarksRef.current);
+    sendText(clean, colorMarksRef.current, boldMarksRef.current, sizeMarksRef.current);
   };
 
   const clearPad = () => {
     colorMarksRef.current = [];
     boldMarksRef.current = [];
+    sizeMarksRef.current = [];
     renderColorMarks([]);
     renderBoldMarks([]);
+    renderSizeMarks([]);
+    setSelectionFontSize(DEFAULT_FONT_SIZE);
     setText('');
-    sendText('', [], []);
+    sendText('', [], [], []);
   };
 
   // 无 token：显示「粘贴邀请链接」入口
@@ -1350,8 +1545,6 @@ export default function App() {
                 />
               </label>
 
-              <FontSizeControl fontSize={fontSize} onChange={changeFontSize} />
-
               {supportsFrost && (
                 <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontWeight: 500, color: frostedGlass ? '#10b981' : '#cbd5e1' }}>
                   <input
@@ -1413,7 +1606,11 @@ export default function App() {
                   {colorTip}
                 </span>
               )}
-              <FontSizeControl fontSize={fontSize} onChange={changeFontSize} />
+              <SelectionSizeControl
+                fontSize={selectionFontSize}
+                hasSelection={hasSelection}
+                onAdjust={handleAdjustSelectionSize}
+              />
               <button
                 type="button"
                 onMouseDown={(e) => e.preventDefault()}
@@ -1583,9 +1780,10 @@ export default function App() {
             }
             if (colorMarksRef.current.length > 0) renderColorMarks(colorMarksRef.current);
             if (boldMarksRef.current.length > 0) renderBoldMarks(boldMarksRef.current);
+            if (sizeMarksRef.current.length > 0) renderSizeMarks(sizeMarksRef.current);
             monaco.editor.setTheme('codex-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
-            // 导师端：记录非空选区用于局部改色，并把选区实时发给客户
+            // 导师端：记录非空选区用于局部改色/加粗/调字号，并把选区实时发给客户
             if (!isClientApp) {
               // ⌘B / Ctrl+B 切换选中文字加粗（handleToggleSelectionBold 只依赖 ref 与 setState，首帧闭包可安全复用）
               editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, handleToggleSelectionBold);
@@ -1600,6 +1798,18 @@ export default function App() {
                   (s) => s.startLineNumber !== s.endLineNumber || s.startColumn !== s.endColumn
                 );
                 setHasSelection(nonEmpty.length > 0);
+                const model = editor.getModel();
+                if (model && nonEmpty.length > 0) {
+                  const s0 = nonEmpty[0];
+                  const a = model.getOffsetAt({ lineNumber: s0.startLineNumber, column: s0.startColumn });
+                  const b = model.getOffsetAt({ lineNumber: s0.endLineNumber, column: s0.endColumn });
+                  const start = Math.min(a, b);
+                  const end = Math.max(a, b);
+                  const hit = sizeMarksRef.current.find((m) => m.end > start && m.start < end);
+                  setSelectionFontSize(hit ? hit.size : DEFAULT_FONT_SIZE);
+                } else {
+                  setSelectionFontSize(DEFAULT_FONT_SIZE);
+                }
                 if (wsRef.current?.readyState !== 1) return;
                 wsRef.current.send(JSON.stringify({ type: 'SEL_SYNC', payload: { selections } }));
               });
@@ -1608,8 +1818,8 @@ export default function App() {
           options={{
             readOnly: isClientApp,
             fontFamily: codeFont,
-            fontSize,
-            lineHeight: Math.round(fontSize * 1.6),
+            fontSize: DEFAULT_FONT_SIZE,
+            lineHeight: 28,
             wordWrap: 'on',
             minimap: { enabled: false },
             stickyScroll: { enabled: false },
@@ -1661,8 +1871,8 @@ export default function App() {
   );
 }
 
-// ── 字体放大缩小控件：支持 A- / A+ 步进调节、点击字号数字恢复默认 15px ──
-function FontSizeControl({ fontSize, onChange }) {
+// ── 导师端选中文本局部字号放大缩小控件：仅对当前选中的文字放大/缩小/重置，不影响未选中内容 ──
+function SelectionSizeControl({ fontSize, hasSelection, onAdjust }) {
   return (
     <div
       style={{
@@ -1670,28 +1880,27 @@ function FontSizeControl({ fontSize, onChange }) {
         alignItems: 'center',
         gap: '3px',
         background: 'rgba(15, 23, 34, 0.65)',
-        border: '1px solid #334155',
+        border: `1px solid ${hasSelection ? 'rgba(16, 185, 129, 0.55)' : '#334155'}`,
         borderRadius: '6px',
         padding: '2px 5px',
         WebkitAppRegion: 'no-drag',
       }}
-      title={`放大/缩小提词字体（${modKey}- 缩小 · ${modKey}+ 放大 · 点击数字或 ${modKey}0 恢复默认 ${DEFAULT_FONT_SIZE}px）`}
+      title={`先选中部分文字，再点 A- / A+ 缩小或放大选中文字（${modKey}- 缩小 · ${modKey}+ 放大 · 点击数字或 ${modKey}0 恢复默认 ${DEFAULT_FONT_SIZE}px）`}
     >
       <button
         type="button"
         onMouseDown={(e) => e.preventDefault()}
-        onClick={() => onChange((s) => s - 1)}
-        disabled={fontSize <= MIN_FONT_SIZE}
-        title={`缩小字体 (${modKey}-)`}
+        onClick={() => onAdjust(-2)}
+        title={`缩小选中文字 (${modKey}-)`}
         style={{
           background: 'transparent',
-          color: fontSize <= MIN_FONT_SIZE ? '#475569' : '#cbd5e1',
+          color: hasSelection ? '#34d399' : '#cbd5e1',
           border: 'none',
           borderRadius: '4px',
           padding: '1px 5px',
           fontSize: '11.5px',
           fontWeight: 600,
-          cursor: fontSize <= MIN_FONT_SIZE ? 'not-allowed' : 'pointer',
+          cursor: 'pointer',
           lineHeight: 1.2,
         }}
       >
@@ -1699,12 +1908,12 @@ function FontSizeControl({ fontSize, onChange }) {
       </button>
       <span
         onMouseDown={(e) => e.preventDefault()}
-        onClick={() => onChange(DEFAULT_FONT_SIZE)}
-        title={`当前字号 ${fontSize}px，点击恢复默认 ${DEFAULT_FONT_SIZE}px`}
+        onClick={() => onAdjust(0)}
+        title={`当前选区字号 ${fontSize}px，点击将选中文字恢复默认 ${DEFAULT_FONT_SIZE}px`}
         style={{
           fontSize: '11px',
           fontFamily: codeFont,
-          color: fontSize === DEFAULT_FONT_SIZE ? '#94a3b8' : '#34d399',
+          color: fontSize !== DEFAULT_FONT_SIZE ? '#34d399' : (hasSelection ? '#e2e8f0' : '#94a3b8'),
           minWidth: '22px',
           textAlign: 'center',
           cursor: 'pointer',
@@ -1716,18 +1925,17 @@ function FontSizeControl({ fontSize, onChange }) {
       <button
         type="button"
         onMouseDown={(e) => e.preventDefault()}
-        onClick={() => onChange((s) => s + 1)}
-        disabled={fontSize >= MAX_FONT_SIZE}
-        title={`放大字体 (${modKey}+)`}
+        onClick={() => onAdjust(2)}
+        title={`放大选中文字 (${modKey}+)`}
         style={{
           background: 'transparent',
-          color: fontSize >= MAX_FONT_SIZE ? '#475569' : '#cbd5e1',
+          color: hasSelection ? '#34d399' : '#cbd5e1',
           border: 'none',
           borderRadius: '4px',
           padding: '1px 5px',
           fontSize: '11.5px',
           fontWeight: 700,
-          cursor: fontSize >= MAX_FONT_SIZE ? 'not-allowed' : 'pointer',
+          cursor: 'pointer',
           lineHeight: 1.2,
         }}
       >

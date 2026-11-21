@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.8';
+let pkgVersion = '1.0.9';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.8';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.9';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增字体放大/缩小（A- / A+ 按钮与 ⌘/Ctrl + +/-/0 快捷键，11px–32px，点击数字恢复默认 15px，导师端调节同步至客户端）\n2. 选中文字加粗（顶栏「B」或 ⌘B / Ctrl+B）与选中文字局部改色实时同步\n3. 支持「⚡ 1 秒极速热更新」',
+  notes: process.env.RELEASE_NOTES || '1. 顶栏 A- / A+ 升级为「选中文字局部放大/缩小」：导师选中任意文字即可单独调大/调小字号（11px–28px，点数字或 ⌘/Ctrl+0 恢复默认 15px），客户端实时同步呈现\n2. 选中文字加粗（B / ⌘B）与选中文字局部改色实时同步\n3. 客户端仅实时展示导师标注的字号、加粗与颜色',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -128,10 +128,19 @@ function sanitizeBoldMarks(raw) {
   return list;
 }
 
-function sanitizeFontSize(raw) {
-  const n = Math.round(Number(raw));
-  if (!Number.isFinite(n)) return 15;
-  return Math.max(11, Math.min(32, n));
+function sanitizeSizeMarks(raw) {
+  if (!Array.isArray(raw)) return [];
+  const list = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const start = Number(item.start);
+    const end = Number(item.end);
+    const size = Math.round(Number(item.size));
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start) continue;
+    if (!Number.isFinite(size) || size < 11 || size > 28 || size === 15) continue;
+    list.push({ start, end, size });
+  }
+  return list;
 }
 
 function persistRooms() {
@@ -145,7 +154,7 @@ function persistRooms() {
         text: room.text,
         colorMarks: room.colorMarks || [],
         boldMarks: room.boldMarks || [],
-        fontSize: sanitizeFontSize(room.fontSize),
+        sizeMarks: room.sizeMarks || [],
         language: room.language,
         createdAt: room.createdAt || room.lastActive,
         lastActive: room.lastActive,
@@ -168,7 +177,7 @@ function loadRooms() {
         text: r.text || '',
         colorMarks: sanitizeColorMarks(r.colorMarks),
         boldMarks: sanitizeBoldMarks(r.boldMarks),
-        fontSize: sanitizeFontSize(r.fontSize),
+        sizeMarks: sanitizeSizeMarks(r.sizeMarks),
         language: r.language || 'python',
         clients: new Map(),
         sharerId: null,
@@ -196,7 +205,7 @@ function getOrCreateRoom(roomId, token, note = '') {
       text: '',
       colorMarks: [],
       boldMarks: [],
-      fontSize: 15,
+      sizeMarks: [],
       language: 'python',
       clients: new Map(),
       sharerId: null,
@@ -474,7 +483,7 @@ wss.on('connection', (ws, req) => {
       text: room.text,
       colorMarks: room.colorMarks || [],
       boldMarks: room.boldMarks || [],
-      fontSize: sanitizeFontSize(room.fontSize),
+      sizeMarks: room.sizeMarks || [],
       language: room.language,
       screenShare: {
         active: Boolean(room.sharerId),
@@ -501,6 +510,10 @@ wss.on('connection', (ws, req) => {
         room.boldMarks = sanitizeBoldMarks(msg.payload.boldMarks);
         outPayload.boldMarks = room.boldMarks;
       }
+      if (Array.isArray(msg.payload.sizeMarks)) {
+        room.sizeMarks = sanitizeSizeMarks(msg.payload.sizeMarks);
+        outPayload.sizeMarks = room.sizeMarks;
+      }
       room.lastActive = Date.now();
       persistRooms();
       room.clients.forEach((_, c) => {
@@ -526,13 +539,13 @@ wss.on('connection', (ws, req) => {
           c.send(JSON.stringify({ type: 'BOLD_MARKS_SYNC', payload: { boldMarks: room.boldMarks } }));
         }
       });
-    } else if (msg.type === 'FONT_SIZE_SYNC') {
-      room.fontSize = sanitizeFontSize(msg.payload?.fontSize);
+    } else if (msg.type === 'SIZE_MARKS_SYNC') {
+      room.sizeMarks = sanitizeSizeMarks(msg.payload?.sizeMarks);
       room.lastActive = Date.now();
       persistRooms();
       room.clients.forEach((_, c) => {
         if (c !== ws && c.readyState === 1) {
-          c.send(JSON.stringify({ type: 'FONT_SIZE_SYNC', payload: { fontSize: room.fontSize } }));
+          c.send(JSON.stringify({ type: 'SIZE_MARKS_SYNC', payload: { sizeMarks: room.sizeMarks } }));
         }
       });
     } else if (msg.type === 'LANG_SYNC') {
