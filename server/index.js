@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.11';
+let pkgVersion = '1.0.12';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.11';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.12';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增 CoderPad 风格实时光标与姓名标签：任何成员点击或框选编辑器任意位置，其他成员会在该位置看到彩色光标竖线与姓名气泡\n2. 进入 Pad 支持输入自定义名字（不再使用固定的 Client / Mentor 默认名），底部在线栏支持随时点击自己名字改名\n3. 选中文字局部放大/缩小、加粗、改色实时同步',
+  notes: process.env.RELEASE_NOTES || '1. 优化 CoderPad 风格光标名字标签：点击或移动光标时显示名字气泡，停留 2.5 秒后名字标签自动平滑淡出消失，不遮挡代码\n2. 进入 Pad 支持输入自定义名字，底部状态栏可随时点击自己名字改名\n3. 选中文字局部放大/缩小、加粗、改色实时同步',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };

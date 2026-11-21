@@ -381,7 +381,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.11';
+  let currentVersion = '1.0.12';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -533,8 +533,9 @@ export default function App() {
   const editorRef = useRef(null);
   const isRemote = useRef(false);
   const remoteSelDecorations = useRef(null); // 对方选区的高亮装饰集合
-  const remoteCursorsRef = useRef(new Map()); // Map<clientId, { name, color, selections }>
+  const remoteCursorsRef = useRef(new Map()); // Map<clientId, { name, color, selections, showFlag }>
   const cursorWidgetsRef = useRef(new Map()); // Map<clientId, Monaco IContentWidget>
+  const cursorFlagTimersRef = useRef(new Map()); // Map<clientId, TimeoutId> 控制名字标签在几秒后自动淡出消失
   const colorMarksDecorations = useRef(null); // 选中文本局部字色装饰集合
   const colorMarksRef = useRef([]); // 当前文档的局部字色区间 [{ start, end, color }]
   const boldMarksDecorations = useRef(null); // 选中文本加粗装饰集合
@@ -1242,21 +1243,49 @@ export default function App() {
       widget._caret.style.backgroundColor = color;
       widget._flag.style.backgroundColor = color;
       widget._flag.textContent = name;
+      if (info.showFlag === false) {
+        widget._flag.classList.add('gp-flag-hidden');
+      } else {
+        widget._flag.classList.remove('gp-flag-hidden');
+      }
       // 第 1 行顶部空间较窄时，姓名标签向下贴合避免被编辑器顶边裁切
       widget._flag.style.top = posLine <= 1 ? '0px' : '-18px';
       widget._position = { lineNumber: posLine, column: posCol };
       editor.layoutContentWidget(widget);
     });
 
-    // 清理已离开或无光标的成员 Widget
+    // 清理已离开或无光标的成员 Widget 与定时器
     cursorWidgetsRef.current.forEach((widget, cid) => {
       if (!activeIds.has(cid)) {
         try { editor.removeContentWidget(widget); } catch {}
         cursorWidgetsRef.current.delete(cid);
+        const timer = cursorFlagTimersRef.current.get(cid);
+        if (timer) {
+          clearTimeout(timer);
+          cursorFlagTimersRef.current.delete(cid);
+        }
       }
     });
 
     remoteSelDecorations.current.set(allDecos);
+  };
+
+  // 为指定成员重置「名字标签显示 2.5 秒后自动消失」的计时器
+  const scheduleHideCursorFlag = (cid) => {
+    const prevTimer = cursorFlagTimersRef.current.get(cid);
+    if (prevTimer) clearTimeout(prevTimer);
+    const timer = setTimeout(() => {
+      cursorFlagTimersRef.current.delete(cid);
+      const cur = remoteCursorsRef.current.get(cid);
+      if (cur) {
+        cur.showFlag = false;
+      }
+      const widget = cursorWidgetsRef.current.get(cid);
+      if (widget?._flag) {
+        widget._flag.classList.add('gp-flag-hidden');
+      }
+    }, 2500);
+    cursorFlagTimersRef.current.set(cid, timer);
   };
 
   const updateRemoteCursor = (payload) => {
@@ -1267,8 +1296,10 @@ export default function App() {
       name: payload.name || 'User',
       color: payload.color || '#f59e0b',
       selections: Array.isArray(payload.selections) ? payload.selections : [],
+      showFlag: true,
     });
     renderAllRemoteCursors();
+    scheduleHideCursorFlag(cid);
   };
 
   const syncRemoteCursorsWithPresence = (list) => {
@@ -1286,6 +1317,8 @@ export default function App() {
       } else if (p.name !== cur.name || p.color !== cur.color) {
         cur.name = p.name;
         cur.color = p.color;
+        cur.showFlag = true;
+        scheduleHideCursorFlag(cid);
         changed = true;
       }
     });
