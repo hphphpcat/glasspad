@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.7';
+let pkgVersion = '1.0.8';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.7';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.8';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增选中文字加粗：导师端选中文字后点顶栏「B」或按 ⌘B / Ctrl+B，客户端实时显示\n2. 选中文本局部改色：导师端选中任意文字即可单独着色并实时同步到客户端\n3. 客户端不再提供字色修改控件，只显示导师标注的颜色与加粗',
+  notes: process.env.RELEASE_NOTES || '1. 新增字体放大/缩小（A- / A+ 按钮与 ⌘/Ctrl + +/-/0 快捷键，11px–32px，点击数字恢复默认 15px，导师端调节同步至客户端）\n2. 选中文字加粗（顶栏「B」或 ⌘B / Ctrl+B）与选中文字局部改色实时同步\n3. 支持「⚡ 1 秒极速热更新」',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -128,6 +128,12 @@ function sanitizeBoldMarks(raw) {
   return list;
 }
 
+function sanitizeFontSize(raw) {
+  const n = Math.round(Number(raw));
+  if (!Number.isFinite(n)) return 15;
+  return Math.max(11, Math.min(32, n));
+}
+
 function persistRooms() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -139,6 +145,7 @@ function persistRooms() {
         text: room.text,
         colorMarks: room.colorMarks || [],
         boldMarks: room.boldMarks || [],
+        fontSize: sanitizeFontSize(room.fontSize),
         language: room.language,
         createdAt: room.createdAt || room.lastActive,
         lastActive: room.lastActive,
@@ -161,6 +168,7 @@ function loadRooms() {
         text: r.text || '',
         colorMarks: sanitizeColorMarks(r.colorMarks),
         boldMarks: sanitizeBoldMarks(r.boldMarks),
+        fontSize: sanitizeFontSize(r.fontSize),
         language: r.language || 'python',
         clients: new Map(),
         sharerId: null,
@@ -188,6 +196,7 @@ function getOrCreateRoom(roomId, token, note = '') {
       text: '',
       colorMarks: [],
       boldMarks: [],
+      fontSize: 15,
       language: 'python',
       clients: new Map(),
       sharerId: null,
@@ -465,6 +474,7 @@ wss.on('connection', (ws, req) => {
       text: room.text,
       colorMarks: room.colorMarks || [],
       boldMarks: room.boldMarks || [],
+      fontSize: sanitizeFontSize(room.fontSize),
       language: room.language,
       screenShare: {
         active: Boolean(room.sharerId),
@@ -514,6 +524,15 @@ wss.on('connection', (ws, req) => {
       room.clients.forEach((_, c) => {
         if (c !== ws && c.readyState === 1) {
           c.send(JSON.stringify({ type: 'BOLD_MARKS_SYNC', payload: { boldMarks: room.boldMarks } }));
+        }
+      });
+    } else if (msg.type === 'FONT_SIZE_SYNC') {
+      room.fontSize = sanitizeFontSize(msg.payload?.fontSize);
+      room.lastActive = Date.now();
+      persistRooms();
+      room.clients.forEach((_, c) => {
+        if (c !== ws && c.readyState === 1) {
+          c.send(JSON.stringify({ type: 'FONT_SIZE_SYNC', payload: { fontSize: room.fontSize } }));
         }
       });
     } else if (msg.type === 'LANG_SYNC') {

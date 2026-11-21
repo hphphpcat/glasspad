@@ -1,6 +1,6 @@
 {
   "name": "codex-clone",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "private": true,
   "description": "Codex Interview 1:1 复刻：React + Electron + WebSocket 实时协同",
   "main": "electron/main.js",
