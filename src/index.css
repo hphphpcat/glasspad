@@ -12,3 +12,9 @@ html, body, #root {
   background-color: rgba(245, 158, 11, 0.45);
   border-radius: 2px;
 }
+
+/* 导师选中文字加粗（Monaco inlineClassName 装饰） */
+.monaco-editor .view-line span.gp-inline-bold,
+.monaco-editor .view-line span.gp-inline-bold span {
+  font-weight: 700 !important;
+}

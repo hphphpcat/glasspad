@@ -9,6 +9,7 @@
 - **实时同步**：导师逐字输入，候选人端即时显示，超过一屏时自动滚到最新一行。
 - **选区同步**：导师选中的文字，在候选人端显示为橙色高亮，用来指出重点。
 - **只读**：候选人端不能修改内容。
+- **选中改色 / 加粗**：导师选中一段文字后，点顶栏「选中字色」的色点改颜色（最左侧彩点清除颜色），点「B」或按 `⌘B` / `Ctrl+B` 加粗（再按一次取消）。只影响选中部分，候选人端实时同步显示。候选人端没有改色和加粗的入口。
 - **透明悬浮窗**：透明度 8% 到 100% 可调，可以透过窗口看到下面的浏览器；可开 Frosted Glass 毛玻璃模糊背景。
 - **邀请链接加入**：房间由管理员创建，每个房间有独立 token，没有链接进不了房间。
 - **房间持久化**：服务重启后房间和 token 仍然有效，房间闲置 6 小时后回收。
@@ -52,10 +53,10 @@
 
 ## 安装候选人 App
 
-到 [Releases](../../releases) 下载：
+到 [GlassPad Releases](https://github.com/hphphpcat/glasspad/releases/tag/glasspad) 下载最新版本：
 
-- macOS（Apple Silicon）：`Codex-1.0.0-arm64.dmg`
-- Windows（x64）：`Codex-1.0.0-portable.exe`，免安装，双击运行
+- macOS（Apple Silicon）：`GlassPad-<版本>-arm64.dmg`
+- Windows（x64）：`GlassPad-<版本>-portable.exe`，免安装，双击运行
 
 安装包没有签名：
 
@@ -102,6 +103,52 @@ node scripts/empty-room-test.mjs  # 房间清空后 token 仍有效
 npx electron scripts/screenshots.js  # 重新生成 README 截图
 ```
 
+## 发版流程
+
+改完代码后按下面的顺序发版。只执行 `git push` 不会出现新的 Release：仓库没有 GitHub Actions，安装包要在本地打包后上传。
+
+**约定**
+
+- 远程 `origin` 有两个 push 地址（`hphphpcat/codex-clone` 和 `hphphpcat/glasspad`），`git push origin` 会同时推送两个仓库。
+- 安装包统一放在 `hphphpcat/glasspad` 的一个 Release 里，tag 固定叫 `glasspad`。每个版本往里追加附件，并把标题改成 `GlassPad v<版本>`。
+- `server/index.js` 的默认下载链接按 `releases/download/glasspad/GlassPad-<版本>-arm64.dmg` 和 `GlassPad-<版本>-portable.exe` 拼接，附件文件名必须一致，否则客户端的「完整安装包更新」会下载失败。
+
+**步骤**（`X.Y.Z` 为新版本号）
+
+1. 升版本号，以下三处保持一致：`package.json` 的 `version`；`server/index.js` 的 `pkgVersion` 初值、兜底值和 `appRelease.notes` 更新说明；`src/App.jsx` 里 `performUpdateCheck` 的 `currentVersion`。
+2. 验证：
+   ```bash
+   npm run build
+   node --check server/index.js
+   ```
+3. 提交并推送：
+   ```bash
+   git add <改动文件>
+   git commit -m "feat: ... (vX.Y.Z)"
+   git push origin main
+   ```
+4. 打安装包，输出到 `release/`：
+   ```bash
+   npm run dist                               # macOS arm64 DMG
+   npx electron-builder --win portable --x64  # Windows 便携版
+   ```
+5. 打 tag 并推送，`glasspad` tag 每次都强制移动到最新提交：
+   ```bash
+   git tag vX.Y.Z HEAD
+   git tag -f glasspad HEAD
+   git push origin vX.Y.Z
+   git push -f origin glasspad
+   ```
+6. 上传安装包并更新 Release 标题（token 从 `GITHUB_TOKEN` / `GH_TOKEN` 或 git 钥匙串读取）：
+   ```bash
+   node scripts/upload-release.mjs "更新说明 1" "更新说明 2"
+   ```
+7. 核验 Release 标题是 `GlassPad vX.Y.Z`，且两个安装包都在：
+   ```bash
+   curl -s https://api.github.com/repos/hphphpcat/glasspad/releases/tags/glasspad \
+     | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d.name,(d.assets||[]).map(a=>a.name).filter(n=>n.includes('X.Y.Z')))"
+   ```
+
 ## 目录
 
 ```
@@ -110,5 +157,5 @@ src/App.jsx          导师网页端 + 候选人 App 共用的页面（按是否
 src/Admin.jsx        管理台
 electron/main.js     候选人 App 窗口：透明、置顶、防截屏、快捷键
 electron/preload.js  暴露给页面的桌面能力（毛玻璃、剪贴板）
-scripts/             测试与截图脚本
+scripts/             测试、截图与发版上传脚本（upload-release.mjs）
 ```

@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.6';
+let pkgVersion = '1.0.7';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.6';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.7';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 字体颜色升级为「选中文本局部改色」：导师端选中任意文字即可单独着色并实时同步到客户端，不再全局覆盖\n2. 客户端顶栏移除字色修改控件，仅实时呈现导师标注的局部颜色\n3. 支持「⚡ 1 秒极速热更新」：直接从 Railway 高速节点秒级热更',
+  notes: process.env.RELEASE_NOTES || '1. 新增选中文字加粗：导师端选中文字后点顶栏「B」或按 ⌘B / Ctrl+B，客户端实时显示\n2. 选中文本局部改色：导师端选中任意文字即可单独着色并实时同步到客户端\n3. 客户端不再提供字色修改控件，只显示导师标注的颜色与加粗',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -115,6 +115,19 @@ function sanitizeColorMarks(raw) {
   return list;
 }
 
+function sanitizeBoldMarks(raw) {
+  if (!Array.isArray(raw)) return [];
+  const list = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const start = Number(item.start);
+    const end = Number(item.end);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start) continue;
+    list.push({ start, end });
+  }
+  return list;
+}
+
 function persistRooms() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -125,6 +138,7 @@ function persistRooms() {
         note: room.note || '',
         text: room.text,
         colorMarks: room.colorMarks || [],
+        boldMarks: room.boldMarks || [],
         language: room.language,
         createdAt: room.createdAt || room.lastActive,
         lastActive: room.lastActive,
@@ -146,6 +160,7 @@ function loadRooms() {
         note: r.note || '',
         text: r.text || '',
         colorMarks: sanitizeColorMarks(r.colorMarks),
+        boldMarks: sanitizeBoldMarks(r.boldMarks),
         language: r.language || 'python',
         clients: new Map(),
         sharerId: null,
@@ -172,6 +187,7 @@ function getOrCreateRoom(roomId, token, note = '') {
       note: note || '',
       text: '',
       colorMarks: [],
+      boldMarks: [],
       language: 'python',
       clients: new Map(),
       sharerId: null,
@@ -448,6 +464,7 @@ wss.on('connection', (ws, req) => {
       clientId,
       text: room.text,
       colorMarks: room.colorMarks || [],
+      boldMarks: room.boldMarks || [],
       language: room.language,
       screenShare: {
         active: Boolean(room.sharerId),
@@ -465,14 +482,17 @@ wss.on('connection', (ws, req) => {
 
     if (msg.type === 'TEXT_SYNC') {
       room.text = msg.payload.text;
+      const outPayload = { text: room.text };
       if (Array.isArray(msg.payload.colorMarks)) {
         room.colorMarks = sanitizeColorMarks(msg.payload.colorMarks);
+        outPayload.colorMarks = room.colorMarks;
+      }
+      if (Array.isArray(msg.payload.boldMarks)) {
+        room.boldMarks = sanitizeBoldMarks(msg.payload.boldMarks);
+        outPayload.boldMarks = room.boldMarks;
       }
       room.lastActive = Date.now();
       persistRooms();
-      const outPayload = Array.isArray(msg.payload.colorMarks)
-        ? { text: room.text, colorMarks: room.colorMarks }
-        : { text: room.text };
       room.clients.forEach((_, c) => {
         if (c !== ws && c.readyState === 1) {
           c.send(JSON.stringify({ type: 'TEXT_SYNC', payload: outPayload }));
@@ -485,6 +505,15 @@ wss.on('connection', (ws, req) => {
       room.clients.forEach((_, c) => {
         if (c !== ws && c.readyState === 1) {
           c.send(JSON.stringify({ type: 'COLOR_MARKS_SYNC', payload: { colorMarks: room.colorMarks } }));
+        }
+      });
+    } else if (msg.type === 'BOLD_MARKS_SYNC') {
+      room.boldMarks = sanitizeBoldMarks(msg.payload?.boldMarks);
+      room.lastActive = Date.now();
+      persistRooms();
+      room.clients.forEach((_, c) => {
+        if (c !== ws && c.readyState === 1) {
+          c.send(JSON.stringify({ type: 'BOLD_MARKS_SYNC', payload: { boldMarks: room.boldMarks } }));
         }
       });
     } else if (msg.type === 'LANG_SYNC') {

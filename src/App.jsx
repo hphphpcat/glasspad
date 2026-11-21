@@ -123,6 +123,26 @@ function shiftColorMarksByChanges(marks, changes) {
   return normalizeColorMarks(current);
 }
 
+// 加粗区间复用上面的区间算法：内部用固定占位色 BOLD_SENTINEL 表示「已加粗」，收发时只保留 { start, end }
+const BOLD_SENTINEL = '#000000';
+const boldToInternal = (marks) => (Array.isArray(marks) ? marks : [])
+  .map((m) => ({ start: m?.start, end: m?.end, color: BOLD_SENTINEL }));
+const boldToWire = (marks) => marks.map((m) => ({ start: m.start, end: m.end }));
+
+// 选区是否已全部加粗：全部加粗则本次操作为取消加粗，否则为加粗
+function isRangesFullyCovered(marks, ranges) {
+  return ranges.every((r) => {
+    let cursor = r.start;
+    for (const m of marks) {
+      if (m.end <= cursor) continue;
+      if (m.start > cursor) return false;
+      cursor = m.end;
+      if (cursor >= r.end) return true;
+    }
+    return cursor >= r.end;
+  });
+}
+
 const normalizeLF = (s) => (s || '').replace(/\r\n/g, '\n');
 
 const DEFAULT_SERVER_HTTP = 'https://glasspad.up.railway.app';
@@ -150,7 +170,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.6';
+  let currentVersion = '1.0.7';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -301,6 +321,8 @@ export default function App() {
   const remoteSelDecorations = useRef(null); // 对方选区的高亮装饰集合
   const colorMarksDecorations = useRef(null); // 选中文本局部字色装饰集合
   const colorMarksRef = useRef([]); // 当前文档的局部字色区间 [{ start, end, color }]
+  const boldMarksDecorations = useRef(null); // 选中文本加粗装饰集合
+  const boldMarksRef = useRef([]); // 当前文档的加粗区间（内部格式 { start, end, color: BOLD_SENTINEL }）
   const latestText = useRef(''); // 最近收到的远端文字（编辑器挂载前到达时用于补写）
 
   // 客户端共享屏幕用到的 WebRTC / Media 引用
@@ -847,11 +869,18 @@ export default function App() {
             colorMarksRef.current = normalizeColorMarks(payload.colorMarks);
             renderColorMarks(colorMarksRef.current);
           }
+          if (Array.isArray(payload.boldMarks)) {
+            boldMarksRef.current = normalizeColorMarks(boldToInternal(payload.boldMarks));
+            renderBoldMarks(boldMarksRef.current);
+          }
           if (payload.language) setLanguage(payload.language);
           if (isClientApp) scrollToBottom();
         } else if (type === 'COLOR_MARKS_SYNC') {
           colorMarksRef.current = normalizeColorMarks(payload?.colorMarks || []);
           renderColorMarks(colorMarksRef.current);
+        } else if (type === 'BOLD_MARKS_SYNC') {
+          boldMarksRef.current = normalizeColorMarks(boldToInternal(payload?.boldMarks || []));
+          renderBoldMarks(boldMarksRef.current);
         } else if (type === 'LANG_SYNC') {
           setLanguage(payload.language);
         } else if (type === 'SEL_SYNC') {
@@ -954,6 +983,67 @@ export default function App() {
     colorMarksDecorations.current.set(decorations);
   };
 
+  // 将加粗区间渲染为 Monaco inlineClassName 装饰（样式见 index.css 的 .gp-inline-bold）
+  const renderBoldMarks = (marks) => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+    if (!boldMarksDecorations.current) {
+      boldMarksDecorations.current = editor.createDecorationsCollection();
+    }
+    const maxLen = model.getValueLength();
+    const decorations = [];
+    for (const m of marks || []) {
+      const start = Math.max(0, Math.min(maxLen, m.start));
+      const end = Math.max(0, Math.min(maxLen, m.end));
+      if (end <= start) continue;
+      const from = model.getPositionAt(start);
+      const to = model.getPositionAt(end);
+      decorations.push({
+        range: {
+          startLineNumber: from.lineNumber,
+          startColumn: from.column,
+          endLineNumber: to.lineNumber,
+          endColumn: to.column,
+        },
+        options: { inlineClassName: 'gp-inline-bold', stickiness: 1 },
+      });
+    }
+    boldMarksDecorations.current.set(decorations);
+  };
+
+  // 导师端：选中文字切换加粗（选区已全部加粗则取消，否则加粗），并实时同步给客户端
+  const handleToggleSelectionBold = () => {
+    if (isClientApp) return;
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+
+    const offsetRanges = (editor.getSelections() || [])
+      .map((s) => {
+        const a = model.getOffsetAt({ lineNumber: s.startLineNumber, column: s.startColumn });
+        const b = model.getOffsetAt({ lineNumber: s.endLineNumber, column: s.endColumn });
+        return { start: Math.min(a, b), end: Math.max(a, b) };
+      })
+      .filter((r) => r.end > r.start);
+
+    if (offsetRanges.length === 0) {
+      setColorTip('请先选中要加粗的文字');
+      setTimeout(() => setColorTip(''), 2200);
+      return;
+    }
+
+    const removing = isRangesFullyCovered(boldMarksRef.current, offsetRanges);
+    const nextMarks = applyColorToOffsets(boldMarksRef.current, offsetRanges, removing ? '' : BOLD_SENTINEL);
+    boldMarksRef.current = nextMarks;
+    renderBoldMarks(nextMarks);
+    setColorTip('');
+    if (wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify({ type: 'BOLD_MARKS_SYNC', payload: { boldMarks: boldToWire(nextMarks) } }));
+    }
+    editor.focus();
+  };
+
   // 导师端：对当前选中的局部文本应用或清除字体颜色，并实时同步给客户端
   const handleApplySelectionColor = (nextColor) => {
     if (isClientApp) return;
@@ -1025,9 +1115,11 @@ export default function App() {
     isRemote.current = false;
   };
 
-  const sendText = (value, colorMarks) => {
+  const sendText = (value, colorMarks, boldMarks) => {
     if (wsRef.current?.readyState === 1) {
-      const payload = Array.isArray(colorMarks) ? { text: value, colorMarks } : { text: value };
+      const payload = { text: value };
+      if (Array.isArray(colorMarks)) payload.colorMarks = colorMarks;
+      if (Array.isArray(boldMarks)) payload.boldMarks = boldToWire(boldMarks);
       wsRef.current.send(JSON.stringify({ type: 'TEXT_SYNC', payload }));
     }
   };
@@ -1044,15 +1136,22 @@ export default function App() {
       colorMarksRef.current = shifted;
       renderColorMarks(shifted);
     }
+    if (ev?.changes?.length && boldMarksRef.current.length > 0) {
+      const shiftedBold = shiftColorMarksByChanges(boldMarksRef.current, ev.changes);
+      boldMarksRef.current = shiftedBold;
+      renderBoldMarks(shiftedBold);
+    }
     setText(clean);
-    sendText(clean, colorMarksRef.current);
+    sendText(clean, colorMarksRef.current, boldMarksRef.current);
   };
 
   const clearPad = () => {
     colorMarksRef.current = [];
+    boldMarksRef.current = [];
     renderColorMarks([]);
+    renderBoldMarks([]);
     setText('');
-    sendText('', []);
+    sendText('', [], []);
   };
 
   // 无 token：显示「粘贴邀请链接」入口
@@ -1275,6 +1374,21 @@ export default function App() {
                   {colorTip}
                 </span>
               )}
+              <button
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={handleToggleSelectionBold}
+                title="加粗 / 取消加粗选中文字（⌘B / Ctrl+B）"
+                style={{
+                  ...btn,
+                  fontWeight: 800,
+                  color: hasSelection ? '#34d399' : '#9ca3af',
+                  borderColor: hasSelection ? 'rgba(16, 185, 129, 0.55)' : '#333',
+                  padding: '3px 9px',
+                }}
+              >
+                B
+              </button>
               <SelectionColorPicker
                 pickerColor={pickerColor}
                 hasSelection={hasSelection}
@@ -1428,10 +1542,13 @@ export default function App() {
               }
             }
             if (colorMarksRef.current.length > 0) renderColorMarks(colorMarksRef.current);
+            if (boldMarksRef.current.length > 0) renderBoldMarks(boldMarksRef.current);
             monaco.editor.setTheme('codex-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
             // 导师端：记录非空选区用于局部改色，并把选区实时发给客户
             if (!isClientApp) {
+              // ⌘B / Ctrl+B 切换选中文字加粗（handleToggleSelectionBold 只依赖 ref 与 setState，首帧闭包可安全复用）
+              editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, handleToggleSelectionBold);
               editor.onDidChangeCursorSelection(() => {
                 const selections = (editor.getSelections() || []).map((s) => ({
                   startLineNumber: s.startLineNumber,
