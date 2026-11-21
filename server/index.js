@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.9';
+let pkgVersion = '1.0.10';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.9';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.10';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 顶栏 A- / A+ 升级为「选中文字局部放大/缩小」：导师选中任意文字即可单独调大/调小字号（11px–28px，点数字或 ⌘/Ctrl+0 恢复默认 15px），客户端实时同步呈现\n2. 选中文字加粗（B / ⌘B）与选中文字局部改色实时同步\n3. 客户端仅实时展示导师标注的字号、加粗与颜色',
+  notes: process.env.RELEASE_NOTES || '1. 修复局部字号缩放：同时选中大小不一的文字时按各自原有字号独立放大/缩小，不再被统一成同一字号\n2. 修复局部字号渲染后鼠标框选定位偏移、边缘打字吞入旧样式及点击顶栏选区偶发丢失问题\n3. 选中文字局部放大/缩小、加粗、改色实时同步到客户端',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
