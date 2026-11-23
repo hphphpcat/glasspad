@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.15';
+let pkgVersion = '1.0.16';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.15';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.16';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. Mac 系统音内录：接入 BlackHole 虚拟声卡，电脑声音无损直传导师（无需开外放、不受环境噪声影响）\n2. 客户端新增「系统音」一键配置：自动检测 BlackHole、创建多输出设备并设为默认输出\n3. 系统音与麦克风独立双轨混音，麦克风可一键开关；未装 BlackHole 时自动回退开外放拾音',
+  notes: process.env.RELEASE_NOTES || '1. 修复 Mac 系统音采集不到的问题：多输出设备改为镜像模式，系统声音真正回环进 BlackHole\n2. 修复麦克风设备误匹配（排除虚拟/聚合设备），系统音与麦克风双轨独立采集\n3. 一键配置会自动重建旧版多输出设备，点一次即可修复',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };

@@ -24,7 +24,12 @@ async function getMacAudioSources() {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const inputs = devices.filter((d) => d.kind === 'audioinput');
     const blackhole = inputs.find((d) => /BlackHole/i.test(d.label || ''));
-    const mic = inputs.find((d) => d.deviceId !== blackhole?.deviceId && !/BlackHole/i.test(d.label || ''));
+    // 物理麦克风：排除 default 占位项、BlackHole 本身、聚合设备（GlassPad 系统音也有输入流）及其它虚拟设备
+    const mic = inputs.find((d) => {
+      if (d.deviceId === 'default' || d.deviceId === blackhole?.deviceId) return false;
+      const lab = d.label || '';
+      return !/BlackHole|GlassPad|Aggregate|Virtual/i.test(lab);
+    });
     return { blackholeId: blackhole?.deviceId || null, micId: mic?.deviceId || null, error: '' };
   } finally {
     probe?.getTracks().forEach((t) => t.stop());
@@ -401,7 +406,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.15';
+  let currentVersion = '1.0.16';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();

@@ -1,6 +1,6 @@
 {
   "name": "glasspad",
-  "version": "1.0.15",
+  "version": "1.0.16",
   "private": true,
   "description": "GlassPad：React + Electron + WebSocket 实时协同提词",
   "main": "electron/main.js",

@@ -14,6 +14,7 @@ let kAggNameKey = "name" as String
 let kAggUIDKey = "uid" as String
 let kAggSubDeviceListKey = "subdevices" as String
 let kAggMasterSubDeviceKey = "master" as String
+let kAggStackedKey = "stacked" as String
 let kSubDeviceUIDKey = "uid" as String
 
 // 读取某个 AudioObject 的字符串属性（CFString，get rule）
@@ -77,6 +78,9 @@ func createAggregateDevice(subDeviceUIDs: [String], masterUID: String) -> AudioD
         kAggUIDKey: AGG_UID,
         kAggSubDeviceListKey: subDevices,
         kAggMasterSubDeviceKey: masterUID,
+        // stacked = 0：镜像模式，所有子设备（扬声器 + BlackHole）的输出流喂相同数据，
+        // 系统立体声才会同时进入扬声器与 BlackHole 环回，而不是按通道顺序拼接
+        kAggStackedKey: 0,
     ]
     var deviceID = AudioDeviceID(0)
     let status = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &deviceID)
@@ -97,10 +101,8 @@ func setDefaultOutputDevice(_ deviceID: AudioDeviceID) -> Bool {
 }
 
 func runSetup() -> [String: Any] {
-    let devices = allAudioDevices()
-
     // 1. 找 BlackHole（名字含 BlackHole）
-    guard let blackhole = devices.first(where: {
+    guard let blackhole = allAudioDevices().first(where: {
         (readString($0, kAudioObjectPropertyName) ?? "").localizedCaseInsensitiveContains("BlackHole")
     }) else {
         return ["ok": false, "error": "未检测到 BlackHole，请先安装"]
@@ -109,24 +111,25 @@ func runSetup() -> [String: Any] {
         return ["ok": false, "error": "无法读取 BlackHole 设备 UID"]
     }
 
-    // 2. 已存在「GlassPad 系统音」则复用并设为默认
-    if let existing = devices.first(where: { readString($0, kAudioObjectPropertyName) == AGG_NAME }) {
-        let setOK = setDefaultOutputDevice(existing)
-        return ["ok": true, "outputDevice": AGG_NAME, "reused": true, "defaultSet": setOK]
+    // 2. 若已存在旧的「GlassPad 系统音」（可能是早期非镜像版本），先销毁
+    if let old = allAudioDevices().first(where: { readString($0, kAudioObjectPropertyName) == AGG_NAME }) {
+        AudioHardwareDestroyAggregateDevice(old)
     }
 
-    // 3. 挑选扬声器：默认输出（非 BlackHole）优先，否则第一个有输出流且非 BlackHole 的设备
+    // 3. 重新枚举并挑选扬声器：默认输出（非 BlackHole）优先，否则第一个有输出流且非 BlackHole 的设备
+    let devices = allAudioDevices()
     var speaker: AudioDeviceID?
     if let def = defaultOutputDevice(), def != blackhole {
         speaker = def
-    } else {
+    }
+    if speaker == nil {
         speaker = devices.first(where: { $0 != blackhole && hasOutputStreams($0) })
     }
     guard let spk = speaker, let spkUID = readString(spk, kAudioDevicePropertyDeviceUID) else {
         return ["ok": false, "error": "未找到可用的扬声器输出设备"]
     }
 
-    // 4. 创建 Aggregate（扬声器 + BlackHole），master 用扬声器保证时钟稳定
+    // 4. 创建 Aggregate（扬声器 + BlackHole，镜像模式），master 用扬声器保证时钟稳定
     var subUIDs = [spkUID]
     if !subUIDs.contains(blackholeUID) { subUIDs.append(blackholeUID) }
 
