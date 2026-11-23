@@ -71,29 +71,50 @@ func hasOutputStreams(_ deviceID: AudioDeviceID) -> Bool {
     return AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size) == noErr && size > 0
 }
 
+// 判断是否为虚拟/聚合设备（这些设备的音量绝不能动，尤其是 BlackHole 必须保持 100% 音量给导师）
+func isVirtualAudioDevice(_ d: AudioDeviceID) -> Bool {
+    let name = readString(d, kAudioObjectPropertyName) ?? ""
+    let uid = readString(d, kAudioDevicePropertyDeviceUID) ?? ""
+    return name.localizedCaseInsensitiveContains("Virtual")
+        || name.localizedCaseInsensitiveContains("Aggregate")
+        || name.localizedCaseInsensitiveContains("BlackHole")
+        || name.localizedCaseInsensitiveContains("ZoomAudio")
+        || name.localizedCaseInsensitiveContains("Oray")
+        || name.localizedCaseInsensitiveContains("ToDesk")
+        || name == AGG_NAME
+        || uid == AGG_UID
+        || uid.localizedCaseInsensitiveContains("aggregate")
+        || uid.localizedCaseInsensitiveContains("BlackHole")
+        || uid.localizedCaseInsensitiveContains("MULTIPLE")
+}
+
 // 挑选物理扬声器（关键：必须在销毁旧聚合设备之前调用，且明确排除 BlackHole / 聚合设备 / 虚拟设备，
 // 否则默认输出可能指向被销毁的旧聚合设备，导致把「聚合设备自己」当扬声器塞进去，扬声器被丢出链路、学生听不到声音）
 func findPhysicalSpeaker() -> AudioDeviceID? {
     let devices = allAudioDevices()
+    // 0. 若当前默认输出是真实物理输出设备（例如外接耳机/音响/内置扬声器），优先使用它
+    if let def = defaultOutputDevice(), hasOutputStreams(def), !isVirtualAudioDevice(def) {
+        return def
+    }
     // 1. Mac 内置扬声器的标准 UID，最可靠
     if let builtin = devices.first(where: { readString($0, kAudioDevicePropertyDeviceUID) == "BuiltInSpeakerDevice" }) {
         return builtin
     }
     // 2. 名字含「扬声器 / Speaker」，且排除虚拟设备、聚合设备、BlackHole 本身
-    return devices.first(where: { d in
-        guard hasOutputStreams(d) else { return false }
+    if let named = devices.first(where: { d in
+        guard hasOutputStreams(d), !isVirtualAudioDevice(d) else { return false }
         let name = readString(d, kAudioObjectPropertyName) ?? ""
-        let uid = readString(d, kAudioDevicePropertyDeviceUID) ?? ""
-        let isVirtual = name.localizedCaseInsensitiveContains("Virtual")
-            || name.localizedCaseInsensitiveContains("Aggregate")
-            || name.localizedCaseInsensitiveContains("BlackHole")
-            || name == AGG_NAME
-            || uid == AGG_UID
-            || uid.localizedCaseInsensitiveContains("aggregate")
-            || uid.localizedCaseInsensitiveContains("BlackHole")
-        let looksSpeaker = name.contains("扬声器") || name.localizedCaseInsensitiveContains("Speaker")
-        return looksSpeaker && !isVirtual
-    })
+        return name.contains("扬声器") || name.localizedCaseInsensitiveContains("Speaker")
+    }) {
+        return named
+    }
+    // 3. 兜底：任意非虚拟的物理输出设备
+    return devices.first(where: { hasOutputStreams($0) && !isVirtualAudioDevice($0) })
+}
+
+// 查找所有物理输出设备（内置扬声器 + 外接耳机/显示器音响等），用于统一调节本机外放音量
+func findAllPhysicalOutputDevices() -> [AudioDeviceID] {
+    return allAudioDevices().filter { hasOutputStreams($0) && !isVirtualAudioDevice($0) }
 }
 
 // 创建 Aggregate Device（镜像模式：所有子设备喂相同数据，扬声器 + BlackHole 同时出声）
@@ -145,35 +166,57 @@ func outputChannelCount(_ deviceID: AudioDeviceID) -> Int {
     }
 }
 
-// 直接设置物理扬声器设备的音量（0–100）。
+// 直接设置所有物理扬声器/耳机输出设备的音量（0–100）。
 // 背景：聚合设备接管默认输出后，系统音量键失效（macOS 不支持调 Multi-Output 设备音量），
-// 只能绕过聚合设备、对物理扬声器子设备单独设 kAudioDevicePropertyVolumeScalar
-func setSpeakerVolume(_ percent: Float) -> [String: Any] {
-    guard let spk = findPhysicalSpeaker() else {
-        return ["ok": false, "error": "未找到扬声器设备"]
-    }
+// 只能绕过聚合设备、对物理扬声器子设备单独设 kAudioDevicePropertyVolumeScalar 与 Mute
+func setDeviceVolumeScalar(_ dev: AudioDeviceID, _ percent: Float) -> Bool {
     let scalar = max(0, min(1, percent / 100))
-    let chans = outputChannelCount(spk)
+    let shouldMute: UInt32 = percent <= 0.5 ? 1 : 0
+    let chans = outputChannelCount(dev)
     var anyOK = false
-    // 逐通道设置，覆盖左右声道（内置扬声器通常 2 通道）
-    for ch in 0..<max(1, chans) {
+
+    // 同步设置主通道与各声道 Mute 状态（当滑到 0% 时彻底硬件静音，>0% 时自动解除静音）
+    for ch in 0...max(1, chans) {
+        var muteAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: UInt32(ch))
+        if AudioObjectHasProperty(dev, &muteAddr) {
+            var m = shouldMute
+            _ = AudioObjectSetPropertyData(dev, &muteAddr, 0, nil, UInt32(MemoryLayout<UInt32>.size), &m)
+        }
+    }
+
+    // 逐通道设置 VolumeScalar，覆盖主通道(0)与左右声道(1, 2)
+    for ch in 0...max(2, chans) {
         var addr = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyVolumeScalar,
             mScope: kAudioObjectPropertyScopeOutput,
             mElement: UInt32(ch))
-        var value: Float32 = scalar
-        if AudioObjectSetPropertyData(spk, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &value) == noErr {
+        if AudioObjectHasProperty(dev, &addr) {
+            var value: Float32 = scalar
+            if AudioObjectSetPropertyData(dev, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &value) == noErr {
+                anyOK = true
+            }
+        }
+    }
+    return anyOK
+}
+
+func setSpeakerVolume(_ percent: Float) -> [String: Any] {
+    let targets = findAllPhysicalOutputDevices()
+    guard !targets.isEmpty else {
+        return ["ok": false, "error": "未找到扬声器设备"]
+    }
+    var anyOK = false
+    for dev in targets {
+        if setDeviceVolumeScalar(dev, percent) {
             anyOK = true
         }
     }
-    if !anyOK {
-        // 回退：主通道
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain)
-        var value: Float32 = scalar
-        anyOK = AudioObjectSetPropertyData(spk, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &value) == noErr
+    // 确保 BlackHole 始终保持 100% 满音量且不静音，避免被意外调小导致导师听不见系统音
+    for d in allAudioDevices() where (readString(d, kAudioObjectPropertyName) ?? "").localizedCaseInsensitiveContains("BlackHole") {
+        _ = setDeviceVolumeScalar(d, 100)
     }
     return anyOK ? ["ok": true, "volume": Int(percent)] : ["ok": false, "error": "设置扬声器音量失败"]
 }
@@ -183,25 +226,30 @@ func getSpeakerVolume() -> [String: Any] {
     guard let spk = findPhysicalSpeaker() else {
         return ["ok": false, "error": "未找到扬声器设备"]
     }
-    var addr = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyVolumeScalar,
+    var muteAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyMute,
         mScope: kAudioObjectPropertyScopeOutput,
         mElement: kAudioObjectPropertyElementMain)
-    var value: Float32 = 0
-    var size = UInt32(MemoryLayout<Float32>.size)
-    if AudioObjectGetPropertyData(spk, &addr, 0, nil, &size, &value) != noErr {
-        // 回退读通道 0
-        var a2 = AudioObjectPropertyAddress(
+    var muted: UInt32 = 0
+    var mSize = UInt32(MemoryLayout<UInt32>.size)
+    if AudioObjectHasProperty(spk, &muteAddr),
+       AudioObjectGetPropertyData(spk, &muteAddr, 0, nil, &mSize, &muted) == noErr,
+       muted != 0 {
+        return ["ok": true, "volume": 0]
+    }
+    for el: UInt32 in [0, 1, 2] {
+        var addr = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyVolumeScalar,
             mScope: kAudioObjectPropertyScopeOutput,
-            mElement: 0)
-        value = 0
-        size = UInt32(MemoryLayout<Float32>.size)
-        guard AudioObjectGetPropertyData(spk, &a2, 0, nil, &size, &value) == noErr else {
-            return ["ok": false, "error": "读取扬声器音量失败"]
+            mElement: el)
+        var value: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        if AudioObjectHasProperty(spk, &addr),
+           AudioObjectGetPropertyData(spk, &addr, 0, nil, &size, &value) == noErr {
+            return ["ok": true, "volume": Int(round(value * 100))]
         }
     }
-    return ["ok": true, "volume": Int(value * 100)]
+    return ["ok": false, "error": "读取扬声器音量失败"]
 }
 
 func runSetup() -> [String: Any] {
@@ -240,7 +288,15 @@ func runSetup() -> [String: Any] {
         return ["ok": false, "error": "创建多输出设备失败"]
     }
     let setOK = setDefaultOutputDevice(aggID)
-    return ["ok": true, "outputDevice": AGG_NAME, "created": true, "defaultSet": setOK]
+    // 若物理扬声器音量过高（>45%），自动压到舒适的 35%，防止聚合设备接管后外放震耳且被麦克风回拾
+    if let cur = getSpeakerVolume()["volume"] as? Int, cur > 45 || cur == 0 {
+        _ = setSpeakerVolume(35)
+    } else {
+        // 确保 BlackHole 本身保持 100% 满音量
+        _ = setDeviceVolumeScalar(blackhole, 100)
+    }
+    let finalVol = (getSpeakerVolume()["volume"] as? Int) ?? 35
+    return ["ok": true, "outputDevice": AGG_NAME, "created": true, "defaultSet": setOK, "volume": finalVol]
 }
 
 // 业务结果统一 JSON 输出 + exit 0；仅在进程崩溃时才非 0，便于主进程用 stderr 兜底

@@ -140,12 +140,15 @@ function isUsingHotRemoteBundle() {
     const metaPath = getHotMetaPath();
     if (fs.existsSync(metaPath)) {
       const saved = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-      if (saved?.version && compareSemver(saved.version, app.getVersion()) >= 0 && saved.useRemote) {
+      // 仅当热更新记录版本严格高于本地安装包内置版本时才加载远端页面；
+      // 一旦用户安装了更新的完整安装包（pkgVer >= saved.version），自动清理旧记录并使用本地内置最新 dist
+      if (saved?.version && compareSemver(saved.version, app.getVersion()) > 0 && saved.useRemote) {
         return true;
       }
+      try { fs.unlinkSync(metaPath); } catch {}
     }
   } catch {}
-  return false;
+  return false
 }
 function checkFrostedGlassSupport() {
   if (process.platform === 'darwin') return true;

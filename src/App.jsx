@@ -406,7 +406,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.18';
+  let currentVersion = '1.0.19';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -597,6 +597,18 @@ export default function App() {
     api.getAppVersion?.().then((info) => {
       if (info?.version) setAppVersion(info.version);
     });
+    // macOS：启动即读取 BlackHole 安装状态与本机物理扬声器当前音量，确保未开屏幕共享时顶栏也能随时调节音量
+    if (api.platform === 'darwin' && api.getAudioSetupStatus) {
+      api.getAudioSetupStatus().then((st) => {
+        const installed = Boolean(st?.blackholeInstalled);
+        setAudioSetup({ supported: Boolean(st?.supported), blackholeInstalled: installed, configured: false });
+        if (installed && api.getSpeakerVolume) {
+          api.getSpeakerVolume().then((vol) => {
+            if (typeof vol?.volume === 'number') setSpeakerVolume(vol.volume);
+          }).catch(() => {});
+        }
+      }).catch(() => {});
+    }
     // 启动后自动检查更新：若发现新版本，直接弹出更新提示卡片并高亮顶栏按钮
     performUpdateCheck(wsBase).then((res) => {
       if (res?.currentVersion) setAppVersion(res.currentVersion);
@@ -775,6 +787,10 @@ export default function App() {
     const session = shareSessionRef.current;
     if (session) {
       session.stopped = true;
+      if (session.duckTimer) {
+        clearInterval(session.duckTimer);
+        session.duckTimer = null;
+      }
       session.peers.forEach((entry) => {
         entry.pc.onicecandidate = null;
         entry.pc.onconnectionstatechange = null;
@@ -848,19 +864,25 @@ export default function App() {
         throw captureErr;
       }
 
-      // 0.5 macOS BlackHole 检测（装了则系统音走 BlackHole 数字环回，不靠麦克风拾外放）
+      // 0.5 macOS BlackHole 检测（装了则系统音走 BlackHole 数字环回，不靠麦克风拾外放；同时自动修复/确保多输出设备与安全音量生效）
       let blackholeInstalled = false;
       if (caps.platform === 'darwin' && window.electronAPI?.getAudioSetupStatus) {
         try {
           const st = await window.electronAPI.getAudioSetupStatus();
           blackholeInstalled = Boolean(st?.blackholeInstalled);
           setAudioSetup({ supported: Boolean(st?.supported), blackholeInstalled, configured: false });
-          // 读取物理扬声器当前音量，初始化音量滑块
-          if (blackholeInstalled && window.electronAPI?.getSpeakerVolume) {
-            try {
-              const vol = await window.electronAPI.getSpeakerVolume();
-              if (typeof vol?.volume === 'number') setSpeakerVolume(vol.volume);
-            } catch {}
+          if (blackholeInstalled) {
+            if (window.electronAPI?.runAudioSetup) {
+              try {
+                const setupRes = await window.electronAPI.runAudioSetup();
+                if (typeof setupRes?.volume === 'number') setSpeakerVolume(setupRes.volume);
+              } catch {}
+            } else if (window.electronAPI?.getSpeakerVolume) {
+              try {
+                const vol = await window.electronAPI.getSpeakerVolume();
+                if (typeof vol?.volume === 'number') setSpeakerVolume(vol.volume);
+              } catch {}
+            }
           }
         } catch {}
       }
@@ -944,17 +966,57 @@ export default function App() {
         micAudioTrack.enabled = initialMicOn;
       }
 
-      // 3. 把系统音与麦克风合并成单路音轨；麦克风静音统一走 track.enabled，兼容「仅麦克风 / 仅系统音 / 两路混音」三种情况
+      // 3. 把系统音与麦克风合并成单路音轨，并启用「系统音优先自动门控 (Auto-Ducking)」：
+      //    当 BlackHole 系统音正在播放（如面试官说话）时，自动将物理麦克风增益平滑压至 0，
+      //    彻底阻断扬声器外放被麦克风二次拾取回传造成双重重音；系统音停下后立即恢复麦克风人声。
       let audioCtx = null;
       let mixedAudioTrack = null;
+      let micGainNode = null;
+      let duckTimer = null;
       if (sysAudioTrack && micAudioTrack) {
         try {
           // 强制 interactive 极低延迟缓冲 + 48000Hz 对齐 WebRTC Opus 原生采样率，消除重采样延迟
           audioCtx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
           await audioCtx.resume();
           const dest = audioCtx.createMediaStreamDestination();
-          audioCtx.createMediaStreamSource(new MediaStream([sysAudioTrack])).connect(dest);
-          audioCtx.createMediaStreamSource(new MediaStream([micAudioTrack])).connect(dest);
+          const sysSource = audioCtx.createMediaStreamSource(new MediaStream([sysAudioTrack]));
+          const micSource = audioCtx.createMediaStreamSource(new MediaStream([micAudioTrack]));
+
+          const sysAnalyser = audioCtx.createAnalyser();
+          sysAnalyser.fftSize = 512;
+          sysSource.connect(sysAnalyser);
+          sysSource.connect(dest);
+
+          micGainNode = audioCtx.createGain();
+          micGainNode.gain.value = initialMicOn ? 1.0 : 0.0;
+          micSource.connect(micGainNode);
+          micGainNode.connect(dest);
+
+          const pcm = new Uint8Array(sysAnalyser.fftSize);
+          let holdFrames = 0;
+          duckTimer = setInterval(() => {
+            if (!micGainNode || !audioCtx || audioCtx.state === 'closed') return;
+            if (!micAudioTrack.enabled) {
+              micGainNode.gain.setTargetAtTime(0.0, audioCtx.currentTime, 0.015);
+              return;
+            }
+            sysAnalyser.getByteTimeDomainData(pcm);
+            let sumSq = 0;
+            for (let i = 0; i < pcm.length; i++) {
+              const v = (pcm[i] - 128) / 128;
+              sumSq += v * v;
+            }
+            const rms = Math.sqrt(sumSq / pcm.length);
+            // 当系统音 RMS > 0.008（约 -42dBFS，代表面试官或系统正在出声），保持 160ms 抑麦窗口
+            if (rms > 0.008) {
+              holdFrames = 4;
+            } else if (holdFrames > 0) {
+              holdFrames -= 1;
+            }
+            const targetGain = holdFrames > 0 ? 0.0 : 1.0;
+            micGainNode.gain.setTargetAtTime(targetGain, audioCtx.currentTime, targetGain === 0.0 ? 0.01 : 0.05);
+          }, 40);
+
           mixedAudioTrack = dest.stream.getAudioTracks()[0] || null;
         } catch {
           // 混音失败时退化为只传系统音
@@ -978,6 +1040,8 @@ export default function App() {
         sysAudioStream,
         outboundStream,
         audioCtx,
+        micGainNode,
+        duckTimer,
         micTrack: micAudioTrack,
         sysAudioTrack,
         videoTrack,
@@ -1017,13 +1081,15 @@ export default function App() {
     if (!session?.micTrack) return;
     const next = !shareMicOn;
     session.micTrack.enabled = next;
+    if (session.micGainNode && session.audioCtx && session.audioCtx.state !== 'closed') {
+      session.micGainNode.gain.setTargetAtTime(next ? 1.0 : 0.0, session.audioCtx.currentTime, 0.015);
+    }
     setShareMicOn(next);
-    // 开麦时压低扬声器音量（ducking），避免外放被麦克风拾取、与 BlackHole 系统音叠加产生重音；
-    // 关麦时恢复用户设定的音量。只影响学生本机扬声器，BlackHole 传给导师的系统音不受影响
+    // 开麦时若用户设定的本机音量偏大（>20%），自动压低到 15% 降低声学回拾；若用户已手动调得更低（<=15%）则尊重用户设定
     if (shareSystemAudio && audioSetup.blackholeInstalled && window.electronAPI?.setSpeakerVolume) {
       if (next) {
         speakerDuckedRef.current = true;
-        window.electronAPI.setSpeakerVolume(20);
+        window.electronAPI.setSpeakerVolume(Math.min(speakerVolume, 15));
       } else {
         speakerDuckedRef.current = false;
         window.electronAPI.setSpeakerVolume(speakerVolume);
@@ -1059,6 +1125,7 @@ export default function App() {
     try {
       const res = await window.electronAPI.runAudioSetup();
       if (res?.ok) {
+        if (typeof res.volume === 'number') setSpeakerVolume(res.volume);
         setAudioSetupMsg('系统音已配置，电脑播放的声音将无损传给导师');
       } else {
         setAudioSetupMsg(res?.error || '配置失败，请重试');
@@ -1987,25 +2054,24 @@ export default function App() {
                 </button>
               )}
 
-              {/* 物理扬声器音量（仅 macOS BlackHole 系统音模式）：聚合设备接管后系统音量键失效，这里绕过聚合设备直接调扬声器 */}
-              {isSharingScreen && shareSystemAudio && audioSetup.blackholeInstalled && (
+              {/* 物理扬声器音量（macOS 安装 BlackHole 后常驻显示）：聚合设备接管后系统音量键失效，这里绕过聚合设备直接实时调物理扬声器 */}
+              {audioSetup.blackholeInstalled && (
                 <label
                   style={{ display: 'flex', alignItems: 'center', gap: '5px', color: '#94a3b8', fontSize: '11px', whiteSpace: 'nowrap' }}
-                  title={speakerDuckedRef.current
-                    ? `开麦中已自动压低扬声器避免回声，关麦后恢复至 ${speakerVolume}%`
-                    : '调节本机扬声器音量（不影响传给导师的系统音）'}
+                  title="直接调节本机扬声器外放音量（0–100%，完全不影响传给导师的系统音）"
                 >
-                  <span>{speakerDuckedRef.current ? '🔇 本机音量(开麦压低中)' : '🔊 本机音量'}</span>
+                  <span>🔊 本机音量</span>
                   <input
                     type="range" min="0" max="100" step="1" value={speakerVolume}
                     onChange={(e) => {
                       const v = Number(e.target.value);
                       setSpeakerVolume(v);
-                      if (!speakerDuckedRef.current) window.electronAPI?.setSpeakerVolume?.(v);
+                      speakerDuckedRef.current = false;
+                      window.electronAPI?.setSpeakerVolume?.(v);
                     }}
-                    style={{ width: '52px', cursor: 'pointer', accentColor: '#38bdf8' }}
+                    style={{ width: '56px', cursor: 'pointer', accentColor: '#38bdf8' }}
                   />
-                  <span style={{ minWidth: '26px', textAlign: 'right' }}>{speakerVolume}%</span>
+                  <span style={{ minWidth: '28px', textAlign: 'right' }}>{speakerVolume}%</span>
                 </label>
               )}
 

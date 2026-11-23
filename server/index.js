@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.18';
+let pkgVersion = '1.0.19';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.18';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.19';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 修复开麦重音：开麦时自动压低本机扬声器音量（不影响传给导师的系统音），关麦自动恢复\n2. 新增本机扬声器音量调节：系统音模式下可滑动调音量，解决聚合设备下系统音量键失效的问题\n3. 导师听到的系统音不受本机音量影响，声音更干净',
+  notes: process.env.RELEASE_NOTES || '1. 彻底消除双重重音：新增系统音智能侧链门控(Sidechain Ducking)，对方说话时自动切断麦克风回拾，零回声零重音\n2. 修复本机声音过大：一键配置/共享启动时自动将本机外放限制在舒适音量(35%)，顶栏常驻「🔊 本机音量」滑块随时可调\n3. 调低甚至静音(0%)本机外放完全不影响传给导师的 100% 无损系统音',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
