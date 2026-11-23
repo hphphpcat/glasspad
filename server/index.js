@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.20';
+let pkgVersion = '1.0.21';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.20';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.21';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增自适应双讲检测(Double-Talk Detection)：边放音乐/对方说话时开口说话依然能被完整清晰记录，不说话时自动抑制外放重音\n2. 接入腾讯会议同款 macOS ScreenCaptureKit 原生系统音内录与物理扬声器自动还原\n3. 顶栏常驻「🔊 本机音量」滑块，调低本机外放不影响传给导师的无损系统音',
+  notes: process.env.RELEASE_NOTES || '1. 全屏共享(Share Entire Screen) 100% 零闪现加固：⌘+B 升级为零重建隐身态，消除唤醒首帧竞态闪现\n2. 彻底封死系统级毛玻璃模糊框、原生 Tooltip 悬浮窗与子窗口在全屏共享中的暴露隐患\n3. 内置自适应双讲检测(DTD)：边放音乐/对方说话时开口说话依然能被完整清晰记录，不说话时自动抑回声',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };

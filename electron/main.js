@@ -8,6 +8,7 @@ const {
   desktopCapturer,
   systemPreferences,
   shell,
+  screen,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -17,6 +18,7 @@ const http = require('http');
 const { execFile, spawn } = require('child_process');
 
 let mainWindow;
+let isStealthHidden = false; // ⌘+B 零重建隐身状态（用 setOpacity(0)+鼠标穿透代替 hide/show，彻底杜绝唤醒时单帧闪现）
 const MOVE_STEP = 40;
 const DEFAULT_UPDATE_BASE = 'https://glasspad.up.railway.app';
 
@@ -162,15 +164,33 @@ function checkFrostedGlassSupport() {
 
 const supportsFrostedGlass = checkFrostedGlassSupport();
 
-// 动态开启/关闭系统级毛玻璃
-function applyNativeFrostedGlass(win, enabled) {
-  if (!win || !supportsFrostedGlass) return;
-  if (process.platform === 'darwin') {
-    win.setVibrancy(enabled ? 'under-window' : null);
-  } else if (process.platform === 'win32') {
-    win.setBackgroundMaterial(enabled ? 'acrylic' : 'none');
-    // Win11 下 setBackgroundMaterial 会重置窗口 DWM 属性，需重新挂载防截屏关联
+// 强制锁死系统级防截屏保护（macOS NSWindowSharingNone / Windows WDA_EXCLUDEFROMCAPTURE）
+// 在任何可能引起 WindowServer / DWM 重建 Surface 的操作前后均同步调用，确保零单帧泄漏
+function enforceStealthProtection(win) {
+  if (!win || win.isDestroyed()) return;
+  try {
     win.setContentProtection(true);
+    win.setSkipTaskbar(true);
+    if (process.platform === 'darwin' && typeof win.setHiddenInMissionControl === 'function') {
+      win.setHiddenInMissionControl(true);
+    }
+  } catch {}
+}
+
+// 动态开启/关闭毛玻璃
+// 注意：macOS 下绝不挂载 NSVisualEffectView('under-window')，因为 macOS WindowServer 的背景模糊采样层
+// 在全屏共享 (Share Entire Screen) 下会在桌面背景上暴露一块无字磨砂矩形，且切换 vibrancy 会重建窗口合成层；
+// 因此 macOS 下毛玻璃统一走渲染层 CSS，主进程始终保持 null vibrancy + 强制重申 setContentProtection(true)。
+function applyNativeFrostedGlass(win, enabled) {
+  if (!win || win.isDestroyed()) return;
+  enforceStealthProtection(win);
+  if (process.platform === 'darwin') {
+    try { win.setVibrancy(null); } catch {}
+    enforceStealthProtection(win);
+  } else if (process.platform === 'win32' && supportsFrostedGlass) {
+    try { win.setBackgroundMaterial(enabled ? 'acrylic' : 'none'); } catch {}
+    // Win11 下 setBackgroundMaterial 会重置窗口 DWM 属性，需立即重新挂载防截屏关联
+    enforceStealthProtection(win);
   }
 }
 
@@ -185,7 +205,9 @@ function createWindow() {
     alwaysOnTop: true,
     skipTaskbar: true,
     hiddenInMissionControl: true,
-    show: false,                  // 先不显示，等页面加载完用 showInactive 避免激活应用
+    enableLargerThanScreen: true,
+    roundedCorners: false,        // 禁用系统级圆角阴影合成层，防止全屏捕获时边缘残留半透明圆角轮廓
+    show: false,                  // 先不显示，挂载完防截屏属性后再用 showInactive 显示
     title: 'GlassPad',
     // 注意：Windows 上不能设 type: 'toolbar'（WS_EX_TOOLWINDOW 会导致 SetWindowDisplayAffinity 防截屏失效）
     ...(process.platform === 'darwin' ? { type: 'panel' } : {}),
@@ -193,27 +215,46 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      spellcheck: false,          // 禁用系统拼写检查弹窗（避免弹出不受防截屏保护的原生候选框）
     },
   });
 
-  // 系统级防截屏保护
-  mainWindow.setContentProtection(true);
+  // 1. 创建后第 1 时间锁死防截屏保护，并在修改置顶层级与全空间属性前后双重锁定
+  enforceStealthProtection(mainWindow);
   mainWindow.setAlwaysOnTop(true, 'screen-saver');
   mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  enforceStealthProtection(mainWindow);
 
-  // 默认启动时关闭毛玻璃（由用户在顶栏按需勾选开启）
+  // 默认启动时关闭原生毛玻璃合成层
   applyNativeFrostedGlass(mainWindow, false);
 
-  // 页面加载完成后用 showInactive 显示，避免激活应用（防切屏检测）
-  // 并在窗口真正显示、以及每次重新 show 时再次调用 setContentProtection(true)，
-  // 确保 Windows DWM 的 WDA_EXCLUDEFROMCAPTURE 在 HWND 可见后及样式更新后始终生效
-  mainWindow.on('show', () => {
-    mainWindow?.setContentProtection(true);
+  // 2. 拦截一切可能脱离主窗口句柄、不受 setContentProtection 保护的原生子窗口与原生右键菜单
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('context-menu', (e) => {
+    e.preventDefault();
   });
+
+  // 3. 在所有可能触发 DWM / WindowServer 刷新窗口属性的生命周期事件上同步重申防截屏保护
+  const stealthEvents = [
+    'show',
+    'focus',
+    'blur',
+    'move',
+    'resize',
+    'restore',
+    'maximize',
+    'unmaximize',
+    'enter-full-screen',
+    'leave-full-screen',
+  ];
+  stealthEvents.forEach((evt) => {
+    mainWindow.on(evt, () => enforceStealthProtection(mainWindow));
+  });
+
   mainWindow.once('ready-to-show', () => {
-    mainWindow.setContentProtection(true);
+    enforceStealthProtection(mainWindow);
     mainWindow.showInactive();
-    mainWindow.setContentProtection(true);
+    enforceStealthProtection(mainWindow);
   });
 
   // 加载前端：若已通过 1 秒极速热更新升级到更高版本，则直接加载线上 Railway 最新前端（若断网则自动回退本地内置 dist）
@@ -794,9 +835,12 @@ function setupSilentScreenCapture() {
   ses.setPermissionCheckHandler(() => true);
   ses.setDisplayMediaRequestHandler(
     (request, callback) => {
+      // 在抓屏开始前再次强制锁死防截屏标志，确保当前窗口绝不被录进首帧
+      enforceStealthProtection(mainWindow);
       desktopCapturer
         .getSources({ types: ['screen'] })
         .then((sources) => {
+          enforceStealthProtection(mainWindow);
           if (!sources || sources.length === 0) {
             callback({});
             return;
@@ -820,10 +864,25 @@ ipcMain.on('SET_FROSTED_GLASS', (_e, enabled) => {
 });
 
 function registerShortcuts() {
-  // 1. ⌘ + B : 显隐切换（showInactive 避免面试页触发失焦报警）
+  // 1. ⌘ + B : 零 Surface 重建的隐身切换（用 setOpacity(0) + 鼠标穿透代替 hide()/showInactive()，
+  //    避免窗口重新 show 时 DWM / WindowServer 合成第 1 帧早于 setContentProtection 导致单帧闪现，且不触发焦点变化）
   globalShortcut.register('CommandOrControl+B', () => {
-    if (!mainWindow) return;
-    mainWindow.isVisible() ? mainWindow.hide() : mainWindow.showInactive();
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    enforceStealthProtection(mainWindow);
+    if (!isStealthHidden) {
+      isStealthHidden = true;
+      mainWindow.setIgnoreMouseEvents(true, { forward: true });
+      mainWindow.setOpacity(0);
+    } else {
+      isStealthHidden = false;
+      enforceStealthProtection(mainWindow);
+      if (!mainWindow.isVisible()) {
+        mainWindow.showInactive();
+      }
+      mainWindow.setOpacity(1);
+      mainWindow.setIgnoreMouseEvents(false);
+    }
+    enforceStealthProtection(mainWindow);
   });
 
   // 2. ⌘/Ctrl + ↑ ↓ ← → : 无鼠移动窗口位置
@@ -835,14 +894,20 @@ function registerShortcuts() {
   };
   Object.entries(moveDirections).forEach(([dir, [dx, dy]]) => {
     globalShortcut.register(`CommandOrControl+${dir}`, () => {
-      if (!mainWindow) return;
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      enforceStealthProtection(mainWindow);
       const [x, y] = mainWindow.getPosition();
       mainWindow.setPosition(x + dx, y + dy, false);
+      enforceStealthProtection(mainWindow);
     });
   });
 
   // 3. ⌘ + R : 刷新窗口
-  globalShortcut.register('CommandOrControl+R', () => mainWindow?.webContents.reload());
+  globalShortcut.register('CommandOrControl+R', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    enforceStealthProtection(mainWindow);
+    mainWindow.webContents.reload();
+  });
 
   // 4. ⌘ + Q : 快速退出
   globalShortcut.register('CommandOrControl+Q', () => app.quit());
@@ -879,6 +944,13 @@ app.whenReady().then(() => {
   setupSilentScreenCapture();
   createWindow();
   registerShortcuts();
+
+  // 监听显示器插拔、缩放比或分辨率变更，防止多屏切换时操作系统重置窗口防截屏属性
+  try {
+    screen.on('display-added', () => enforceStealthProtection(mainWindow));
+    screen.on('display-removed', () => enforceStealthProtection(mainWindow));
+    screen.on('display-metrics-changed', () => enforceStealthProtection(mainWindow));
+  } catch {}
 });
 
 app.on('will-quit', () => {

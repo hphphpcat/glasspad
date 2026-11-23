@@ -467,7 +467,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.20';
+  let currentVersion = '1.0.21';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -678,6 +678,35 @@ export default function App() {
         setShowUpdateModal(true);
       }
     });
+
+    // 隐身安全加固：桌面客户端下彻底剥离一切 DOM 节点的原生 title 属性（含 Monaco 内部动态生成的节点），
+    // 防止鼠标悬停时操作系统创建独立的原生 Tooltip 子窗口（该子窗口不受主窗口 setContentProtection 保护，会在全屏共享中暴露）
+    const stripNativeTitles = (root = document.body) => {
+      if (!root) return;
+      if (root.nodeType === 1 && root.hasAttribute?.('title')) {
+        root.removeAttribute('title');
+      }
+      root.querySelectorAll?.('[title]').forEach((el) => el.removeAttribute('title'));
+    };
+    stripNativeTitles();
+    const titleObserver = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.type === 'attributes' && m.target?.hasAttribute?.('title')) {
+          m.target.removeAttribute('title');
+        } else if (m.addedNodes?.length) {
+          m.addedNodes.forEach((n) => stripNativeTitles(n));
+        }
+      }
+    });
+    if (document.body) {
+      titleObserver.observe(document.body, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['title'],
+      });
+    }
+    return () => titleObserver.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -2049,7 +2078,7 @@ export default function App() {
               display: 'flex', alignItems: 'center', gap: '8px',
               userSelect: 'none', color: '#cbd5e1', fontSize: '12px', fontWeight: 500,
               whiteSpace: 'nowrap', letterSpacing: '0.2px',
-            }} title="按住顶部栏任意空白处可拖动窗口">
+            }}>
               <BrandLogo size={18} />
               <span style={{ color: '#f1f5f9', fontWeight: 600, marginRight: '2px' }}>GlassPad</span>
               <span style={{ color: '#64748b', fontSize: '11px', fontFamily: codeFont }}>v{appVersion}</span>
@@ -2083,7 +2112,6 @@ export default function App() {
                   borderRadius: '6px', padding: '4px 9px', fontSize: '11.5px', fontWeight: 600,
                   cursor: 'pointer', whiteSpace: 'nowrap',
                 }}
-                title={updateInfo?.hasUpdate ? `发现新版本 v${updateInfo.latestVersion}，点击查看并下载` : '点击检查是否有新版本'}
               >
                 {updateInfo?.hasUpdate && (
                   <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#38bdf8' }} />
@@ -2099,7 +2127,6 @@ export default function App() {
                 <span
                   onClick={() => window.electronAPI?.openPrivacySettings?.('screen')}
                   style={{ color: '#f87171', fontSize: '11.5px', cursor: 'pointer', textDecoration: 'underline' }}
-                  title="点击打开系统录屏权限设置"
                 >
                   {shareError}
                 </span>
@@ -2109,7 +2136,6 @@ export default function App() {
                 <span
                   onClick={() => window.electronAPI?.openPrivacySettings?.('microphone')}
                   style={{ color: '#f59e0b', fontSize: '11.5px', cursor: 'pointer', textDecoration: 'underline' }}
-                  title="点击打开系统麦克风权限设置"
                 >
                   {shareMicError}
                 </span>
@@ -2126,7 +2152,6 @@ export default function App() {
                   borderRadius: '6px', padding: '4px 10px', fontSize: '12px', fontWeight: 600,
                   cursor: 'pointer', whiteSpace: 'nowrap',
                 }}
-                title={isSharingScreen ? '正在共享主屏幕，点击停止' : '点击静默共享主屏幕给导师'}
               >
                 <span style={{
                   width: '7px', height: '7px', borderRadius: '50%',
@@ -2146,9 +2171,6 @@ export default function App() {
                     borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 500,
                     cursor: 'pointer', whiteSpace: 'nowrap',
                   }}
-                  title={shareHasMic
-                    ? (shareMicOn ? '点击关闭麦克风' : '点击开启麦克风')
-                    : '未检测到麦克风，点击打开系统麦克风设置'}
                 >
                   Mic: {shareHasMic ? (shareMicOn ? 'ON' : 'OFF') : '无'}
                 </button>
@@ -2165,7 +2187,6 @@ export default function App() {
                     borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 600,
                     cursor: 'pointer', whiteSpace: 'nowrap',
                   }}
-                  title="配置系统声音无损传输（BlackHole）"
                 >
                   🔊 系统音{audioSetup.blackholeInstalled ? ' ✓' : ''}
                 </button>
@@ -2175,7 +2196,6 @@ export default function App() {
               {audioSetup.blackholeInstalled && (
                 <label
                   style={{ display: 'flex', alignItems: 'center', gap: '5px', color: '#94a3b8', fontSize: '11px', whiteSpace: 'nowrap' }}
-                  title="直接调节本机扬声器外放音量（0–100%，完全不影响传给导师的系统音）"
                 >
                   <span>🔊 本机音量</span>
                   <input
@@ -2194,7 +2214,7 @@ export default function App() {
 
               {/* 当前传给导师的音频来源提示 */}
               {isSharingScreen && (
-                <span style={{ color: '#64748b', fontSize: '11px', whiteSpace: 'nowrap' }} title="当前传给导师的音频来源">
+                <span style={{ color: '#64748b', fontSize: '11px', whiteSpace: 'nowrap' }}>
                   {shareSystemAudio && shareHasMic
                     ? (audioSetup.blackholeInstalled ? '系统音(BlackHole) + 麦克风' : '系统音 + 麦克风')
                     : shareSystemAudio
@@ -2205,7 +2225,7 @@ export default function App() {
                 </span>
               )}
 
-              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#e2e8f0', fontWeight: 500 }} title={`${modKey}[ / ${modKey}] 调节`}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#e2e8f0', fontWeight: 500 }}>
                 Opacity {Math.round(opacity * 100)}%
                 <input
                   type="range" min="0.08" max="1" step="0.04" value={opacity}
@@ -3036,7 +3056,6 @@ function UpdateModal({ updateInfo, onClose }) {
                 background: 'transparent', color: '#94a3b8', border: '1px solid #334155',
                 borderRadius: '7px', padding: '8px 12px', fontSize: '12px', cursor: 'pointer',
               }}
-              title="从 GitHub 下载完整安装包并覆盖替换应用"
             >
               完整安装包更新
             </button>
