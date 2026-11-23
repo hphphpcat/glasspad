@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.13';
+let pkgVersion = '1.0.14';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.13';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.14';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 关闭客户端 Auto Scroll：导师继续往后打字时，客户端保持当前阅读位置不跳到底部\n2. 修复网页端行号左缘裁切与底部内容显示不全，开启常驻纵向滚动条与自适应布局\n3. 全面统一项目名称为 GlassPad',
+  notes: process.env.RELEASE_NOTES || '1. 修复 Mac 端听不到系统声音与麦克风的问题：关闭回声消除/降噪，靠麦克风拾取外放（开扬声器即可被导师听到）\n2. 客户端顶栏新增麦克风开关（ON/OFF/无 三态）与实时音频来源提示\n3. 无系统内录时自动显示「请打开外放」提醒横幅，确保导师能听到电脑声音',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -182,6 +182,7 @@ function loadRooms() {
         clients: new Map(),
         sharerId: null,
         sharerMicOn: false,
+        sharerSystemAudio: false,
         createdAt: r.createdAt || r.lastActive || Date.now(),
         lastActive: r.lastActive || Date.now(),
       });
@@ -210,6 +211,7 @@ function getOrCreateRoom(roomId, token, note = '') {
       clients: new Map(),
       sharerId: null,
       sharerMicOn: false,
+      sharerSystemAudio: false,
       createdAt: now,
       lastActive: now,
     });
@@ -468,6 +470,7 @@ wss.on('connection', (ws, req) => {
         active: Boolean(room.sharerId),
         sharerId: room.sharerId || null,
         micOn: Boolean(room.sharerMicOn),
+        systemAudio: Boolean(room.sharerSystemAudio),
       },
     });
     room.clients.forEach((_, c) => {
@@ -489,6 +492,7 @@ wss.on('connection', (ws, req) => {
         active: Boolean(room.sharerId),
         sharerId: room.sharerId || null,
         micOn: Boolean(room.sharerMicOn),
+        systemAudio: Boolean(room.sharerSystemAudio),
       },
     },
   }));
@@ -586,6 +590,7 @@ wss.on('connection', (ws, req) => {
     } else if (msg.type === 'SCREEN_SHARE_START') {
       room.sharerId = clientId;
       room.sharerMicOn = Boolean(msg.payload?.micOn);
+      room.sharerSystemAudio = Boolean(msg.payload?.systemAudio);
       room.lastActive = Date.now();
       broadcastShareState();
     } else if (msg.type === 'SCREEN_SHARE_MIC') {
@@ -602,6 +607,7 @@ wss.on('connection', (ws, req) => {
         }
         room.sharerId = null;
         room.sharerMicOn = false;
+        room.sharerSystemAudio = false;
         broadcastShareState();
       }
     } else if (msg.type === 'SCREEN_VIEWER_JOIN') {
@@ -646,6 +652,7 @@ wss.on('connection', (ws, req) => {
     if (room.sharerId === clientId) {
       room.sharerId = null;
       room.sharerMicOn = false;
+      room.sharerSystemAudio = false;
       broadcastShareState();
     } else if (room.sharerId) {
       const sharerWs = findWsByClientId(room.sharerId);

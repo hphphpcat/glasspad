@@ -381,7 +381,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.13';
+  let currentVersion = '1.0.14';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -514,9 +514,12 @@ export default function App() {
   // ── 屏幕共享状态（客户端推流 / 导师端观看）──
   const [isSharingScreen, setIsSharingScreen] = useState(false);
   const [shareMicOn, setShareMicOn] = useState(false);
-  const [shareHasMic, setShareHasMic] = useState(false);
+  const [shareHasMic, setShareHasMic] = useState(false); // 是否真正拿到了麦克风音轨
+  const [shareSystemAudio, setShareSystemAudio] = useState(false); // 是否真正拿到了系统声音轨
+  const [shareMicError, setShareMicError] = useState(''); // 麦克风不可用时的提示
+  const [speakerTipDismissed, setSpeakerTipDismissed] = useState(false); // 是否已关闭「请开外放」提醒横幅
   const [shareError, setShareError] = useState('');
-  const [remoteShareState, setRemoteShareState] = useState({ active: false, sharerId: null, micOn: false });
+  const [remoteShareState, setRemoteShareState] = useState({ active: false, sharerId: null, micOn: false, systemAudio: false });
   const [showViewerPane, setShowViewerPane] = useState(true);
   const [viewerConnected, setViewerConnected] = useState(false);
   const [viewerMuted, setViewerMuted] = useState(false);
@@ -546,7 +549,7 @@ export default function App() {
   const latestText = useRef(''); // 最近收到的远端文字（编辑器挂载前到达时用于补写）
 
   // 客户端共享屏幕用到的 WebRTC / Media 引用
-  const shareSessionRef = useRef(null); // { displayStream, micStream, audioCtx, micGain, videoTrack, audioTrack, peers: Map<viewerId, { pc, pendingIce: [] }> }
+  const shareSessionRef = useRef(null); // { displayStream, micStream, audioCtx, micTrack, sysAudioTrack, videoTrack, audioTrack, peers: Map<viewerId, { pc, pendingIce: [] }> }
   // 导师端观看屏幕用到的 WebRTC / Video 引用
   const viewerPcRef = useRef(null); // { pc, sharerId, pendingIce: [], stream: MediaStream }
   const remoteVideoRef = useRef(null);
@@ -755,20 +758,30 @@ export default function App() {
     setIsSharingScreen(false);
     setShareMicOn(false);
     setShareHasMic(false);
+    setShareSystemAudio(false);
+    setShareMicError('');
+    setSpeakerTipDismissed(false);
     if (notifyServer && wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({ type: 'SCREEN_SHARE_STOP' }));
     }
   };
 
-  // ── 屏幕共享：启动本地静默共享（主屏画面 + 系统声音 + 麦克风混音） ──
+  // ── 屏幕共享：启动本地静默共享（主屏画面 + 系统声音 + 麦克风） ──
   const startScreenShare = async () => {
     if (shareSessionRef.current) return;
     setShareError('');
+    setShareMicError('');
 
     try {
+      // 0. 读取平台能力：Electron 的 loopback 系统内录目前仅 Windows 支持，macOS 只有麦克风可选
+      let caps = { platform: 'web', systemAudioSupported: false, screen: 'granted', microphone: 'granted' };
+      if (window.electronAPI?.getScreenShareCaps) {
+        caps = await window.electronAPI.getScreenShareCaps();
+      }
+
       // 1. 直接调用 getDisplayMedia 触发系统底层 desktopCapturer.getSources：
       //    限制最大 1920x1080 @ 30fps，避免 Retina/4K 全分辨率软编排队积压造成音画延迟；
-      //    系统内录音频关闭回声消除/降噪/自动增益，保持原始低延迟低失真系统声
+      //    Windows 请求系统内录（关闭回声消除/降噪/自动增益），macOS 不请求音频（loopback 不支持）
       let displayStream;
       try {
         displayStream = await navigator.mediaDevices.getDisplayMedia({
@@ -777,40 +790,46 @@ export default function App() {
             height: { ideal: 1080, max: 1080 },
             frameRate: { ideal: 30, max: 30 },
           },
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-            channelCount: 2,
-            sampleRate: 48000,
-          },
+          audio: caps.systemAudioSupported
+            ? {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+                channelCount: 2,
+                sampleRate: 48000,
+              }
+            : false,
         });
       } catch (captureErr) {
-        if (window.electronAPI?.getMediaPermissionStatus) {
-          const perm = await window.electronAPI.getMediaPermissionStatus();
-          if (perm?.screen && perm.screen !== 'granted') {
-            setShareError('请在系统「录屏与系统录音」中勾选 GlassPad（或点左下角 + 号添加）后重试');
-            window.electronAPI.openPrivacySettings?.('screen');
-            return;
-          }
+        if (caps.screen && caps.screen !== 'granted') {
+          setShareError('请在系统「屏幕与系统音频」中勾选 GlassPad（或点左下角 + 号添加）后重试');
+          window.electronAPI.openPrivacySettings?.('screen');
+          return;
         }
         throw captureErr;
       }
 
-      // 2. 尝试采集麦克风并通过 GainNode 混音（默认静音，可在顶栏一键开关 Mic）
+      // 2. 采集麦克风：macOS 无系统音时是唯一音源；权限被拒或无设备时给出明确提示
       let micStream = null;
-      try {
-        micStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-            sampleRate: 48000,
-            latency: 0.01,
-          },
-        });
-      } catch {
-        // 无麦克风或未授权时继续仅共享屏幕+系统音频
+      let micError = '';
+      if (caps.microphone === 'denied' || caps.microphone === 'restricted') {
+        micError = '麦克风权限未开启，点此到系统设置允许 GlassPad 使用麦克风';
+      } else {
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              // Windows：系统音走 loopback，麦克风只负责清晰人声，开 AEC/降噪避免拾到扬声器外放造成重复与回声
+              // macOS：无系统 loopback，关掉 AEC/降噪，让麦克风忠实拾取「扬声器外放的系统音 + 人声」（开外放即可被导师听到）
+              echoCancellation: caps.systemAudioSupported,
+              noiseSuppression: caps.systemAudioSupported,
+              autoGainControl: true,
+              sampleRate: 48000,
+              latency: 0.01,
+            },
+          });
+        } catch {
+          micError = '未检测到可用麦克风（无设备或未授权），导师将听不到你的声音';
+        }
       }
 
       const videoTrack = displayStream.getVideoTracks()[0] || null;
@@ -822,33 +841,35 @@ export default function App() {
       }
       const sysAudioTrack = displayStream.getAudioTracks()[0] || null;
       const micAudioTrack = micStream?.getAudioTracks()[0] || null;
+      const hasSystemAudio = Boolean(sysAudioTrack);
 
+      // 初始麦克风状态：有系统音时默认关麦（隐私）；没有系统音（macOS）时默认开麦，保证导师至少能听到声音
+      const initialMicOn = !hasSystemAudio && Boolean(micAudioTrack);
+      if (micAudioTrack) {
+        micAudioTrack.enabled = initialMicOn;
+      }
+
+      // 3. 把系统音与麦克风合并成单路音轨；麦克风静音统一走 track.enabled，兼容「仅麦克风 / 仅系统音 / 两路混音」三种情况
       let audioCtx = null;
-      let micGain = null;
       let mixedAudioTrack = null;
-
-      if (sysAudioTrack || micAudioTrack) {
+      if (sysAudioTrack && micAudioTrack) {
         try {
           // 强制 interactive 极低延迟缓冲 + 48000Hz 对齐 WebRTC Opus 原生采样率，消除重采样延迟
           audioCtx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
           await audioCtx.resume();
           const dest = audioCtx.createMediaStreamDestination();
-          if (sysAudioTrack) {
-            audioCtx.createMediaStreamSource(new MediaStream([sysAudioTrack])).connect(dest);
-          }
-          if (micAudioTrack) {
-            micGain = audioCtx.createGain();
-            micGain.gain.value = 0; // 默认关闭麦克风，只传系统声音
-            audioCtx.createMediaStreamSource(new MediaStream([micAudioTrack])).connect(micGain);
-            micGain.connect(dest);
-          }
+          audioCtx.createMediaStreamSource(new MediaStream([sysAudioTrack])).connect(dest);
+          audioCtx.createMediaStreamSource(new MediaStream([micAudioTrack])).connect(dest);
           mixedAudioTrack = dest.stream.getAudioTracks()[0] || null;
-          if (mixedAudioTrack && 'contentHint' in mixedAudioTrack) {
-            try { mixedAudioTrack.contentHint = 'speech'; } catch {}
-          }
         } catch {
-          mixedAudioTrack = sysAudioTrack || null;
+          // 混音失败时退化为只传系统音
+          mixedAudioTrack = sysAudioTrack;
         }
+      } else {
+        mixedAudioTrack = sysAudioTrack || micAudioTrack || null;
+      }
+      if (mixedAudioTrack && 'contentHint' in mixedAudioTrack) {
+        try { mixedAudioTrack.contentHint = 'speech'; } catch {}
       }
 
       const outboundStream = new MediaStream();
@@ -861,7 +882,8 @@ export default function App() {
         micStream,
         outboundStream,
         audioCtx,
-        micGain,
+        micTrack: micAudioTrack,
+        sysAudioTrack,
         videoTrack,
         audioTrack: mixedAudioTrack,
         peers: new Map(),
@@ -875,13 +897,15 @@ export default function App() {
       }
 
       setIsSharingScreen(true);
-      setShareMicOn(false);
-      setShareHasMic(Boolean(micGain));
+      setShareMicOn(initialMicOn);
+      setShareHasMic(Boolean(micAudioTrack));
+      setShareSystemAudio(hasSystemAudio);
+      setShareMicError(micError);
 
       if (wsRef.current?.readyState === 1) {
         wsRef.current.send(JSON.stringify({
           type: 'SCREEN_SHARE_START',
-          payload: { micOn: false },
+          payload: { micOn: initialMicOn, systemAudio: hasSystemAudio },
         }));
       }
     } catch (err) {
@@ -894,9 +918,9 @@ export default function App() {
   // ── 屏幕共享：切换候选人麦克风开关 ──
   const toggleShareMic = () => {
     const session = shareSessionRef.current;
-    if (!session?.micGain) return;
+    if (!session?.micTrack) return;
     const next = !shareMicOn;
-    session.micGain.gain.value = next ? 1 : 0;
+    session.micTrack.enabled = next;
     setShareMicOn(next);
     if (wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({
@@ -1070,7 +1094,10 @@ export default function App() {
         if (shareSessionRef.current && !shareSessionRef.current.stopped) {
           ws.send(JSON.stringify({
             type: 'SCREEN_SHARE_START',
-            payload: { micOn: Boolean(shareSessionRef.current.micGain?.gain.value) },
+            payload: {
+              micOn: Boolean(shareSessionRef.current.micTrack?.enabled),
+              systemAudio: Boolean(shareSessionRef.current.sysAudioTrack),
+            },
           }));
         }
       };
@@ -1125,7 +1152,7 @@ export default function App() {
           setParticipants(list);
           syncRemoteCursorsWithPresence(list);
         } else if (type === 'SCREEN_SHARE_STATE') {
-          setRemoteShareState(payload || { active: false, sharerId: null, micOn: false });
+          setRemoteShareState(payload || { active: false, sharerId: null, micOn: false, systemAudio: false });
           if (!payload?.active) {
             closeViewerConnection();
           }
@@ -1754,7 +1781,17 @@ export default function App() {
                 </span>
               )}
 
-              {/* 客户端静默屏幕共享开关（免弹窗直接共享主屏幕 + 系统声音） */}
+              {isSharingScreen && shareMicError && (
+                <span
+                  onClick={() => window.electronAPI?.openPrivacySettings?.('microphone')}
+                  style={{ color: '#f59e0b', fontSize: '11.5px', cursor: 'pointer', textDecoration: 'underline' }}
+                  title="点击打开系统麦克风权限设置"
+                >
+                  {shareMicError}
+                </span>
+              )}
+
+              {/* 客户端静默屏幕共享开关（免弹窗直接共享主屏幕 + 声音） */}
               <button
                 onClick={() => (isSharingScreen ? stopScreenShare(true) : startScreenShare())}
                 style={{
@@ -1765,7 +1802,7 @@ export default function App() {
                   borderRadius: '6px', padding: '4px 10px', fontSize: '12px', fontWeight: 600,
                   cursor: 'pointer', whiteSpace: 'nowrap',
                 }}
-                title={isSharingScreen ? '正在共享主屏幕与系统声音，点击停止' : '点击静默共享主屏幕与系统声音给导师'}
+                title={isSharingScreen ? '正在共享主屏幕，点击停止' : '点击静默共享主屏幕给导师'}
               >
                 <span style={{
                   width: '7px', height: '7px', borderRadius: '50%',
@@ -1774,20 +1811,33 @@ export default function App() {
                 {isSharingScreen ? 'Sharing Screen' : 'Share Screen'}
               </button>
 
-              {isSharingScreen && shareHasMic && (
+              {/* 麦克风开关：始终显示，含 ON / OFF / 无（不可用）三种状态 */}
+              {isSharingScreen && (
                 <button
-                  onClick={toggleShareMic}
+                  onClick={shareHasMic ? toggleShareMic : () => window.electronAPI?.openPrivacySettings?.('microphone')}
                   style={{
                     background: shareMicOn ? 'rgba(16, 185, 129, 0.18)' : 'rgba(31, 41, 55, 0.75)',
-                    color: shareMicOn ? '#34d399' : '#94a3b8',
-                    border: `1px solid ${shareMicOn ? 'rgba(16, 185, 129, 0.45)' : '#374151'}`,
+                    color: shareHasMic ? (shareMicOn ? '#34d399' : '#94a3b8') : '#f87171',
+                    border: `1px solid ${shareHasMic ? (shareMicOn ? 'rgba(16, 185, 129, 0.45)' : '#374151') : 'rgba(239, 68, 68, 0.4)'}`,
                     borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 500,
                     cursor: 'pointer', whiteSpace: 'nowrap',
                   }}
-                  title="切换是否把自己的麦克风声音也传给导师"
+                  title={shareHasMic
+                    ? (shareMicOn ? '点击关闭麦克风' : '点击开启麦克风')
+                    : '未检测到麦克风，点击打开系统麦克风设置'}
                 >
-                  Mic: {shareMicOn ? 'ON' : 'OFF'}
+                  Mic: {shareHasMic ? (shareMicOn ? 'ON' : 'OFF') : '无'}
                 </button>
+              )}
+
+              {/* 当前传给导师的音频来源提示 */}
+              {isSharingScreen && (
+                <span style={{ color: '#64748b', fontSize: '11px', whiteSpace: 'nowrap' }} title="当前传给导师的音频来源">
+                  {shareSystemAudio && shareHasMic ? '系统音 + 麦克风'
+                    : shareSystemAudio ? '系统音'
+                    : shareHasMic ? '麦克风拾音（系统音请开外放）'
+                    : '无声音'}
+                </span>
               )}
 
               <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#e2e8f0', fontWeight: 500 }} title={`${modKey}[ / ${modKey}] 调节`}>
@@ -1908,6 +1958,33 @@ export default function App() {
         )}
       </div>
 
+      {/* 客户端提醒横幅：Mac 无系统内录，靠麦克风拾取外放，提醒候选人打开扬声器才能让导师听到电脑声音 */}
+      {isClientApp && isSharingScreen && !shareSystemAudio && !speakerTipDismissed && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: '10px',
+          padding: '8px 14px',
+          background: 'linear-gradient(90deg, rgba(245, 158, 11, 0.18), rgba(239, 68, 68, 0.12))',
+          borderBottom: '1px solid rgba(245, 158, 11, 0.4)',
+          color: '#fbbf24', fontSize: '12.5px', fontWeight: 600,
+          flexShrink: 0, WebkitAppRegion: 'no-drag', cursor: 'default',
+        }}>
+          <span style={{ fontSize: '15px', lineHeight: 1 }}>🔊</span>
+          <span style={{ flex: 1, minWidth: 0 }}>
+            已开启屏幕共享：请打开电脑<b style={{ color: '#fcd34d' }}>扬声器外放</b>，导师才能听到你电脑里播放的声音
+          </span>
+          <button
+            onClick={() => setSpeakerTipDismissed(true)}
+            style={{
+              background: 'rgba(31, 41, 55, 0.7)', color: '#fcd34d',
+              border: '1px solid rgba(245, 158, 11, 0.4)', borderRadius: '5px',
+              padding: '2px 9px', fontSize: '11.5px', cursor: 'pointer', fontWeight: 600,
+            }}
+          >
+            知道了
+          </button>
+        </div>
+      )}
+
       {/* 主体区域：导师端在观看屏幕时左右分栏（左侧客户实时屏幕 + 右侧提词编辑器），客户端保持单栏 */}
       <div style={{ flex: 1, display: 'flex', minWidth: 0, minHeight: 0, overflow: 'hidden', position: 'relative' }}>
         {!isClientApp && remoteShareState.active && showViewerPane && (
@@ -1932,7 +2009,7 @@ export default function App() {
                   {viewerConnected ? '客户桌面实时画面 (WebRTC)' : '正在连接客户桌面…'}
                 </span>
                 <span style={{ color: '#64748b', fontSize: '11.5px' }}>
-                  · 客户麦克风: {remoteShareState.micOn ? '已开启' : '静音(仅系统音)'}
+                  · 客户麦克风: {remoteShareState.micOn ? '已开启' : '已关闭'} · 系统音: {remoteShareState.systemAudio ? '有' : '无'}
                 </span>
               </div>
 

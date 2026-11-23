@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readClipboardText: () => ipcRenderer.invoke('READ_CLIPBOARD_TEXT'),
   // 屏幕共享权限检测与系统设置跳转
   getMediaPermissionStatus: () => ipcRenderer.invoke('GET_MEDIA_PERMISSION_STATUS'),
+  getScreenShareCaps: () => ipcRenderer.invoke('GET_SCREEN_SHARE_CAPS'),
   openPrivacySettings: (type) => ipcRenderer.invoke('OPEN_PRIVACY_SETTINGS', type),
   // 客户端版本获取、检查更新与软件内静默自更新（含 1 秒极速热更新）
   getAppVersion: () => ipcRenderer.invoke('GET_APP_VERSION'),

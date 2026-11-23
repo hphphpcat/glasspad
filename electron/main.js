@@ -262,6 +262,19 @@ ipcMain.handle('OPEN_PRIVACY_SETTINGS', (_e, type) => {
   shell.openExternal(`x-apple.systempreferences:com.apple.preference.security?${anchor}`);
 });
 
+// 屏幕共享能力与权限查询：前端据此决定音频采集策略（Windows 有系统 loopback，macOS 仅有麦克风）
+ipcMain.handle('GET_SCREEN_SHARE_CAPS', () => {
+  const platform = process.platform;
+  // Electron 的 getDisplayMedia loopback 系统内录目前仅 Windows 支持
+  const systemAudioSupported = platform === 'win32';
+  return {
+    platform,
+    systemAudioSupported,
+    screen: platform === 'darwin' ? systemPreferences.getMediaAccessStatus('screen') : 'granted',
+    microphone: platform === 'darwin' ? systemPreferences.getMediaAccessStatus('microphone') : 'granted',
+  };
+});
+
 // 获取当前客户端版本号与系统平台（优先返回热更新后的生效版本号）
 ipcMain.handle('GET_APP_VERSION', () => ({
   version: getEffectiveAppVersion(),
@@ -600,7 +613,8 @@ ipcMain.handle('DOWNLOAD_AND_INSTALL_UPDATE', async (_e, downloadUrl) => {
   }
 });
 
-// 配置免弹窗静默抓屏（自动选择主屏幕 + 系统内录声音 loopback，useSystemPicker: false）
+// 配置免弹窗静默抓屏（自动选择主屏幕；系统内录 loopback 仅 Windows 支持，
+// macOS 上 Electron 的 getDisplayMedia loopback 不采集系统声音，因此只在 Windows 上返回 audio: 'loopback'）
 function setupSilentScreenCapture() {
   const ses = session.defaultSession;
   ses.setPermissionRequestHandler((_webContents, _permission, callback) => {
@@ -617,7 +631,8 @@ function setupSilentScreenCapture() {
             return;
           }
           const result = { video: sources[0] };
-          if (request.audioRequested) {
+          // Electron 的 loopback 系统内录目前仅 Windows 支持（macOS 会得到静音音轨）
+          if (request.audioRequested && process.platform === 'win32') {
             result.audio = 'loopback';
           }
           callback(result);
