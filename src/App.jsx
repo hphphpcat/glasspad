@@ -467,7 +467,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.21';
+  let currentVersion = '1.0.22';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -2601,6 +2601,11 @@ export default function App() {
           }}
           options={{
             readOnly: isClientApp,
+            contextmenu: !isClientApp,
+            hover: { enabled: !isClientApp },
+            links: !isClientApp,
+            quickSuggestions: !isClientApp,
+            parameterHints: { enabled: !isClientApp },
             automaticLayout: true,
             fontFamily: codeFont,
             fontSize: DEFAULT_FONT_SIZE,

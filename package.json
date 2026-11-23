@@ -1,6 +1,6 @@
 {
   "name": "glasspad",
-  "version": "1.0.21",
+  "version": "1.0.22",
   "private": true,
   "description": "GlassPad：React + Electron + WebSocket 实时协同提词",
   "main": "electron/main.js",
@@ -59,7 +59,10 @@
       "target": [
         "dmg"
       ],
-      "identity": null
+      "identity": null,
+      "extendInfo": {
+        "LSUIElement": true
+      }
     },
     "win": {
       "target": [

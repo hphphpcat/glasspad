@@ -9,6 +9,7 @@ const {
   systemPreferences,
   shell,
   screen,
+  Menu,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -16,6 +17,12 @@ const os = require('os');
 const https = require('https');
 const http = require('http');
 const { execFile, spawn } = require('child_process');
+
+// 单实例锁：防止误双击图标启动第二个实例导致意外弹窗或状态冲突
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+}
 
 let mainWindow;
 let isStealthHidden = false; // ⌘+B 零重建隐身状态（用 setOpacity(0)+鼠标穿透代替 hide/show，彻底杜绝唤醒时单帧闪现）
@@ -178,20 +185,19 @@ function enforceStealthProtection(win) {
 }
 
 // 动态开启/关闭毛玻璃
-// 注意：macOS 下绝不挂载 NSVisualEffectView('under-window')，因为 macOS WindowServer 的背景模糊采样层
-// 在全屏共享 (Share Entire Screen) 下会在桌面背景上暴露一块无字磨砂矩形，且切换 vibrancy 会重建窗口合成层；
-// 因此 macOS 下毛玻璃统一走渲染层 CSS，主进程始终保持 null vibrancy + 强制重申 setContentProtection(true)。
-function applyNativeFrostedGlass(win, enabled) {
+// 注意：macOS 绝不挂载 NSVisualEffectView('under-window')，Win11 也不调用 setBackgroundMaterial('acrylic')：
+// 1) macOS WindowServer 的背景模糊采样层在全屏共享下可能暴露无字磨砂矩形；
+// 2) Win11 的 setBackgroundMaterial 会重置窗口 DWM 属性，在重建到重挂 WDA_EXCLUDEFROMCAPTURE 之间存在 1~5ms 单帧竞态空窗；
+// 因此双端毛玻璃统一走渲染层 CSS，主进程绝不触发原生背景合成层重建，并始终重申 setContentProtection(true)。
+function applyNativeFrostedGlass(win, _enabled) {
   if (!win || win.isDestroyed()) return;
   enforceStealthProtection(win);
   if (process.platform === 'darwin') {
     try { win.setVibrancy(null); } catch {}
-    enforceStealthProtection(win);
   } else if (process.platform === 'win32' && supportsFrostedGlass) {
-    try { win.setBackgroundMaterial(enabled ? 'acrylic' : 'none'); } catch {}
-    // Win11 下 setBackgroundMaterial 会重置窗口 DWM 属性，需立即重新挂载防截屏关联
-    enforceStealthProtection(win);
+    try { win.setBackgroundMaterial('none'); } catch {}
   }
+  enforceStealthProtection(win);
 }
 
 function createWindow() {
@@ -251,10 +257,22 @@ function createWindow() {
     mainWindow.on(evt, () => enforceStealthProtection(mainWindow));
   });
 
+  // 零首帧闪现启动：先设为 opacity(0) 再 showInactive，让 WindowServer/DWM 在全透明态完成 Surface 挂载与防截屏锁定，
+  // 40ms 后二次锁死 setContentProtection(true) 再恢复不透明度，从物理上消灭首次显示的第 1 帧竞态暴露
   mainWindow.once('ready-to-show', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.setOpacity(0);
     enforceStealthProtection(mainWindow);
     mainWindow.showInactive();
     enforceStealthProtection(mainWindow);
+    setTimeout(() => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      enforceStealthProtection(mainWindow);
+      if (!isStealthHidden) {
+        mainWindow.setOpacity(1);
+        enforceStealthProtection(mainWindow);
+      }
+    }, 40);
   });
 
   // 加载前端：若已通过 1 秒极速热更新升级到更高版本，则直接加载线上 Railway 最新前端（若断网则自动回退本地内置 dist）
@@ -934,9 +952,18 @@ function clearMacQuarantineOnLaunch() {
   } catch {}
 }
 
+app.on('second-instance', () => {
+  // 误触二次启动时不抢焦点、不弹窗，仅静默加固防截屏保护
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    enforceStealthProtection(mainWindow);
+  }
+});
+
 app.whenReady().then(() => {
+  if (!gotSingleInstanceLock) return;
+  Menu.setApplicationMenu(null); // 清空原生应用菜单，配合 Info.plist LSUIElement 杜绝顶部菜单栏暴露
   if (process.platform === 'darwin') {
-    app.dock.hide(); // 隐藏 Mac Dock 图标
+    app.dock?.hide(); // 双保险隐藏 Mac Dock 图标
     clearMacQuarantineOnLaunch();
     // 启动时自动清理可能遗留的聚合设备并恢复系统默认输出到物理扬声器，确保系统键盘音量键正常可用
     runBlackHoleHelper(['restore']).catch(() => {});
