@@ -467,7 +467,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.19';
+  let currentVersion = '1.0.20';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -1035,9 +1035,10 @@ export default function App() {
         micAudioTrack.enabled = initialMicOn;
       }
 
-      // 3. 把系统音与麦克风合并成单路音轨，并启用「系统音优先自动门控 (Auto-Ducking)」：
-      //    当 BlackHole 系统音正在播放（如面试官说话）时，自动将物理麦克风增益平滑压至 0，
-      //    彻底阻断扬声器外放被麦克风二次拾取回传造成双重重音；系统音停下后立即恢复麦克风人声。
+      // 3. 把系统音与麦克风合并成单路音轨，并启用「自适应双讲检测 (Double-Talk Detection, DTD) + 双向动态增益」：
+      //    - 纯系统音播放（候选人未说话）：将麦克风增益压至 0.06，阻断扬声器外放回拾造成双重重音；
+      //    - 边放系统音边说话（触发双讲）：当 micRms 显著高于外放漏音基线时，立即全开麦克风(1.0)并适度压低系统音(0.55)，确保放音乐或对方说话时候选人的每一句话都能清晰记录；
+      //    - 系统音静默：麦克风与系统音均保持 1.0。
       let audioCtx = null;
       let mixedAudioTrack = null;
       let micGainNode = null;
@@ -1053,38 +1054,84 @@ export default function App() {
 
           const sysAnalyser = audioCtx.createAnalyser();
           sysAnalyser.fftSize = 512;
+          const sysGainNode = audioCtx.createGain();
+          sysGainNode.gain.value = 1.0;
           sysSource.connect(sysAnalyser);
-          sysSource.connect(dest);
+          sysSource.connect(sysGainNode);
+          sysGainNode.connect(dest);
 
+          const micAnalyser = audioCtx.createAnalyser();
+          micAnalyser.fftSize = 512;
           micGainNode = audioCtx.createGain();
           micGainNode.gain.value = initialMicOn ? 1.0 : 0.0;
+          micSource.connect(micAnalyser);
           micSource.connect(micGainNode);
           micGainNode.connect(dest);
 
-          const pcm = new Uint8Array(sysAnalyser.fftSize);
-          let holdFrames = 0;
+          const sysPcm = new Uint8Array(sysAnalyser.fftSize);
+          const micPcm = new Uint8Array(micAnalyser.fftSize);
+          const calcRms = (arr) => {
+            let s = 0;
+            for (let i = 0; i < arr.length; i++) {
+              const v = (arr[i] - 128) / 128;
+              s += v * v;
+            }
+            return Math.sqrt(s / arr.length);
+          };
+
+          let sysHoldFrames = 0;
+          let speechHoldFrames = 0;
+          let leakRatio = 0.16; // 扬声器到麦克风的声学漏音比例估计值
+
           duckTimer = setInterval(() => {
             if (!micGainNode || !audioCtx || audioCtx.state === 'closed') return;
             if (!micAudioTrack.enabled) {
               micGainNode.gain.setTargetAtTime(0.0, audioCtx.currentTime, 0.015);
+              sysGainNode.gain.setTargetAtTime(1.0, audioCtx.currentTime, 0.04);
               return;
             }
-            sysAnalyser.getByteTimeDomainData(pcm);
-            let sumSq = 0;
-            for (let i = 0; i < pcm.length; i++) {
-              const v = (pcm[i] - 128) / 128;
-              sumSq += v * v;
+            sysAnalyser.getByteTimeDomainData(sysPcm);
+            micAnalyser.getByteTimeDomainData(micPcm);
+            const sysRms = calcRms(sysPcm);
+            const micRms = calcRms(micPcm);
+
+            if (sysRms > 0.008) {
+              sysHoldFrames = 4; // 120ms 系统音活跃窗口
+            } else if (sysHoldFrames > 0) {
+              sysHoldFrames -= 1;
             }
-            const rms = Math.sqrt(sumSq / pcm.length);
-            // 当系统音 RMS > 0.008（约 -42dBFS，代表面试官或系统正在出声），保持 160ms 抑麦窗口
-            if (rms > 0.008) {
-              holdFrames = 4;
-            } else if (holdFrames > 0) {
-              holdFrames -= 1;
+
+            // 双讲判定：候选人近讲人声能量明显超过扬声器外放漏音（绝对门限 0.016 + 相对漏音比 1.85 倍）
+            const echoCeiling = sysRms * Math.max(0.28, leakRatio * 1.85);
+            const isUserSpeaking = micRms > 0.016 && micRms > echoCeiling;
+
+            if (isUserSpeaking) {
+              speechHoldFrames = 9; // 保持约 270ms 人声拖尾，防止句尾被截断
+            } else if (speechHoldFrames > 0) {
+              speechHoldFrames -= 1;
+            } else if (sysRms > 0.015 && micRms > 0.001) {
+              // 未说话且系统音稳定时，慢速自适应更新扬声器外放漏音比（限制在 0.05 ~ 0.35 之间）
+              const instRatio = Math.min(0.35, Math.max(0.05, micRms / sysRms));
+              leakRatio = leakRatio * 0.9 + instRatio * 0.1;
             }
-            const targetGain = holdFrames > 0 ? 0.0 : 1.0;
-            micGainNode.gain.setTargetAtTime(targetGain, audioCtx.currentTime, targetGain === 0.0 ? 0.01 : 0.05);
-          }, 40);
+
+            let targetMicGain = 1.0;
+            let targetSysGain = 1.0;
+            if (sysHoldFrames > 0) {
+              if (speechHoldFrames > 0) {
+                // 边放声音边说话（Double-Talk）：全开麦克风，并适度压低系统背景音使人声清晰可辨
+                targetMicGain = 1.0;
+                targetSysGain = 0.55;
+              } else {
+                // 仅系统音播放、候选人未说话：抑制麦克风回拾，消除双重重音
+                targetMicGain = 0.06;
+                targetSysGain = 1.0;
+              }
+            }
+
+            micGainNode.gain.setTargetAtTime(targetMicGain, audioCtx.currentTime, targetMicGain >= 1.0 ? 0.008 : 0.025);
+            sysGainNode.gain.setTargetAtTime(targetSysGain, audioCtx.currentTime, 0.04);
+          }, 30);
 
           mixedAudioTrack = dest.stream.getAudioTracks()[0] || null;
         } catch {
@@ -1155,11 +1202,11 @@ export default function App() {
       session.micGainNode.gain.setTargetAtTime(next ? 1.0 : 0.0, session.audioCtx.currentTime, 0.015);
     }
     setShareMicOn(next);
-    // 开麦时若用户设定的本机音量偏大（>20%），自动压低到 15% 降低声学回拾；若用户已手动调得更低（<=15%）则尊重用户设定
+    // 开麦时若用户设定的本机音量偏大（>28%），自动限制在 28% 降低声学回拾；若用户已手动调得更低（<=28%）则尊重用户设定
     if (shareSystemAudio && audioSetup.blackholeInstalled && window.electronAPI?.setSpeakerVolume) {
       if (next) {
         speakerDuckedRef.current = true;
-        window.electronAPI.setSpeakerVolume(Math.min(speakerVolume, 15));
+        window.electronAPI.setSpeakerVolume(Math.min(speakerVolume, 28));
       } else {
         speakerDuckedRef.current = false;
         window.electronAPI.setSpeakerVolume(speakerVolume);
