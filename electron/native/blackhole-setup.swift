@@ -124,6 +124,86 @@ func setDefaultOutputDevice(_ deviceID: AudioDeviceID) -> Bool {
     return status == noErr
 }
 
+// 设备输出通道数（统计 stream configuration 里所有 buffer 的通道）
+func outputChannelCount(_ deviceID: AudioDeviceID) -> Int {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size) == noErr, size > 0 else { return 0 }
+    var buf = [UInt8](repeating: 0, count: Int(size))
+    guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &buf) == noErr else { return 0 }
+    return buf.withUnsafeBytes { raw -> Int in
+        let list = raw.load(as: AudioBufferList.self)
+        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: raw.baseAddress!.assumingMemoryBound(to: AudioBufferList.self)))
+        var total = 0
+        for i in 0..<Int(list.mNumberBuffers) {
+            total += Int(abl[i].mNumberChannels)
+        }
+        return total
+    }
+}
+
+// 直接设置物理扬声器设备的音量（0–100）。
+// 背景：聚合设备接管默认输出后，系统音量键失效（macOS 不支持调 Multi-Output 设备音量），
+// 只能绕过聚合设备、对物理扬声器子设备单独设 kAudioDevicePropertyVolumeScalar
+func setSpeakerVolume(_ percent: Float) -> [String: Any] {
+    guard let spk = findPhysicalSpeaker() else {
+        return ["ok": false, "error": "未找到扬声器设备"]
+    }
+    let scalar = max(0, min(1, percent / 100))
+    let chans = outputChannelCount(spk)
+    var anyOK = false
+    // 逐通道设置，覆盖左右声道（内置扬声器通常 2 通道）
+    for ch in 0..<max(1, chans) {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: UInt32(ch))
+        var value: Float32 = scalar
+        if AudioObjectSetPropertyData(spk, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &value) == noErr {
+            anyOK = true
+        }
+    }
+    if !anyOK {
+        // 回退：主通道
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        var value: Float32 = scalar
+        anyOK = AudioObjectSetPropertyData(spk, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &value) == noErr
+    }
+    return anyOK ? ["ok": true, "volume": Int(percent)] : ["ok": false, "error": "设置扬声器音量失败"]
+}
+
+// 读取物理扬声器当前音量（0–100），用于初始化前端音量滑块
+func getSpeakerVolume() -> [String: Any] {
+    guard let spk = findPhysicalSpeaker() else {
+        return ["ok": false, "error": "未找到扬声器设备"]
+    }
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyVolumeScalar,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain)
+    var value: Float32 = 0
+    var size = UInt32(MemoryLayout<Float32>.size)
+    if AudioObjectGetPropertyData(spk, &addr, 0, nil, &size, &value) != noErr {
+        // 回退读通道 0
+        var a2 = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: 0)
+        value = 0
+        size = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(spk, &a2, 0, nil, &size, &value) == noErr else {
+            return ["ok": false, "error": "读取扬声器音量失败"]
+        }
+    }
+    return ["ok": true, "volume": Int(value * 100)]
+}
+
 func runSetup() -> [String: Any] {
     // 1. 找 BlackHole（名字含 BlackHole）
     guard let blackhole = allAudioDevices().first(where: {
@@ -165,8 +245,7 @@ func runSetup() -> [String: Any] {
 
 // 业务结果统一 JSON 输出 + exit 0；仅在进程崩溃时才非 0，便于主进程用 stderr 兜底
 let args = CommandLine.arguments
-if args.count > 1 && args[1] == "setup" {
-    let result = runSetup()
+func emitResult(_ result: [String: Any]) -> Never {
     if let data = try? JSONSerialization.data(withJSONObject: result, options: []),
        let json = String(data: data, encoding: .utf8) {
         print(json)
@@ -176,5 +255,18 @@ if args.count > 1 && args[1] == "setup" {
     exit(0)
 }
 
-print("{\"ok\":false,\"error\":\"未知命令\"}")
-exit(0)
+if args.count > 1 {
+    switch args[1] {
+    case "setup":
+        emitResult(runSetup())
+    case "set-volume":
+        let pct = args.count > 2 ? (Float(args[2]) ?? 60) : 60
+        emitResult(setSpeakerVolume(pct))
+    case "get-volume":
+        emitResult(getSpeakerVolume())
+    default:
+        emitResult(["ok": false, "error": "未知命令"])
+    }
+}
+
+emitResult(["ok": false, "error": "未知命令"])

@@ -322,21 +322,39 @@ ipcMain.handle('GET_AUDIO_SETUP_STATUS', async () => {
   };
 });
 
-// 一键创建/复用「GlassPad 系统音」多输出设备并设为系统默认输出
-ipcMain.handle('RUN_AUDIO_SETUP', async () => {
-  if (process.platform !== 'darwin') return { ok: false, error: '仅 macOS 支持' };
+// 通用执行 blackhole-setup helper（setup / set-volume / get-volume），返回解析后的 JSON
+function runBlackHoleHelper(args, timeout = 20000) {
   const helperPath = resolveBlackHoleHelperPath();
-  if (!fs.existsSync(helperPath)) return { ok: false, error: '配置组件缺失，请更新到最新版本' };
+  if (!fs.existsSync(helperPath)) return Promise.resolve({ ok: false, error: '配置组件缺失，请更新到最新版本' });
   return new Promise((resolve) => {
-    execFile(helperPath, ['setup'], { timeout: 20000 }, (err, stdout, stderr) => {
-      if (err) return resolve({ ok: false, error: (stderr || err.message || '配置失败').toString().trim() });
+    execFile(helperPath, args, { timeout }, (err, stdout, stderr) => {
+      if (err) return resolve({ ok: false, error: (stderr || err.message || '操作失败').toString().trim() });
       try {
         resolve(JSON.parse(stdout));
       } catch {
-        resolve({ ok: false, error: (stdout || stderr || '配置失败').toString().trim() });
+        resolve({ ok: false, error: (stdout || stderr || '操作失败').toString().trim() });
       }
     });
   });
+}
+
+// 一键创建/复用「GlassPad 系统音」多输出设备并设为系统默认输出
+ipcMain.handle('RUN_AUDIO_SETUP', async () => {
+  if (process.platform !== 'darwin') return { ok: false, error: '仅 macOS 支持' };
+  return runBlackHoleHelper(['setup']);
+});
+
+// 调节物理扬声器音量（0–100）：聚合设备接管默认输出后系统音量键失效，这里绕过聚合设备直接设扬声器子设备音量
+ipcMain.handle('SET_SPEAKER_VOLUME', async (_e, volume) => {
+  if (process.platform !== 'darwin') return { ok: false, error: '仅 macOS 支持' };
+  const pct = Math.max(0, Math.min(100, Number(volume) || 0));
+  return runBlackHoleHelper(['set-volume', String(pct)]);
+});
+
+// 读取物理扬声器当前音量（0–100），用于初始化前端音量滑块
+ipcMain.handle('GET_SPEAKER_VOLUME', async () => {
+  if (process.platform !== 'darwin') return { ok: false, error: '仅 macOS 支持' };
+  return runBlackHoleHelper(['get-volume']);
 });
 
 // 打开 BlackHole 下载页

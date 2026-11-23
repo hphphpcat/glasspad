@@ -15,6 +15,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAudioSetupStatus: () => ipcRenderer.invoke('GET_AUDIO_SETUP_STATUS'),
   runAudioSetup: () => ipcRenderer.invoke('RUN_AUDIO_SETUP'),
   openBlackHoleDownload: () => ipcRenderer.invoke('OPEN_BLACKHOLE_DOWNLOAD'),
+  // 物理扬声器音量（0–100）：聚合设备接管后系统音量键失效，用 helper 直接设扬声器子设备音量
+  setSpeakerVolume: (volume) => ipcRenderer.invoke('SET_SPEAKER_VOLUME', volume),
+  getSpeakerVolume: () => ipcRenderer.invoke('GET_SPEAKER_VOLUME'),
   // 客户端版本获取、检查更新与软件内静默自更新（含 1 秒极速热更新）
   getAppVersion: () => ipcRenderer.invoke('GET_APP_VERSION'),
   checkForUpdates: (customBase) => ipcRenderer.invoke('CHECK_FOR_UPDATES', customBase),

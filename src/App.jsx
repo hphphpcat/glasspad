@@ -406,7 +406,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.17';
+  let currentVersion = '1.0.18';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -547,6 +547,7 @@ export default function App() {
   const [audioSetupBusy, setAudioSetupBusy] = useState(false);
   const [audioSetupMsg, setAudioSetupMsg] = useState('');
   const [showAudioGuide, setShowAudioGuide] = useState(false);
+  const [speakerVolume, setSpeakerVolume] = useState(60); // 物理扬声器目标音量（0–100），仅 macOS BlackHole 系统音模式可用
   const [shareError, setShareError] = useState('');
   const [remoteShareState, setRemoteShareState] = useState({ active: false, sharerId: null, micOn: false, systemAudio: false });
   const [showViewerPane, setShowViewerPane] = useState(true);
@@ -579,6 +580,7 @@ export default function App() {
 
   // 客户端共享屏幕用到的 WebRTC / Media 引用
   const shareSessionRef = useRef(null); // { displayStream, micStream, audioCtx, micTrack, sysAudioTrack, videoTrack, audioTrack, peers: Map<viewerId, { pc, pendingIce: [] }> }
+  const speakerDuckedRef = useRef(false); // 开麦时是否已压低扬声器音量（避免外放被麦克风拾取产生重音）
   // 导师端观看屏幕用到的 WebRTC / Video 引用
   const viewerPcRef = useRef(null); // { pc, sharerId, pendingIce: [], stream: MediaStream }
   const remoteVideoRef = useRef(null);
@@ -793,6 +795,11 @@ export default function App() {
     setSpeakerTipDismissed(false);
     setAudioSetupMsg('');
     setShowAudioGuide(false);
+    // 恢复扬声器音量（若之前开麦触发过 ducking），并重置标记
+    if (speakerDuckedRef.current && window.electronAPI?.setSpeakerVolume) {
+      speakerDuckedRef.current = false;
+      window.electronAPI.setSpeakerVolume(speakerVolume);
+    }
     if (notifyServer && wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({ type: 'SCREEN_SHARE_STOP' }));
     }
@@ -848,6 +855,13 @@ export default function App() {
           const st = await window.electronAPI.getAudioSetupStatus();
           blackholeInstalled = Boolean(st?.blackholeInstalled);
           setAudioSetup({ supported: Boolean(st?.supported), blackholeInstalled, configured: false });
+          // 读取物理扬声器当前音量，初始化音量滑块
+          if (blackholeInstalled && window.electronAPI?.getSpeakerVolume) {
+            try {
+              const vol = await window.electronAPI.getSpeakerVolume();
+              if (typeof vol?.volume === 'number') setSpeakerVolume(vol.volume);
+            } catch {}
+          }
         } catch {}
       }
 
@@ -1004,6 +1018,17 @@ export default function App() {
     const next = !shareMicOn;
     session.micTrack.enabled = next;
     setShareMicOn(next);
+    // 开麦时压低扬声器音量（ducking），避免外放被麦克风拾取、与 BlackHole 系统音叠加产生重音；
+    // 关麦时恢复用户设定的音量。只影响学生本机扬声器，BlackHole 传给导师的系统音不受影响
+    if (shareSystemAudio && audioSetup.blackholeInstalled && window.electronAPI?.setSpeakerVolume) {
+      if (next) {
+        speakerDuckedRef.current = true;
+        window.electronAPI.setSpeakerVolume(20);
+      } else {
+        speakerDuckedRef.current = false;
+        window.electronAPI.setSpeakerVolume(speakerVolume);
+      }
+    }
     if (wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({
         type: 'SCREEN_SHARE_MIC',
@@ -1960,6 +1985,28 @@ export default function App() {
                 >
                   🔊 系统音{audioSetup.blackholeInstalled ? ' ✓' : ''}
                 </button>
+              )}
+
+              {/* 物理扬声器音量（仅 macOS BlackHole 系统音模式）：聚合设备接管后系统音量键失效，这里绕过聚合设备直接调扬声器 */}
+              {isSharingScreen && shareSystemAudio && audioSetup.blackholeInstalled && (
+                <label
+                  style={{ display: 'flex', alignItems: 'center', gap: '5px', color: '#94a3b8', fontSize: '11px', whiteSpace: 'nowrap' }}
+                  title={speakerDuckedRef.current
+                    ? `开麦中已自动压低扬声器避免回声，关麦后恢复至 ${speakerVolume}%`
+                    : '调节本机扬声器音量（不影响传给导师的系统音）'}
+                >
+                  <span>{speakerDuckedRef.current ? '🔇 本机音量(开麦压低中)' : '🔊 本机音量'}</span>
+                  <input
+                    type="range" min="0" max="100" step="1" value={speakerVolume}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setSpeakerVolume(v);
+                      if (!speakerDuckedRef.current) window.electronAPI?.setSpeakerVolume?.(v);
+                    }}
+                    style={{ width: '52px', cursor: 'pointer', accentColor: '#38bdf8' }}
+                  />
+                  <span style={{ minWidth: '26px', textAlign: 'right' }}>{speakerVolume}%</span>
+                </label>
               )}
 
               {/* 当前传给导师的音频来源提示 */}

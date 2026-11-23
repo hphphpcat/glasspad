@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.17';
+let pkgVersion = '1.0.18';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.17';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.18';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 修复共享屏幕后 Mac 本机听不到声音：多输出设备不再丢掉扬声器，学生/导师双向都能听到\n2. 修复系统音采集：多输出设备改为真正的镜像模式（stacked=1）+ 漂移补偿，系统声音稳定回环进 BlackHole\n3. 一键配置会自动重建旧版多输出设备，点一次即可修复',
+  notes: process.env.RELEASE_NOTES || '1. 修复开麦重音：开麦时自动压低本机扬声器音量（不影响传给导师的系统音），关麦自动恢复\n2. 新增本机扬声器音量调节：系统音模式下可滑动调音量，解决聚合设备下系统音量键失效的问题\n3. 导师听到的系统音不受本机音量影响，声音更干净',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
