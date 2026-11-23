@@ -11,6 +11,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getMediaPermissionStatus: () => ipcRenderer.invoke('GET_MEDIA_PERMISSION_STATUS'),
   getScreenShareCaps: () => ipcRenderer.invoke('GET_SCREEN_SHARE_CAPS'),
   openPrivacySettings: (type) => ipcRenderer.invoke('OPEN_PRIVACY_SETTINGS', type),
+  // macOS BlackHole 系统音内录：状态检测 / 一键配置多输出设备 / 打开下载页
+  getAudioSetupStatus: () => ipcRenderer.invoke('GET_AUDIO_SETUP_STATUS'),
+  runAudioSetup: () => ipcRenderer.invoke('RUN_AUDIO_SETUP'),
+  openBlackHoleDownload: () => ipcRenderer.invoke('OPEN_BLACKHOLE_DOWNLOAD'),
   // 客户端版本获取、检查更新与软件内静默自更新（含 1 秒极速热更新）
   getAppVersion: () => ipcRenderer.invoke('GET_APP_VERSION'),
   checkForUpdates: (customBase) => ipcRenderer.invoke('CHECK_FOR_UPDATES', customBase),

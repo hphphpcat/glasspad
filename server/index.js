@@ -34,9 +34,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.14';
+let pkgVersion = '1.0.15';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.14';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.15';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 修复 Mac 端听不到系统声音与麦克风的问题：关闭回声消除/降噪，靠麦克风拾取外放（开扬声器即可被导师听到）\n2. 客户端顶栏新增麦克风开关（ON/OFF/无 三态）与实时音频来源提示\n3. 无系统内录时自动显示「请打开外放」提醒横幅，确保导师能听到电脑声音',
+  notes: process.env.RELEASE_NOTES || '1. Mac 系统音内录：接入 BlackHole 虚拟声卡，电脑声音无损直传导师（无需开外放、不受环境噪声影响）\n2. 客户端新增「系统音」一键配置：自动检测 BlackHole、创建多输出设备并设为默认输出\n3. 系统音与麦克风独立双轨混音，麦克风可一键开关；未装 BlackHole 时自动回退开外放拾音',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };

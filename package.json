@@ -1,6 +1,6 @@
 {
   "name": "glasspad",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "private": true,
   "description": "GlassPad：React + Electron + WebSocket 实时协同提词",
   "main": "electron/main.js",
@@ -46,6 +46,12 @@
       "electron/**/*",
       "package.json",
       "!node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "build/blackhole-setup",
+        "to": "blackhole-setup"
+      }
     ],
     "mac": {
       "category": "public.app-category.developer-tools",

@@ -275,6 +275,76 @@ ipcMain.handle('GET_SCREEN_SHARE_CAPS', () => {
   };
 });
 
+// ── macOS BlackHole 虚拟声卡：检测与一键配置多输出设备（系统音内录） ──
+
+const BLACKHOLE_HELPER_NAME = 'blackhole-setup';
+const BLACKHOLE_DOWNLOAD_URL = 'https://github.com/ExistentialAudio/BlackHole/releases/latest';
+
+// 解析 system_profiler SPAudioDataType 输出，判断是否已安装 BlackHole
+function detectBlackHole() {
+  return new Promise((resolve) => {
+    execFile('/usr/sbin/system_profiler', ['SPAudioDataType', '-json'], { timeout: 15000 }, (err, stdout) => {
+      if (err || !stdout) {
+        return resolve({ ok: false, blackholeInstalled: false, error: err?.message || '无法读取音频设备' });
+      }
+      try {
+        const data = JSON.parse(stdout);
+        const items = data?.SPAudioDataType?.[0]?._items || [];
+        const blackhole = items.find(
+          (d) => /BlackHole/i.test(d?._name || '') && d?.coreaudio_device_input
+        );
+        resolve({ ok: true, blackholeInstalled: Boolean(blackhole), deviceName: blackhole?._name || '' });
+      } catch (e) {
+        resolve({ ok: false, blackholeInstalled: false, error: e.message });
+      }
+    });
+  });
+}
+
+// 定位 helper 二进制：打包后在 app 的 Resources，开发模式在 build/
+function resolveBlackHoleHelperPath() {
+  if (app.isPackaged) return path.join(process.resourcesPath, BLACKHOLE_HELPER_NAME);
+  return path.join(__dirname, '..', 'build', BLACKHOLE_HELPER_NAME);
+}
+
+// 查询 macOS 系统音内录（BlackHole）的安装状态
+ipcMain.handle('GET_AUDIO_SETUP_STATUS', async () => {
+  if (process.platform !== 'darwin') {
+    return { platform: process.platform, supported: false, blackholeInstalled: false };
+  }
+  const det = await detectBlackHole();
+  return {
+    platform: process.platform,
+    supported: true,
+    blackholeInstalled: det.blackholeInstalled,
+    deviceName: det.deviceName || '',
+    error: det.error || '',
+  };
+});
+
+// 一键创建/复用「GlassPad 系统音」多输出设备并设为系统默认输出
+ipcMain.handle('RUN_AUDIO_SETUP', async () => {
+  if (process.platform !== 'darwin') return { ok: false, error: '仅 macOS 支持' };
+  const helperPath = resolveBlackHoleHelperPath();
+  if (!fs.existsSync(helperPath)) return { ok: false, error: '配置组件缺失，请更新到最新版本' };
+  return new Promise((resolve) => {
+    execFile(helperPath, ['setup'], { timeout: 20000 }, (err, stdout, stderr) => {
+      if (err) return resolve({ ok: false, error: (stderr || err.message || '配置失败').toString().trim() });
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        resolve({ ok: false, error: (stdout || stderr || '配置失败').toString().trim() });
+      }
+    });
+  });
+});
+
+// 打开 BlackHole 下载页
+ipcMain.handle('OPEN_BLACKHOLE_DOWNLOAD', () => {
+  if (process.platform !== 'darwin') return;
+  shell.openExternal(BLACKHOLE_DOWNLOAD_URL);
+});
+
 // 获取当前客户端版本号与系统平台（优先返回热更新后的生效版本号）
 ipcMain.handle('GET_APP_VERSION', () => ({
   version: getEffectiveAppVersion(),

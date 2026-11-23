@@ -11,6 +11,26 @@ const RTC_ICE_SERVERS = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
 ];
 
+// macOS：枚举音频输入设备，识别 BlackHole（系统音环回）与物理麦克风（排除 BlackHole）
+async function getMacAudioSources() {
+  let probe = null;
+  try {
+    // 先请求一次权限，确保 enumerateDevices 返回带 label 的设备名（否则 label 为空无法识别 BlackHole）
+    probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    return { blackholeId: null, micId: null, error: '麦克风权限未开启' };
+  }
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter((d) => d.kind === 'audioinput');
+    const blackhole = inputs.find((d) => /BlackHole/i.test(d.label || ''));
+    const mic = inputs.find((d) => d.deviceId !== blackhole?.deviceId && !/BlackHole/i.test(d.label || ''));
+    return { blackholeId: blackhole?.deviceId || null, micId: mic?.deviceId || null, error: '' };
+  } finally {
+    probe?.getTracks().forEach((t) => t.stop());
+  }
+}
+
 // 选中文字局部字号范围与默认值（支持 A- / A+ 按钮及 ⌘/Ctrl + +/-/0 快捷键仅对选中文字放大缩小）
 const DEFAULT_FONT_SIZE = 15;
 const MIN_FONT_SIZE = 11;
@@ -381,7 +401,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.14';
+  let currentVersion = '1.0.15';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -518,6 +538,10 @@ export default function App() {
   const [shareSystemAudio, setShareSystemAudio] = useState(false); // 是否真正拿到了系统声音轨
   const [shareMicError, setShareMicError] = useState(''); // 麦克风不可用时的提示
   const [speakerTipDismissed, setSpeakerTipDismissed] = useState(false); // 是否已关闭「请开外放」提醒横幅
+  const [audioSetup, setAudioSetup] = useState({ supported: false, blackholeInstalled: false, configured: false }); // macOS BlackHole 状态
+  const [audioSetupBusy, setAudioSetupBusy] = useState(false);
+  const [audioSetupMsg, setAudioSetupMsg] = useState('');
+  const [showAudioGuide, setShowAudioGuide] = useState(false);
   const [shareError, setShareError] = useState('');
   const [remoteShareState, setRemoteShareState] = useState({ active: false, sharerId: null, micOn: false, systemAudio: false });
   const [showViewerPane, setShowViewerPane] = useState(true);
@@ -752,6 +776,7 @@ export default function App() {
       session.peers.clear();
       session.displayStream?.getTracks().forEach((t) => t.stop());
       session.micStream?.getTracks().forEach((t) => t.stop());
+      session.sysAudioStream?.getTracks().forEach((t) => t.stop());
       session.audioCtx?.close().catch(() => {});
       shareSessionRef.current = null;
     }
@@ -761,6 +786,8 @@ export default function App() {
     setShareSystemAudio(false);
     setShareMicError('');
     setSpeakerTipDismissed(false);
+    setAudioSetupMsg('');
+    setShowAudioGuide(false);
     if (notifyServer && wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({ type: 'SCREEN_SHARE_STOP' }));
     }
@@ -809,17 +836,63 @@ export default function App() {
         throw captureErr;
       }
 
-      // 2. 采集麦克风：macOS 无系统音时是唯一音源；权限被拒或无设备时给出明确提示
+      // 0.5 macOS BlackHole 检测（装了则系统音走 BlackHole 数字环回，不靠麦克风拾外放）
+      let blackholeInstalled = false;
+      if (caps.platform === 'darwin' && window.electronAPI?.getAudioSetupStatus) {
+        try {
+          const st = await window.electronAPI.getAudioSetupStatus();
+          blackholeInstalled = Boolean(st?.blackholeInstalled);
+          setAudioSetup({ supported: Boolean(st?.supported), blackholeInstalled, configured: false });
+        } catch {}
+      }
+
+      // 2. 采集音频：系统音（Windows loopback / macOS BlackHole）+ 物理麦克风
+      let sysAudioStream = null;
       let micStream = null;
       let micError = '';
-      if (caps.microphone === 'denied' || caps.microphone === 'restricted') {
+
+      if (caps.platform === 'darwin' && blackholeInstalled) {
+        // 装了 BlackHole：系统音走 BlackHole 输入，物理麦克风独立采人声
+        const srcs = await getMacAudioSources();
+        if (srcs.blackholeId) {
+          try {
+            sysAudioStream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                deviceId: { exact: srcs.blackholeId },
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+                channelCount: 2,
+                sampleRate: 48000,
+              },
+            });
+          } catch {}
+        }
+        if (srcs.micId) {
+          try {
+            micStream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                deviceId: { exact: srcs.micId },
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                sampleRate: 48000,
+                latency: 0.01,
+              },
+            });
+          } catch {}
+        }
+        if (!sysAudioStream && !micStream) {
+          micError = '未检测到可用音频设备（BlackHole 或麦克风）';
+        }
+      } else if (caps.microphone === 'denied' || caps.microphone === 'restricted') {
         micError = '麦克风权限未开启，点此到系统设置允许 GlassPad 使用麦克风';
       } else {
         try {
           micStream = await navigator.mediaDevices.getUserMedia({
             audio: {
               // Windows：系统音走 loopback，麦克风只负责清晰人声，开 AEC/降噪避免拾到扬声器外放造成重复与回声
-              // macOS：无系统 loopback，关掉 AEC/降噪，让麦克风忠实拾取「扬声器外放的系统音 + 人声」（开外放即可被导师听到）
+              // macOS 未装 BlackHole：关掉 AEC/降噪，让麦克风忠实拾取「扬声器外放的系统音 + 人声」（开外放即可被导师听到）
               echoCancellation: caps.systemAudioSupported,
               noiseSuppression: caps.systemAudioSupported,
               autoGainControl: true,
@@ -839,7 +912,10 @@ export default function App() {
           if ('contentHint' in videoTrack) videoTrack.contentHint = 'detail';
         } catch {}
       }
-      const sysAudioTrack = displayStream.getAudioTracks()[0] || null;
+      // 系统音：Windows 来自 displayStream 的 loopback；macOS 来自 BlackHole 独立流
+      const sysAudioTrack = (caps.platform === 'darwin'
+        ? sysAudioStream?.getAudioTracks()[0]
+        : displayStream.getAudioTracks()[0]) || null;
       const micAudioTrack = micStream?.getAudioTracks()[0] || null;
       const hasSystemAudio = Boolean(sysAudioTrack);
 
@@ -880,6 +956,7 @@ export default function App() {
         stopped: false,
         displayStream,
         micStream,
+        sysAudioStream,
         outboundStream,
         audioCtx,
         micTrack: micAudioTrack,
@@ -927,6 +1004,39 @@ export default function App() {
         type: 'SCREEN_SHARE_MIC',
         payload: { micOn: next },
       }));
+    }
+  };
+
+  // ── 屏幕共享：macOS BlackHole 系统音配置 ──
+  const handleRecheckAudioSetup = async () => {
+    setAudioSetupBusy(true);
+    setAudioSetupMsg('');
+    try {
+      const st = await window.electronAPI.getAudioSetupStatus();
+      const installed = Boolean(st?.blackholeInstalled);
+      setAudioSetup({ supported: Boolean(st?.supported), blackholeInstalled: installed, configured: false });
+      setAudioSetupMsg(installed ? '' : '仍未检测到 BlackHole，请确认安装完成后重试');
+    } catch {
+      setAudioSetupMsg('检测失败，请重试');
+    } finally {
+      setAudioSetupBusy(false);
+    }
+  };
+
+  const handleRunAudioSetup = async () => {
+    setAudioSetupBusy(true);
+    setAudioSetupMsg('');
+    try {
+      const res = await window.electronAPI.runAudioSetup();
+      if (res?.ok) {
+        setAudioSetupMsg('系统音已配置，电脑播放的声音将无损传给导师');
+      } else {
+        setAudioSetupMsg(res?.error || '配置失败，请重试');
+      }
+    } catch {
+      setAudioSetupMsg('配置失败，请重试');
+    } finally {
+      setAudioSetupBusy(false);
     }
   };
 
@@ -1830,13 +1940,33 @@ export default function App() {
                 </button>
               )}
 
+              {/* macOS 系统音增强入口（BlackHole） */}
+              {isSharingScreen && audioSetup.supported && (
+                <button
+                  onClick={() => setShowAudioGuide((v) => !v)}
+                  style={{
+                    background: audioSetup.blackholeInstalled ? 'rgba(56, 189, 248, 0.16)' : 'rgba(245, 158, 11, 0.14)',
+                    color: audioSetup.blackholeInstalled ? '#38bdf8' : '#fbbf24',
+                    border: `1px solid ${audioSetup.blackholeInstalled ? 'rgba(56, 189, 248, 0.4)' : 'rgba(245, 158, 11, 0.4)'}`,
+                    borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 600,
+                    cursor: 'pointer', whiteSpace: 'nowrap',
+                  }}
+                  title="配置系统声音无损传输（BlackHole）"
+                >
+                  🔊 系统音{audioSetup.blackholeInstalled ? ' ✓' : ''}
+                </button>
+              )}
+
               {/* 当前传给导师的音频来源提示 */}
               {isSharingScreen && (
                 <span style={{ color: '#64748b', fontSize: '11px', whiteSpace: 'nowrap' }} title="当前传给导师的音频来源">
-                  {shareSystemAudio && shareHasMic ? '系统音 + 麦克风'
-                    : shareSystemAudio ? '系统音'
-                    : shareHasMic ? '麦克风拾音（系统音请开外放）'
-                    : '无声音'}
+                  {shareSystemAudio && shareHasMic
+                    ? (audioSetup.blackholeInstalled ? '系统音(BlackHole) + 麦克风' : '系统音 + 麦克风')
+                    : shareSystemAudio
+                      ? (audioSetup.blackholeInstalled ? '系统音(BlackHole)' : '系统音')
+                      : shareHasMic
+                        ? (audioSetup.blackholeInstalled ? '仅麦克风（系统音未就绪）' : '麦克风拾音（系统音请开外放）')
+                        : '无声音'}
                 </span>
               )}
 
@@ -1958,8 +2088,8 @@ export default function App() {
         )}
       </div>
 
-      {/* 客户端提醒横幅：Mac 无系统内录，靠麦克风拾取外放，提醒候选人打开扬声器才能让导师听到电脑声音 */}
-      {isClientApp && isSharingScreen && !shareSystemAudio && !speakerTipDismissed && (
+      {/* 客户端提醒横幅：未装 BlackHole 时，靠麦克风拾取外放兜底，提醒候选人打开扬声器 */}
+      {isClientApp && isSharingScreen && !shareSystemAudio && !audioSetup.blackholeInstalled && !speakerTipDismissed && (
         <div style={{
           display: 'flex', alignItems: 'center', gap: '10px',
           padding: '8px 14px',
@@ -1981,6 +2111,60 @@ export default function App() {
             }}
           >
             知道了
+          </button>
+        </div>
+      )}
+
+      {/* macOS BlackHole 系统音引导横幅 */}
+      {isClientApp && isSharingScreen && showAudioGuide && audioSetup.supported && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap',
+          padding: '8px 14px',
+          background: 'rgba(14, 22, 33, 0.96)',
+          borderBottom: '1px solid rgba(56, 189, 248, 0.35)',
+          color: '#cbd5e1', fontSize: '12.5px',
+          flexShrink: 0, WebkitAppRegion: 'no-drag', cursor: 'default',
+        }}>
+          <span style={{ fontSize: '15px', lineHeight: 1 }}>🎧</span>
+          {!audioSetup.blackholeInstalled ? (
+            <>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                建议安装免费组件 <b style={{ color: '#38bdf8' }}>BlackHole</b>，可无损传输电脑声音（无需开外放、不受环境噪声影响）
+              </span>
+              <button onClick={() => window.electronAPI?.openBlackHoleDownload?.()} style={{
+                background: 'rgba(56, 189, 248, 0.18)', color: '#38bdf8',
+                border: '1px solid rgba(56, 189, 248, 0.4)', borderRadius: '5px',
+                padding: '3px 10px', fontSize: '12px', cursor: 'pointer', fontWeight: 600,
+              }}>
+                下载 BlackHole
+              </button>
+              <button onClick={handleRecheckAudioSetup} disabled={audioSetupBusy} style={{
+                background: 'rgba(31, 41, 55, 0.8)', color: '#cbd5e1',
+                border: '1px solid #334155', borderRadius: '5px',
+                padding: '3px 10px', fontSize: '12px', cursor: 'pointer', fontWeight: 600,
+              }}>
+                {audioSetupBusy ? '检测中…' : '我已安装，重新检测'}
+              </button>
+            </>
+          ) : (
+            <>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                {audioSetupMsg || '已检测到 BlackHole，一键配置系统声音输出后即可无损传输'}
+              </span>
+              <button onClick={handleRunAudioSetup} disabled={audioSetupBusy} style={{
+                background: 'rgba(16, 185, 129, 0.18)', color: '#34d399',
+                border: '1px solid rgba(16, 185, 129, 0.4)', borderRadius: '5px',
+                padding: '3px 10px', fontSize: '12px', cursor: 'pointer', fontWeight: 600,
+              }}>
+                {audioSetupBusy ? '配置中…' : '一键配置系统音'}
+              </button>
+            </>
+          )}
+          <button onClick={() => setShowAudioGuide(false)} style={{
+            background: 'transparent', color: '#94a3b8',
+            border: 'none', fontSize: '13px', cursor: 'pointer',
+          }}>
+            ✕
           </button>
         </div>
       )}
