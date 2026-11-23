@@ -16,6 +16,7 @@ let kAggSubDeviceListKey = "subdevices" as String
 let kAggMasterSubDeviceKey = "master" as String
 let kAggStackedKey = "stacked" as String
 let kSubDeviceUIDKey = "uid" as String
+let kSubDeviceDriftKey = "drift" as String
 
 // 读取某个 AudioObject 的字符串属性（CFString，get rule）
 func readString(_ objectID: AudioObjectID, _ selector: AudioObjectPropertySelector,
@@ -70,17 +71,40 @@ func hasOutputStreams(_ deviceID: AudioDeviceID) -> Bool {
     return AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size) == noErr && size > 0
 }
 
-// 创建 Aggregate Device
-func createAggregateDevice(subDeviceUIDs: [String], masterUID: String) -> AudioDeviceID? {
-    let subDevices: [[String: Any]] = subDeviceUIDs.map { [kSubDeviceUIDKey: $0] }
+// 挑选物理扬声器（关键：必须在销毁旧聚合设备之前调用，且明确排除 BlackHole / 聚合设备 / 虚拟设备，
+// 否则默认输出可能指向被销毁的旧聚合设备，导致把「聚合设备自己」当扬声器塞进去，扬声器被丢出链路、学生听不到声音）
+func findPhysicalSpeaker() -> AudioDeviceID? {
+    let devices = allAudioDevices()
+    // 1. Mac 内置扬声器的标准 UID，最可靠
+    if let builtin = devices.first(where: { readString($0, kAudioDevicePropertyDeviceUID) == "BuiltInSpeakerDevice" }) {
+        return builtin
+    }
+    // 2. 名字含「扬声器 / Speaker」，且排除虚拟设备、聚合设备、BlackHole 本身
+    return devices.first(where: { d in
+        guard hasOutputStreams(d) else { return false }
+        let name = readString(d, kAudioObjectPropertyName) ?? ""
+        let uid = readString(d, kAudioDevicePropertyDeviceUID) ?? ""
+        let isVirtual = name.localizedCaseInsensitiveContains("Virtual")
+            || name.localizedCaseInsensitiveContains("Aggregate")
+            || name.localizedCaseInsensitiveContains("BlackHole")
+            || name == AGG_NAME
+            || uid == AGG_UID
+            || uid.localizedCaseInsensitiveContains("aggregate")
+            || uid.localizedCaseInsensitiveContains("BlackHole")
+        let looksSpeaker = name.contains("扬声器") || name.localizedCaseInsensitiveContains("Speaker")
+        return looksSpeaker && !isVirtual
+    })
+}
+
+// 创建 Aggregate Device（镜像模式：所有子设备喂相同数据，扬声器 + BlackHole 同时出声）
+func createAggregateDevice(subDevices: [[String: Any]], masterUID: String) -> AudioDeviceID? {
     let desc: [String: Any] = [
         kAggNameKey: AGG_NAME,
         kAggUIDKey: AGG_UID,
         kAggSubDeviceListKey: subDevices,
         kAggMasterSubDeviceKey: masterUID,
-        // stacked = 0：镜像模式，所有子设备（扬声器 + BlackHole）的输出流喂相同数据，
-        // 系统立体声才会同时进入扬声器与 BlackHole 环回，而不是按通道顺序拼接
-        kAggStackedKey: 0,
+        // stacked = 1：多输出设备的实际镜像模式（参考系统 ToDesk 多输出设备 composition）
+        kAggStackedKey: 1,
     ]
     var deviceID = AudioDeviceID(0)
     let status = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &deviceID)
@@ -111,29 +135,28 @@ func runSetup() -> [String: Any] {
         return ["ok": false, "error": "无法读取 BlackHole 设备 UID"]
     }
 
-    // 2. 若已存在旧的「GlassPad 系统音」（可能是早期非镜像版本），先销毁
-    if let old = allAudioDevices().first(where: { readString($0, kAudioObjectPropertyName) == AGG_NAME }) {
-        AudioHardwareDestroyAggregateDevice(old)
-    }
-
-    // 3. 重新枚举并挑选扬声器：默认输出（非 BlackHole）优先，否则第一个有输出流且非 BlackHole 的设备
-    let devices = allAudioDevices()
-    var speaker: AudioDeviceID?
-    if let def = defaultOutputDevice(), def != blackhole {
-        speaker = def
-    }
-    if speaker == nil {
-        speaker = devices.first(where: { $0 != blackhole && hasOutputStreams($0) })
-    }
-    guard let spk = speaker, let spkUID = readString(spk, kAudioDevicePropertyDeviceUID) else {
+    // 2. 先确定物理扬声器（必须在销毁旧聚合设备之前，避免默认输出指向旧聚合设备导致套娃）
+    guard let spk = findPhysicalSpeaker(), spk != blackhole,
+          let spkUID = readString(spk, kAudioDevicePropertyDeviceUID) else {
         return ["ok": false, "error": "未找到可用的扬声器输出设备"]
     }
 
-    // 4. 创建 Aggregate（扬声器 + BlackHole，镜像模式），master 用扬声器保证时钟稳定
-    var subUIDs = [spkUID]
-    if !subUIDs.contains(blackholeUID) { subUIDs.append(blackholeUID) }
+    // 3. 若已存在旧的「GlassPad 系统音」（可能是早期非镜像版本或套娃版本），先销毁
+    if let old = allAudioDevices().first(where: { readString($0, kAudioObjectPropertyName) == AGG_NAME }) {
+        AudioHardwareDestroyAggregateDevice(old)
+        // 销毁是异步的，稍等系统清理，避免创建同名/同 UID 设备冲突
+        Thread.sleep(forTimeInterval: 0.5)
+    }
 
-    guard let aggID = createAggregateDevice(subDeviceUIDs: subUIDs, masterUID: spkUID) else {
+    // 4. 创建 Aggregate（扬声器 + BlackHole，镜像模式）。
+    //    官方要求：内置扬声器必须排第一位、作为时钟源（master）；BlackHole 作为非时钟源设备
+    //    必须开启 Drift Correction（drift=1）跟随扬声器的硬件时钟，否则收不到镜像数据
+    let subDevices: [[String: Any]] = [
+        [kSubDeviceUIDKey: spkUID, kSubDeviceDriftKey: 0],       // 扬声器：时钟源，不开启 drift
+        [kSubDeviceUIDKey: blackholeUID, kSubDeviceDriftKey: 1], // BlackHole：跟随时钟源，开启 drift correction
+    ]
+
+    guard let aggID = createAggregateDevice(subDevices: subDevices, masterUID: spkUID) else {
         return ["ok": false, "error": "创建多输出设备失败"]
     }
     let setOK = setDefaultOutputDevice(aggID)
