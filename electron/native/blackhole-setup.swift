@@ -1,15 +1,19 @@
-// GlassPad macOS 系统音内录配置 helper
-// 用途：一键创建/复用「GlassPad 系统音」多输出设备（扬声器 + BlackHole 2ch），并设为系统默认输出。
-// 原理：BlackHole 是环回虚拟声卡，系统音写入其输出后会回环到其输入，Electron 用 getUserMedia 采其输入即为无损系统音。
-// 用法：blackhole-setup setup  →  输出 JSON { ok, outputDevice, reused|created, error? }
+// GlassPad macOS 原生系统音频引擎 (ScreenCaptureKit + CoreAudio 双模)
+// 1. sck-stream：腾讯会议同款 ScreenCaptureKit 原生系统音频内录（48kHz 双声道 Float32 交错 PCM 从 stdout 实时输出，
+//    开启 excludesCurrentProcessAudio 排除自身进程声音，无需切换系统默认输出设备，键盘音量键 100% 正常）。
+// 2. setup / restore / set-volume / get-volume：CoreAudio 多输出聚合设备管理与物理扬声器硬件音量控制，
+//    并在停止共享（restore）时自动将系统默认输出还原回物理扬声器，销毁临时聚合设备。
 
 import CoreAudio
+import AudioToolbox
 import Foundation
+import ScreenCaptureKit
+import CoreMedia
+import AVFoundation
 
 let AGG_NAME = "GlassPad 系统音"
 let AGG_UID = "com.glasspad.aggregate.sysaudio"
 
-// Aggregate Device 描述字典的私有 key（CoreAudio 未导出符号，用 CFString 字面量）
 let kAggNameKey = "name" as String
 let kAggUIDKey = "uid" as String
 let kAggSubDeviceListKey = "subdevices" as String
@@ -18,7 +22,6 @@ let kAggStackedKey = "stacked" as String
 let kSubDeviceUIDKey = "uid" as String
 let kSubDeviceDriftKey = "drift" as String
 
-// 读取某个 AudioObject 的字符串属性（CFString，get rule）
 func readString(_ objectID: AudioObjectID, _ selector: AudioObjectPropertySelector,
                 _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> String? {
     var addr = AudioObjectPropertyAddress(
@@ -30,7 +33,6 @@ func readString(_ objectID: AudioObjectID, _ selector: AudioObjectPropertySelect
     return value?.takeUnretainedValue() as String?
 }
 
-// 枚举系统全部音频设备
 func allAudioDevices() -> [AudioDeviceID] {
     let sysObject = AudioObjectID(kAudioObjectSystemObject)
     var addr = AudioObjectPropertyAddress(
@@ -49,7 +51,6 @@ func allAudioDevices() -> [AudioDeviceID] {
     return devices
 }
 
-// 当前系统默认输出设备
 func defaultOutputDevice() -> AudioDeviceID? {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDefaultOutputDevice,
@@ -61,7 +62,17 @@ func defaultOutputDevice() -> AudioDeviceID? {
     return status == noErr ? deviceID : nil
 }
 
-// 设备是否具备输出流（用于挑选扬声器）
+func defaultInputDevice() -> AudioDeviceID? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var deviceID = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID)
+    return status == noErr ? deviceID : nil
+}
+
 func hasOutputStreams(_ deviceID: AudioDeviceID) -> Bool {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioDevicePropertyStreams,
@@ -71,7 +82,15 @@ func hasOutputStreams(_ deviceID: AudioDeviceID) -> Bool {
     return AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size) == noErr && size > 0
 }
 
-// 判断是否为虚拟/聚合设备（这些设备的音量绝不能动，尤其是 BlackHole 必须保持 100% 音量给导师）
+func hasInputStreams(_ deviceID: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    return AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size) == noErr && size > 0
+}
+
 func isVirtualAudioDevice(_ d: AudioDeviceID) -> Bool {
     let name = readString(d, kAudioObjectPropertyName) ?? ""
     let uid = readString(d, kAudioDevicePropertyDeviceUID) ?? ""
@@ -88,43 +107,42 @@ func isVirtualAudioDevice(_ d: AudioDeviceID) -> Bool {
         || uid.localizedCaseInsensitiveContains("MULTIPLE")
 }
 
-// 挑选物理扬声器（关键：必须在销毁旧聚合设备之前调用，且明确排除 BlackHole / 聚合设备 / 虚拟设备，
-// 否则默认输出可能指向被销毁的旧聚合设备，导致把「聚合设备自己」当扬声器塞进去，扬声器被丢出链路、学生听不到声音）
 func findPhysicalSpeaker() -> AudioDeviceID? {
     let devices = allAudioDevices()
-    // 0. 若当前默认输出是真实物理输出设备（例如外接耳机/音响/内置扬声器），优先使用它
     if let def = defaultOutputDevice(), hasOutputStreams(def), !isVirtualAudioDevice(def) {
         return def
     }
-    // 1. Mac 内置扬声器的标准 UID，最可靠
     if let builtin = devices.first(where: { readString($0, kAudioDevicePropertyDeviceUID) == "BuiltInSpeakerDevice" }) {
         return builtin
     }
-    // 2. 名字含「扬声器 / Speaker」，且排除虚拟设备、聚合设备、BlackHole 本身
     if let named = devices.first(where: { d in
         guard hasOutputStreams(d), !isVirtualAudioDevice(d) else { return false }
         let name = readString(d, kAudioObjectPropertyName) ?? ""
-        return name.contains("扬声器") || name.localizedCaseInsensitiveContains("Speaker")
+        return name.contains("扬声器") || name.localizedCaseInsensitiveContains("Speaker") || name.localizedCaseInsensitiveContains("Headphone")
     }) {
         return named
     }
-    // 3. 兜底：任意非虚拟的物理输出设备
     return devices.first(where: { hasOutputStreams($0) && !isVirtualAudioDevice($0) })
 }
 
-// 查找所有物理输出设备（内置扬声器 + 外接耳机/显示器音响等），用于统一调节本机外放音量
+func findPhysicalMic() -> AudioDeviceID? {
+    let devices = allAudioDevices()
+    if let builtin = devices.first(where: { readString($0, kAudioDevicePropertyDeviceUID) == "BuiltInMicrophoneDevice" }) {
+        return builtin
+    }
+    return devices.first(where: { hasInputStreams($0) && !isVirtualAudioDevice($0) })
+}
+
 func findAllPhysicalOutputDevices() -> [AudioDeviceID] {
     return allAudioDevices().filter { hasOutputStreams($0) && !isVirtualAudioDevice($0) }
 }
 
-// 创建 Aggregate Device（镜像模式：所有子设备喂相同数据，扬声器 + BlackHole 同时出声）
 func createAggregateDevice(subDevices: [[String: Any]], masterUID: String) -> AudioDeviceID? {
     let desc: [String: Any] = [
         kAggNameKey: AGG_NAME,
         kAggUIDKey: AGG_UID,
         kAggSubDeviceListKey: subDevices,
         kAggMasterSubDeviceKey: masterUID,
-        // stacked = 1：多输出设备的实际镜像模式（参考系统 ToDesk 多输出设备 composition）
         kAggStackedKey: 1,
     ]
     var deviceID = AudioDeviceID(0)
@@ -132,7 +150,6 @@ func createAggregateDevice(subDevices: [[String: Any]], masterUID: String) -> Au
     return status == noErr ? deviceID : nil
 }
 
-// 设置系统默认输出设备
 func setDefaultOutputDevice(_ deviceID: AudioDeviceID) -> Bool {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDefaultOutputDevice,
@@ -145,7 +162,27 @@ func setDefaultOutputDevice(_ deviceID: AudioDeviceID) -> Bool {
     return status == noErr
 }
 
-// 设备输出通道数（统计 stream configuration 里所有 buffer 的通道）
+func setDefaultInputDevice(_ deviceID: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var newID = deviceID
+    let status = AudioObjectSetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+        UInt32(MemoryLayout<AudioDeviceID>.size), &newID)
+    return status == noErr
+}
+
+// 确保系统默认输入设备是物理麦克风（防止系统或其他软件把 BlackHole 或聚合设备当成默认麦克风，导致扬声器声音被作为 Input 再输入一遍）
+func ensureDefaultInputIsPhysicalMic() {
+    if let curIn = defaultInputDevice(), isVirtualAudioDevice(curIn) {
+        if let mic = findPhysicalMic() {
+            _ = setDefaultInputDevice(mic)
+        }
+    }
+}
+
 func outputChannelCount(_ deviceID: AudioDeviceID) -> Int {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioDevicePropertyStreamConfiguration,
@@ -166,16 +203,12 @@ func outputChannelCount(_ deviceID: AudioDeviceID) -> Int {
     }
 }
 
-// 直接设置所有物理扬声器/耳机输出设备的音量（0–100）。
-// 背景：聚合设备接管默认输出后，系统音量键失效（macOS 不支持调 Multi-Output 设备音量），
-// 只能绕过聚合设备、对物理扬声器子设备单独设 kAudioDevicePropertyVolumeScalar 与 Mute
 func setDeviceVolumeScalar(_ dev: AudioDeviceID, _ percent: Float) -> Bool {
     let scalar = max(0, min(1, percent / 100))
     let shouldMute: UInt32 = percent <= 0.5 ? 1 : 0
     let chans = outputChannelCount(dev)
     var anyOK = false
 
-    // 同步设置主通道与各声道 Mute 状态（当滑到 0% 时彻底硬件静音，>0% 时自动解除静音）
     for ch in 0...max(1, chans) {
         var muteAddr = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyMute,
@@ -187,7 +220,6 @@ func setDeviceVolumeScalar(_ dev: AudioDeviceID, _ percent: Float) -> Bool {
         }
     }
 
-    // 逐通道设置 VolumeScalar，覆盖主通道(0)与左右声道(1, 2)
     for ch in 0...max(2, chans) {
         var addr = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyVolumeScalar,
@@ -204,6 +236,7 @@ func setDeviceVolumeScalar(_ dev: AudioDeviceID, _ percent: Float) -> Bool {
 }
 
 func setSpeakerVolume(_ percent: Float) -> [String: Any] {
+    ensureDefaultInputIsPhysicalMic()
     let targets = findAllPhysicalOutputDevices()
     guard !targets.isEmpty else {
         return ["ok": false, "error": "未找到扬声器设备"]
@@ -214,14 +247,12 @@ func setSpeakerVolume(_ percent: Float) -> [String: Any] {
             anyOK = true
         }
     }
-    // 确保 BlackHole 始终保持 100% 满音量且不静音，避免被意外调小导致导师听不见系统音
     for d in allAudioDevices() where (readString(d, kAudioObjectPropertyName) ?? "").localizedCaseInsensitiveContains("BlackHole") {
         _ = setDeviceVolumeScalar(d, 100)
     }
     return anyOK ? ["ok": true, "volume": Int(percent)] : ["ok": false, "error": "设置扬声器音量失败"]
 }
 
-// 读取物理扬声器当前音量（0–100），用于初始化前端音量滑块
 func getSpeakerVolume() -> [String: Any] {
     guard let spk = findPhysicalSpeaker() else {
         return ["ok": false, "error": "未找到扬声器设备"]
@@ -252,8 +283,23 @@ func getSpeakerVolume() -> [String: Any] {
     return ["ok": false, "error": "读取扬声器音量失败"]
 }
 
+// 还原系统默认输出到物理扬声器并销毁「GlassPad 系统音」聚合设备（恢复系统原生键盘音量加减键控制）
+func runRestore() -> [String: Any] {
+    ensureDefaultInputIsPhysicalMic()
+    var restoredName = ""
+    if let spk = findPhysicalSpeaker() {
+        _ = setDefaultOutputDevice(spk)
+        restoredName = readString(spk, kAudioObjectPropertyName) ?? "BuiltInSpeakerDevice"
+    }
+    for d in allAudioDevices() where readString(d, kAudioObjectPropertyName) == AGG_NAME {
+        AudioHardwareDestroyAggregateDevice(d)
+    }
+    let vol = (getSpeakerVolume()["volume"] as? Int) ?? 35
+    return ["ok": true, "restoredOutput": restoredName, "volume": vol]
+}
+
 func runSetup() -> [String: Any] {
-    // 1. 找 BlackHole（名字含 BlackHole）
+    ensureDefaultInputIsPhysicalMic()
     guard let blackhole = allAudioDevices().first(where: {
         (readString($0, kAudioObjectPropertyName) ?? "").localizedCaseInsensitiveContains("BlackHole")
     }) else {
@@ -263,43 +309,140 @@ func runSetup() -> [String: Any] {
         return ["ok": false, "error": "无法读取 BlackHole 设备 UID"]
     }
 
-    // 2. 先确定物理扬声器（必须在销毁旧聚合设备之前，避免默认输出指向旧聚合设备导致套娃）
     guard let spk = findPhysicalSpeaker(), spk != blackhole,
           let spkUID = readString(spk, kAudioDevicePropertyDeviceUID) else {
         return ["ok": false, "error": "未找到可用的扬声器输出设备"]
     }
 
-    // 3. 若已存在旧的「GlassPad 系统音」（可能是早期非镜像版本或套娃版本），先销毁
     if let old = allAudioDevices().first(where: { readString($0, kAudioObjectPropertyName) == AGG_NAME }) {
         AudioHardwareDestroyAggregateDevice(old)
-        // 销毁是异步的，稍等系统清理，避免创建同名/同 UID 设备冲突
-        Thread.sleep(forTimeInterval: 0.5)
+        Thread.sleep(forTimeInterval: 0.4)
     }
 
-    // 4. 创建 Aggregate（扬声器 + BlackHole，镜像模式）。
-    //    官方要求：内置扬声器必须排第一位、作为时钟源（master）；BlackHole 作为非时钟源设备
-    //    必须开启 Drift Correction（drift=1）跟随扬声器的硬件时钟，否则收不到镜像数据
     let subDevices: [[String: Any]] = [
-        [kSubDeviceUIDKey: spkUID, kSubDeviceDriftKey: 0],       // 扬声器：时钟源，不开启 drift
-        [kSubDeviceUIDKey: blackholeUID, kSubDeviceDriftKey: 1], // BlackHole：跟随时钟源，开启 drift correction
+        [kSubDeviceUIDKey: spkUID, kSubDeviceDriftKey: 0],
+        [kSubDeviceUIDKey: blackholeUID, kSubDeviceDriftKey: 1],
     ]
 
     guard let aggID = createAggregateDevice(subDevices: subDevices, masterUID: spkUID) else {
         return ["ok": false, "error": "创建多输出设备失败"]
     }
     let setOK = setDefaultOutputDevice(aggID)
-    // 若物理扬声器音量过高（>45%），自动压到舒适的 35%，防止聚合设备接管后外放震耳且被麦克风回拾
+    ensureDefaultInputIsPhysicalMic()
     if let cur = getSpeakerVolume()["volume"] as? Int, cur > 45 || cur == 0 {
         _ = setSpeakerVolume(35)
     } else {
-        // 确保 BlackHole 本身保持 100% 满音量
         _ = setDeviceVolumeScalar(blackhole, 100)
     }
     let finalVol = (getSpeakerVolume()["volume"] as? Int) ?? 35
     return ["ok": true, "outputDevice": AGG_NAME, "created": true, "defaultSet": setOK, "volume": finalVol]
 }
 
-// 业务结果统一 JSON 输出 + exit 0；仅在进程崩溃时才非 0，便于主进程用 stderr 兜底
+// ── 腾讯会议同款：ScreenCaptureKit 原生系统音频内录流（48kHz 双声道交错 Float32 PCM）──
+class SCKSystemAudioStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio, sampleBuffer.isValid else { return }
+        let numFrames = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard numFrames > 0 else { return }
+
+        var ablSize = 0
+        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer, bufferListSizeNeededOut: &ablSize, bufferListOut: nil, bufferListSize: 0,
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: nil
+        )
+        guard ablSize > 0 else { return }
+        let rawPtr = UnsafeMutableRawPointer.allocate(byteCount: ablSize, alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { rawPtr.deallocate() }
+        let ablPtr = rawPtr.bindMemory(to: AudioBufferList.self, capacity: 1)
+        var blockBuf: CMBlockBuffer?
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer, bufferListSizeNeededOut: nil, bufferListOut: ablPtr, bufferListSize: ablSize,
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, blockBufferOut: &blockBuf
+        )
+        guard status == noErr else { return }
+        let abl = UnsafeMutableAudioBufferListPointer(ablPtr)
+
+        var interleaved = [Float](repeating: 0, count: numFrames * 2)
+        if abl.count >= 2,
+           let lPtr = abl[0].mData?.assumingMemoryBound(to: Float.self),
+           let rPtr = abl[1].mData?.assumingMemoryBound(to: Float.self) {
+            for i in 0..<numFrames {
+                interleaved[i * 2] = lPtr[i]
+                interleaved[i * 2 + 1] = rPtr[i]
+            }
+        } else if abl.count == 1, let p = abl[0].mData?.assumingMemoryBound(to: Float.self) {
+            let totalFloats = Int(abl[0].mDataByteSize) / MemoryLayout<Float>.size
+            if totalFloats == numFrames * 2 {
+                for i in 0..<(numFrames * 2) { interleaved[i] = p[i] }
+            } else {
+                for i in 0..<min(numFrames, totalFloats) {
+                    interleaved[i * 2] = p[i]
+                    interleaved[i * 2 + 1] = p[i]
+                }
+            }
+        }
+
+        interleaved.withUnsafeBufferPointer { buf in
+            if let base = buf.baseAddress {
+                let data = Data(bytes: base, count: buf.count * MemoryLayout<Float>.size)
+                FileHandle.standardOutput.write(data)
+            }
+        }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        fputs("SCK_ERROR:\(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+}
+
+var globalSCKStream: SCStream?
+let sckStreamer = SCKSystemAudioStreamer()
+
+func runSCKAudioStream(excludePID: pid_t?) -> Never {
+    // 启动原生 ScreenCaptureKit 内录前，先把系统默认输出还原回物理扬声器（让系统音量键正常可用）
+    _ = runRestore()
+
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, err in
+        guard let content = content, let display = content.displays.first else {
+            fputs("SCK_NO_DISPLAY:\(err?.localizedDescription ?? "denied")\n", stderr)
+            exit(2)
+        }
+        var excludedApps: [SCRunningApplication] = []
+        if let pid = excludePID, pid > 0 {
+            excludedApps = content.applications.filter { $0.processID == pid }
+        }
+        let filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
+        let config = SCStreamConfiguration()
+        config.width = 2
+        config.height = 2
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        config.capturesAudio = true
+        config.sampleRate = 48000
+        config.channelCount = 2
+        config.excludesCurrentProcessAudio = true
+
+        do {
+            let stream = SCStream(filter: filter, configuration: config, delegate: sckStreamer)
+            try stream.addStreamOutput(sckStreamer, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.glasspad.sck.audio"))
+            stream.startCapture { startErr in
+                if let startErr = startErr {
+                    fputs("SCK_START_ERR:\(startErr.localizedDescription)\n", stderr)
+                    exit(3)
+                }
+                fputs("SCK_READY\n", stderr)
+            }
+            globalSCKStream = stream
+        } catch {
+            fputs("SCK_INIT_ERR:\(error.localizedDescription)\n", stderr)
+            exit(4)
+        }
+    }
+    RunLoop.main.run()
+    exit(0)
+}
+
 let args = CommandLine.arguments
 func emitResult(_ result: [String: Any]) -> Never {
     if let data = try? JSONSerialization.data(withJSONObject: result, options: []),
@@ -313,10 +456,15 @@ func emitResult(_ result: [String: Any]) -> Never {
 
 if args.count > 1 {
     switch args[1] {
+    case "sck-stream":
+        let pid: pid_t? = args.count > 2 ? Int32(args[2]) : nil
+        runSCKAudioStream(excludePID: pid)
     case "setup":
         emitResult(runSetup())
+    case "restore":
+        emitResult(runRestore())
     case "set-volume":
-        let pct = args.count > 2 ? (Float(args[2]) ?? 60) : 60
+        let pct = args.count > 2 ? (Float(args[2]) ?? 35) : 35
         emitResult(setSpeakerVolume(pct))
     case "get-volume":
         emitResult(getSpeakerVolume())

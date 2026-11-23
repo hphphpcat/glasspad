@@ -347,6 +347,86 @@ ipcMain.handle('RUN_AUDIO_SETUP', async () => {
   return runBlackHoleHelper(['setup']);
 });
 
+// 还原系统默认输出设备到物理扬声器并销毁临时聚合设备（恢复系统键盘音量加减键）
+ipcMain.handle('RESTORE_AUDIO_OUTPUT', async () => {
+  if (process.platform !== 'darwin') return { ok: false };
+  return runBlackHoleHelper(['restore']);
+});
+
+// ── 腾讯会议同款：macOS ScreenCaptureKit 原生系统音频内录流（零驱动、不改系统输出设备、自动排除自身进程音频）──
+let nativeAudioProc = null;
+
+function stopNativeAudioStream() {
+  if (nativeAudioProc) {
+    try { nativeAudioProc.kill('SIGTERM'); } catch {}
+    nativeAudioProc = null;
+  }
+}
+
+ipcMain.handle('START_NATIVE_AUDIO_STREAM', async () => {
+  if (process.platform !== 'darwin') return { ok: false, error: '仅 macOS 支持' };
+  stopNativeAudioStream();
+  const helperPath = resolveBlackHoleHelperPath();
+  if (!fs.existsSync(helperPath)) return { ok: false, error: '原生音频组件缺失' };
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (res) => {
+      if (!settled) {
+        settled = true;
+        resolve(res);
+      }
+    };
+
+    const child = spawn(helperPath, ['sck-stream', String(process.pid)], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    nativeAudioProc = child;
+
+    let remainder = Buffer.alloc(0);
+    child.stdout.on('data', (chunk) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      const buf = remainder.length > 0 ? Buffer.concat([remainder, chunk]) : chunk;
+      const frameBytes = 8; // 2ch * Float32(4B)
+      const usableLen = buf.length - (buf.length % frameBytes);
+      if (usableLen > 0) {
+        const sendBuf = buf.subarray(0, usableLen);
+        mainWindow.webContents.send('NATIVE_AUDIO_PCM', sendBuf);
+      }
+      remainder = buf.subarray(usableLen);
+    });
+
+    child.stderr.on('data', (data) => {
+      const msg = data.toString();
+      if (msg.includes('SCK_READY')) {
+        finish({ ok: true, mode: 'sck' });
+      } else if (msg.includes('SCK_NO_DISPLAY') || msg.includes('SCK_START_ERR') || msg.includes('SCK_INIT_ERR')) {
+        stopNativeAudioStream();
+        finish({ ok: false, error: msg.trim() });
+      }
+    });
+
+    child.on('error', (err) => {
+      stopNativeAudioStream();
+      finish({ ok: false, error: err.message });
+    });
+
+    child.on('exit', (code) => {
+      if (nativeAudioProc === child) nativeAudioProc = null;
+      finish({ ok: false, error: `SCK exited (${code})` });
+    });
+
+    setTimeout(() => {
+      finish({ ok: false, error: 'SCK_TIMEOUT' });
+    }, 1500);
+  });
+});
+
+ipcMain.handle('STOP_NATIVE_AUDIO_STREAM', async () => {
+  stopNativeAudioStream();
+  return { ok: true };
+});
+
 // 调节物理扬声器音量（0–100）：聚合设备接管默认输出后系统音量键失效，这里绕过聚合设备直接设扬声器子设备音量
 ipcMain.handle('SET_SPEAKER_VOLUME', async (_e, volume) => {
   if (process.platform !== 'darwin') return { ok: false, error: '仅 macOS 支持' };
@@ -793,10 +873,23 @@ app.whenReady().then(() => {
   if (process.platform === 'darwin') {
     app.dock.hide(); // 隐藏 Mac Dock 图标
     clearMacQuarantineOnLaunch();
+    // 启动时自动清理可能遗留的聚合设备并恢复系统默认输出到物理扬声器，确保系统键盘音量键正常可用
+    runBlackHoleHelper(['restore']).catch(() => {});
   }
   setupSilentScreenCapture();
   createWindow();
   registerShortcuts();
 });
 
-app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll();
+  stopNativeAudioStream();
+  if (process.platform === 'darwin') {
+    try {
+      const helperPath = resolveBlackHoleHelperPath();
+      if (fs.existsSync(helperPath)) {
+        spawn(helperPath, ['restore'], { detached: true, stdio: 'ignore' }).unref();
+      }
+    } catch {}
+  }
+});

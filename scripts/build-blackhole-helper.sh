@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 编译 macOS BlackHole 配置 helper（CoreAudio 多输出设备创建），产物输出到 build/blackhole-setup
+# 编译 macOS 原生系统音频引擎（ScreenCaptureKit 音频内录 + CoreAudio 多输出与音量控制），产物输出到 build/blackhole-setup
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p build
-# 目标 arm64 + macOS 12.0，匹配当前发布的 arm64 DMG，并兼容较老的 macOS 版本
-swiftc -O -target arm64-apple-macos12.0 -o build/blackhole-setup electron/native/blackhole-setup.swift
+# 目标 arm64 + macOS 13.0，支持 ScreenCaptureKit 原生音频捕获 (capturesAudio)
+swiftc -O -target arm64-apple-macos13.0 -o build/blackhole-setup electron/native/blackhole-setup.swift
 echo "built build/blackhole-setup"

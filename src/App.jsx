@@ -11,7 +11,7 @@ const RTC_ICE_SERVERS = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
 ];
 
-// macOS：枚举音频输入设备，识别 BlackHole（系统音环回）与物理麦克风（排除 BlackHole）
+// macOS：枚举音频输入设备，识别 BlackHole（系统音环回）与物理麦克风（排除 BlackHole 及所有虚拟设备）
 async function getMacAudioSources() {
   let probe = null;
   try {
@@ -24,16 +24,77 @@ async function getMacAudioSources() {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const inputs = devices.filter((d) => d.kind === 'audioinput');
     const blackhole = inputs.find((d) => /BlackHole/i.test(d.label || ''));
-    // 物理麦克风：排除 default 占位项、BlackHole 本身、聚合设备（GlassPad 系统音也有输入流）及其它虚拟设备
+    // 物理麦克风：排除 default 占位项、BlackHole 本身、聚合设备（GlassPad 系统音）及 Zoom/Oray/ToDesk 等虚拟设备
     const mic = inputs.find((d) => {
       if (d.deviceId === 'default' || d.deviceId === blackhole?.deviceId) return false;
       const lab = d.label || '';
-      return !/BlackHole|GlassPad|Aggregate|Virtual/i.test(lab);
+      return !/BlackHole|GlassPad|Aggregate|Virtual|ZoomAudio|Oray|ToDesk/i.test(lab);
     });
     return { blackholeId: blackhole?.deviceId || null, micId: mic?.deviceId || null, error: '' };
   } finally {
     probe?.getTracks().forEach((t) => t.stop());
   }
+}
+
+// 腾讯会议同款：将主进程 ScreenCaptureKit 推送的 48kHz 双声道交错 Float32 PCM 实时合成 WebAudio MediaStream
+async function createNativeSCKAudioStream() {
+  if (!window.electronAPI?.startNativeAudioStream || !window.electronAPI?.onNativeAudioPcm) return null;
+  const res = await window.electronAPI.startNativeAudioStream();
+  if (!res?.ok) return null;
+
+  const ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
+  await ctx.resume();
+  const dest = ctx.createMediaStreamDestination();
+  const scriptNode = ctx.createScriptProcessor(1024, 0, 2);
+
+  // 环形队列缓存双声道交错 Float32 样本
+  const ringCapacity = 48000 * 2; // 1 秒双声道容量
+  const ring = new Float32Array(ringCapacity);
+  let writePos = 0;
+  let readPos = 0;
+  let available = 0;
+
+  const offPcm = window.electronAPI.onNativeAudioPcm((rawBuf) => {
+    if (!rawBuf) return;
+    const bytes = rawBuf instanceof Uint8Array ? rawBuf : new Uint8Array(rawBuf);
+    const floats = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+    const n = floats.length;
+    if (n <= 0) return;
+    for (let i = 0; i < n; i++) {
+      ring[writePos] = floats[i];
+      writePos = (writePos + 1) % ringCapacity;
+    }
+    available = Math.min(ringCapacity, available + n);
+  });
+
+  scriptNode.onaudioprocess = (ev) => {
+    const outL = ev.outputBuffer.getChannelData(0);
+    const outR = ev.outputBuffer.getChannelData(1);
+    const frames = outL.length;
+    const needed = frames * 2;
+    if (available >= needed) {
+      for (let i = 0; i < frames; i++) {
+        outL[i] = ring[readPos];
+        outR[i] = ring[(readPos + 1) % ringCapacity];
+        readPos = (readPos + 2) % ringCapacity;
+      }
+      available -= needed;
+    } else {
+      outL.fill(0);
+      outR.fill(0);
+    }
+  };
+
+  scriptNode.connect(dest);
+  return {
+    stream: dest.stream,
+    cleanup: () => {
+      try { offPcm?.(); } catch {}
+      try { scriptNode.disconnect(); } catch {}
+      try { ctx.close(); } catch {}
+      window.electronAPI?.stopNativeAudioStream?.();
+    },
+  };
 }
 
 // 选中文字局部字号范围与默认值（支持 A- / A+ 按钮及 ⌘/Ctrl + +/-/0 快捷键仅对选中文字放大缩小）
@@ -800,6 +861,7 @@ export default function App() {
       session.displayStream?.getTracks().forEach((t) => t.stop());
       session.micStream?.getTracks().forEach((t) => t.stop());
       session.sysAudioStream?.getTracks().forEach((t) => t.stop());
+      session.nativeSckCleanup?.();
       session.audioCtx?.close().catch(() => {});
       shareSessionRef.current = null;
     }
@@ -811,11 +873,9 @@ export default function App() {
     setSpeakerTipDismissed(false);
     setAudioSetupMsg('');
     setShowAudioGuide(false);
-    // 恢复扬声器音量（若之前开麦触发过 ducking），并重置标记
-    if (speakerDuckedRef.current && window.electronAPI?.setSpeakerVolume) {
-      speakerDuckedRef.current = false;
-      window.electronAPI.setSpeakerVolume(speakerVolume);
-    }
+    // 停止共享时恢复物理扬声器为系统默认输出设备（让 Mac 键盘音量加减键立即恢复正常控制）
+    speakerDuckedRef.current = false;
+    window.electronAPI?.restoreAudioOutput?.().catch?.(() => {});
     if (notifyServer && wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({ type: 'SCREEN_SHARE_STOP' }));
     }
@@ -864,15 +924,29 @@ export default function App() {
         throw captureErr;
       }
 
-      // 0.5 macOS BlackHole 检测（装了则系统音走 BlackHole 数字环回，不靠麦克风拾外放；同时自动修复/确保多输出设备与安全音量生效）
+      // 0.5 macOS 优先尝试腾讯会议同款 ScreenCaptureKit 原生系统音频内录（零驱动、不改系统输出设备、键盘音量键正常、自动排除自身进程声音）
       let blackholeInstalled = false;
-      if (caps.platform === 'darwin' && window.electronAPI?.getAudioSetupStatus) {
+      let nativeSckCleanup = null;
+      let sysAudioStream = null;
+      let micStream = null;
+      let micError = '';
+
+      if (caps.platform === 'darwin') {
         try {
-          const st = await window.electronAPI.getAudioSetupStatus();
-          blackholeInstalled = Boolean(st?.blackholeInstalled);
-          setAudioSetup({ supported: Boolean(st?.supported), blackholeInstalled, configured: false });
-          if (blackholeInstalled) {
-            if (window.electronAPI?.runAudioSetup) {
+          const sckHandle = await createNativeSCKAudioStream();
+          if (sckHandle?.stream) {
+            sysAudioStream = sckHandle.stream;
+            nativeSckCleanup = sckHandle.cleanup;
+          }
+        } catch {}
+
+        if (window.electronAPI?.getAudioSetupStatus) {
+          try {
+            const st = await window.electronAPI.getAudioSetupStatus();
+            blackholeInstalled = Boolean(st?.blackholeInstalled);
+            setAudioSetup({ supported: Boolean(st?.supported), blackholeInstalled: blackholeInstalled || Boolean(sysAudioStream), configured: Boolean(sysAudioStream) });
+            // 仅当 ScreenCaptureKit 原生流未就绪且装了 BlackHole 时，才挂载 BlackHole 多输出设备
+            if (!sysAudioStream && blackholeInstalled && window.electronAPI?.runAudioSetup) {
               try {
                 const setupRes = await window.electronAPI.runAudioSetup();
                 if (typeof setupRes?.volume === 'number') setSpeakerVolume(setupRes.volume);
@@ -883,19 +957,14 @@ export default function App() {
                 if (typeof vol?.volume === 'number') setSpeakerVolume(vol.volume);
               } catch {}
             }
-          }
-        } catch {}
+          } catch {}
+        }
       }
 
-      // 2. 采集音频：系统音（Windows loopback / macOS BlackHole）+ 物理麦克风
-      let sysAudioStream = null;
-      let micStream = null;
-      let micError = '';
-
-      if (caps.platform === 'darwin' && blackholeInstalled) {
-        // 装了 BlackHole：系统音走 BlackHole 输入，物理麦克风独立采人声
+      // 2. 采集音频：系统音（Windows loopback / macOS ScreenCaptureKit 或 BlackHole）+ 物理麦克风
+      if (caps.platform === 'darwin' && (sysAudioStream || blackholeInstalled)) {
         const srcs = await getMacAudioSources();
-        if (srcs.blackholeId) {
+        if (!sysAudioStream && srcs.blackholeId) {
           try {
             sysAudioStream = await navigator.mediaDevices.getUserMedia({
               audio: {
@@ -924,7 +993,7 @@ export default function App() {
           } catch {}
         }
         if (!sysAudioStream && !micStream) {
-          micError = '未检测到可用音频设备（BlackHole 或麦克风）';
+          micError = '未检测到可用音频设备（系统音或麦克风）';
         }
       } else if (caps.microphone === 'denied' || caps.microphone === 'restricted') {
         micError = '麦克风权限未开启，点此到系统设置允许 GlassPad 使用麦克风';
@@ -1038,6 +1107,7 @@ export default function App() {
         displayStream,
         micStream,
         sysAudioStream,
+        nativeSckCleanup,
         outboundStream,
         audioCtx,
         micGainNode,
