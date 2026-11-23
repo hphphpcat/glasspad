@@ -600,7 +600,7 @@ ipcMain.handle('DOWNLOAD_AND_INSTALL_UPDATE', async (_e, downloadUrl) => {
   }
 });
 
-// 配置免弹窗静默抓屏（对齐 Codex Interview：自动选择主屏幕 + 系统内录声音 loopback，useSystemPicker: false）
+// 配置免弹窗静默抓屏（自动选择主屏幕 + 系统内录声音 loopback，useSystemPicker: false）
 function setupSilentScreenCapture() {
   const ses = session.defaultSession;
   ses.setPermissionRequestHandler((_webContents, _permission, callback) => {

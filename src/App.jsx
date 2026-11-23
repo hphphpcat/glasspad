@@ -381,7 +381,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.12';
+  let currentVersion = '1.0.13';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -760,7 +760,7 @@ export default function App() {
     }
   };
 
-  // ── 屏幕共享：启动本地静默共享（对齐 Codex Interview：主屏画面 + 系统声音 + 麦克风混音） ──
+  // ── 屏幕共享：启动本地静默共享（主屏画面 + 系统声音 + 麦克风混音） ──
   const startScreenShare = async () => {
     if (shareSessionRef.current) return;
     setShareError('');
@@ -1107,7 +1107,6 @@ export default function App() {
             renderSizeMarks(sizeMarksRef.current);
           }
           if (payload.language) setLanguage(payload.language);
-          if (isClientApp) scrollToBottom();
         } else if (type === 'COLOR_MARKS_SYNC') {
           colorMarksRef.current = normalizeColorMarks(payload?.colorMarks || []);
           renderColorMarks(colorMarksRef.current);
@@ -1163,15 +1162,6 @@ export default function App() {
       ws?.close();
     };
   }, [roomId, token, userName, wsBase]);
-
-  // 客户端提词：导师打字超过一屏时自动滚到最新一行
-  const scrollToBottom = () => {
-    setTimeout(() => {
-      const editor = editorRef.current;
-      const lineCount = editor?.getModel()?.getLineCount();
-      if (lineCount) editor.revealLine(lineCount);
-    }, 20);
-  };
 
   // ── CoderPad 风格：渲染所有远端成员的选区高亮 + 点击/光标位置的彩色姓名气泡 ──
   const renderAllRemoteCursors = () => {
@@ -1523,12 +1513,16 @@ export default function App() {
     editor.focus();
   };
 
-  // 远端文字增量写入：只替换前后缀之间变化的部分，避免整体 setValue 清掉客户的选区
+  // 远端文字增量写入：只替换前后缀之间变化的部分，避免整体 setValue 清掉客户的选区；
+  // 客户端同时锁住当前滚动位置（scrollTop / scrollLeft），导师往后追加内容时客户端视图保持原位不跳动
   const applyRemoteText = (newText) => {
-    const model = editorRef.current?.getModel();
+    const editor = editorRef.current;
+    const model = editor?.getModel();
     if (!model) return;
     const oldText = model.getValue();
     if (oldText === newText) return;
+    const savedScrollTop = isClientApp ? editor.getScrollTop() : null;
+    const savedScrollLeft = isClientApp ? editor.getScrollLeft() : null;
     let start = 0;
     const minLen = Math.min(oldText.length, newText.length);
     while (start < minLen && oldText[start] === newText[start]) start++;
@@ -1549,6 +1543,9 @@ export default function App() {
       text: newText.slice(start, endNew),
     }]);
     isRemote.current = false;
+    if (isClientApp && savedScrollTop !== null) {
+      editor.setScrollPosition({ scrollTop: savedScrollTop, scrollLeft: savedScrollLeft });
+    }
   };
 
   const sendText = (value, colorMarks, boldMarks, sizeMarks) => {
@@ -1675,20 +1672,22 @@ export default function App() {
 
   return (
     <div style={{
-      display: 'flex', flexDirection: 'column', height: '100vh',
+      display: 'flex', flexDirection: 'column',
+      width: '100%', height: '100dvh',
+      boxSizing: 'border-box',
       background: `rgba(13, 13, 13, ${bgAlpha})`,
       backdropFilter: frost ? 'blur(14px)' : 'none',
       WebkitBackdropFilter: frost ? 'blur(14px)' : 'none',
       color: '#e5e5e5', fontFamily: uiFont,
-      border: '1px solid rgba(255, 255, 255, 0.12)',
-      borderRadius: '8px', overflow: 'hidden',
+      border: isClientApp ? '1px solid rgba(255, 255, 255, 0.12)' : 'none',
+      borderRadius: isClientApp ? '8px' : '0px', overflow: 'hidden',
     }}>
       {/* 顶部栏（桌面端整条可按住拖拽移动窗口，右侧控件除外） */}
       <div style={{
-        display: 'flex', alignItems: 'center', gap: '10px',
+        display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap',
         padding: '8px 14px', background: barBg,
         borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
-        fontSize: '12.5px', color: '#d1d5db',
+        fontSize: '12.5px', color: '#d1d5db', flexShrink: 0,
         WebkitAppRegion: isClientApp ? 'drag' : 'no-drag',
         cursor: isClientApp ? 'grab' : 'default',
       }}>
@@ -1755,7 +1754,7 @@ export default function App() {
                 </span>
               )}
 
-              {/* 客户端静默屏幕共享开关（对齐 Codex Interview：免弹窗直接共享主屏幕 + 系统声音） */}
+              {/* 客户端静默屏幕共享开关（免弹窗直接共享主屏幕 + 系统声音） */}
               <button
                 onClick={() => (isSharingScreen ? stopScreenShare(true) : startScreenShare())}
                 style={{
@@ -1910,7 +1909,7 @@ export default function App() {
       </div>
 
       {/* 主体区域：导师端在观看屏幕时左右分栏（左侧客户实时屏幕 + 右侧提词编辑器），客户端保持单栏 */}
-      <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
+      <div style={{ flex: 1, display: 'flex', minWidth: 0, minHeight: 0, overflow: 'hidden', position: 'relative' }}>
         {!isClientApp && remoteShareState.active && showViewerPane && (
           <div style={{
             width: '52%', minWidth: '340px', maxWidth: '75%',
@@ -1994,13 +1993,16 @@ export default function App() {
           style={{
             flex: 1,
             minWidth: 0,
+            minHeight: 0,
+            height: '100%',
             position: 'relative',
-            paddingTop: '8px',
+            overflow: 'hidden',
           }}
         >
           <Editor
+            width="100%"
             height="100%"
-          theme="codex-transparent"
+          theme="glasspad-transparent"
           language={language}
           // 客户端不走受控 value（库在只读模式下每次 value 变化都会整体 setValue，清掉选区），
           // 远端文字由 applyRemoteText 增量写入；导师端保持受控
@@ -2008,7 +2010,7 @@ export default function App() {
           defaultValue={text}
           onChange={handleTextChange}
           beforeMount={(monaco) => {
-            monaco.editor.defineTheme('codex-transparent', {
+            monaco.editor.defineTheme('glasspad-transparent', {
               base: 'vs-dark',
               inherit: true,
               rules: [],
@@ -2016,7 +2018,9 @@ export default function App() {
                 'editor.background': '#00000000',
                 'editorGutter.background': '#00000000',
                 'editor.lineHighlightBackground': '#00000000',
-                'scrollbarSlider.background': '#ffffff22',
+                'scrollbarSlider.background': '#ffffff38',
+                'scrollbarSlider.hoverBackground': '#ffffff55',
+                'scrollbarSlider.activeBackground': '#ffffff77',
                 'editor.selectionBackground': '#1e5aa8',
                 'editor.inactiveSelectionBackground': '#1e5aa8',
               },
@@ -2037,8 +2041,9 @@ export default function App() {
             if (boldMarksRef.current.length > 0) renderBoldMarks(boldMarksRef.current);
             if (sizeMarksRef.current.length > 0) renderSizeMarks(sizeMarksRef.current);
             if (remoteCursorsRef.current.size > 0) renderAllRemoteCursors();
-            monaco.editor.setTheme('codex-transparent');
+            monaco.editor.setTheme('glasspad-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
+            requestAnimationFrame(() => editor.layout());
             // 导师端注册加粗快捷键
             if (!isClientApp) {
               editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, handleToggleSelectionBold);
@@ -2080,17 +2085,30 @@ export default function App() {
           }}
           options={{
             readOnly: isClientApp,
+            automaticLayout: true,
             fontFamily: codeFont,
             fontSize: DEFAULT_FONT_SIZE,
             lineHeight: 28,
+            padding: { top: 8, bottom: 16 },
+            lineNumbersMinChars: 4,
+            glyphMargin: false,
+            folding: false,
             disableMonospaceOptimizations: true,
             fontLigatures: false,
             wordWrap: 'on',
+            wrappingStrategy: 'advanced',
             minimap: { enabled: false },
             stickyScroll: { enabled: false },
             renderLineHighlight: 'none',
             overviewRulerBorder: false,
             scrollBeyondLastLine: false,
+            scrollbar: {
+              vertical: 'visible',
+              horizontal: 'auto',
+              verticalScrollbarSize: 10,
+              horizontalScrollbarSize: 10,
+              alwaysConsumeMouseWheel: false,
+            },
           }}
         />
         </div>
@@ -2099,7 +2117,7 @@ export default function App() {
       {/* 底部栏：连接状态 + 在线成员（桌面端同样支持按住拖拽） */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: '12px',
-        padding: '8px 16px', background: barBg,
+        padding: '8px 16px', background: barBg, flexShrink: 0,
         borderTop: '1px solid rgba(255, 255, 255, 0.08)', fontSize: '13px',
         WebkitAppRegion: isClientApp ? 'drag' : 'no-drag',
         cursor: isClientApp ? 'grab' : 'default',

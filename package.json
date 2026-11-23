@@ -1,8 +1,8 @@
 {
-  "name": "codex-clone",
-  "version": "1.0.12",
+  "name": "glasspad",
+  "version": "1.0.13",
   "private": true,
-  "description": "Codex Interview 1:1 复刻：React + Electron + WebSocket 实时协同",
+  "description": "GlassPad：React + Electron + WebSocket 实时协同提词",
   "main": "electron/main.js",
   "engines": {
     "node": ">=18"

@@ -1,4 +1,4 @@
-# Codex Clone 生产镜像：构建前端 -> 单进程服务静态页 + WebSocket
+# GlassPad 生产镜像：构建前端 -> 单进程服务静态页 + WebSocket
 FROM node:20-slim
 
 WORKDIR /app

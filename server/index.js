@@ -1,4 +1,4 @@
-// Codex 极简版：单端口同源（静态页 + WebSocket 打字同步 + 管理员建房鉴权）
+// GlassPad 服务端：单端口同源（静态页 + WebSocket 打字同步 + 管理员建房鉴权）
 // 部署到 Railway 后，一个 URL 同时提供页面与 wss:// 长连接
 const http = require('http');
 const path = require('path');
@@ -30,13 +30,13 @@ const rooms = new Map();
 const COLORS = ['#00bcd4', '#3b82f6', '#10b981', '#f59e0b', '#ec4899'];
 
 // 持久化：房间数据与客户端版本信息写磁盘，Railway 重启/多副本也不丢
-const DATA_DIR = process.env.DATA_DIR || '/tmp/codex-data';
+const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/tmp/codex-data' : '/tmp/glasspad-data');
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.12';
+let pkgVersion = '1.0.13';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.12';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.13';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +63,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 优化 CoderPad 风格光标名字标签：点击或移动光标时显示名字气泡，停留 2.5 秒后名字标签自动平滑淡出消失，不遮挡代码\n2. 进入 Pad 支持输入自定义名字，底部状态栏可随时点击自己名字改名\n3. 选中文字局部放大/缩小、加粗、改色实时同步',
+  notes: process.env.RELEASE_NOTES || '1. 关闭客户端 Auto Scroll：导师继续往后打字时，客户端保持当前阅读位置不跳到底部\n2. 修复网页端行号左缘裁切与底部内容显示不全，开启常驻纵向滚动条与自适应布局\n3. 全面统一项目名称为 GlassPad',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -683,7 +683,7 @@ httpServer.on('upgrade', (req, socket, head) => {
 httpServer.listen(PORT, () => {
   loadRooms();   // 启动时从磁盘恢复房间
   loadRelease(); // 启动时从磁盘恢复客户端版本配置
-  console.log(`Codex 服务已启动：http://localhost:${PORT}`);
+  console.log(`GlassPad 服务已启动：http://localhost:${PORT}`);
   console.log(`  管理员建房: POST /api/rooms  { key }`);
   console.log(`  版本检测: GET /api/version | POST /api/version`);
   console.log(`  WS 打字同步: ws://localhost:${PORT}/ws?room=<id>&token=<t>&user=<name>`);
