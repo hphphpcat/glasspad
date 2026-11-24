@@ -580,6 +580,7 @@ ipcMain.handle('GET_APP_VERSION', () => ({
 // 检查更新：向后端 /api/version 或自定义 JSON 接口拉取最新版本信息
 ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
   const currentVersion = getEffectiveAppVersion();
+  const baseVersion = app.getVersion();
   const baseUrl = resolveVersionCheckUrl(customBase);
   const checkUrl = `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}_t=${Date.now()}`;
   try {
@@ -587,7 +588,12 @@ ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
     const latestVersion = String(data.version || data.latestVersion || currentVersion)
       .trim()
       .replace(/^v/i, '');
-    const hasUpdate = compareSemver(latestVersion, currentVersion) > 0;
+    const minNativeVersion = String(data.minNativeVersion || '').trim().replace(/^v/i, '');
+    // 原生外壳版本低于服务端要求的最低原生版本时，必须下载完整安装包更新（不能仅靠前端热更新）
+    const requiresNativeUpdate = Boolean(
+      minNativeVersion && compareSemver(minNativeVersion, baseVersion) > 0
+    );
+    const hasUpdate = compareSemver(latestVersion, currentVersion) > 0 || requiresNativeUpdate;
     const downloadUrl =
       process.platform === 'darwin'
         ? data.macUrl || data.dmgUrl || data.downloadUrl || ''
@@ -596,7 +602,10 @@ ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
       ok: true,
       hasUpdate,
       currentVersion,
+      baseVersion,
       latestVersion,
+      minNativeVersion,
+      requiresNativeUpdate,
       downloadUrl,
       macUrl: data.macUrl || '',
       winUrl: data.winUrl || '',
@@ -609,7 +618,10 @@ ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
       ok: false,
       hasUpdate: false,
       currentVersion,
+      baseVersion,
       latestVersion: currentVersion,
+      minNativeVersion: '',
+      requiresNativeUpdate: false,
       error: err.message || '检查更新失败',
       checkUrl: baseUrl,
     };

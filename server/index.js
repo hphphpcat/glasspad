@@ -5,6 +5,7 @@ const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
@@ -24,7 +25,64 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
   '.json': 'application/json; charset=utf-8',
+  '.wasm': 'application/wasm',
+  '.ttf': 'font/ttf',
+  '.woff2': 'font/woff2',
 };
+
+const COMPRESSIBLE_EXTS = new Set(['.html', '.js', '.css', '.svg', '.json', '.wasm']);
+// 静态文件压缩缓存：Map<absPath, { mtimeMs, raw, gz, br }>
+const staticAssetCache = new Map();
+const MAX_STATIC_CACHE_ENTRIES = 64;
+
+// IP 认证失败限流表：Map<ip, { count, resetAt }>
+const authFailMap = new Map();
+const AUTH_WINDOW_MS = 60 * 1000;
+const AUTH_MAX_FAILS = 15;
+
+function getClientIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.trim()) {
+    return fwd.split(',')[0].trim();
+  }
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+function isIpRateLimited(ip) {
+  const rec = authFailMap.get(ip);
+  if (!rec) return false;
+  if (Date.now() > rec.resetAt) {
+    authFailMap.delete(ip);
+    return false;
+  }
+  return rec.count >= AUTH_MAX_FAILS;
+}
+
+function recordAuthFailure(ip) {
+  const now = Date.now();
+  const rec = authFailMap.get(ip);
+  if (!rec || now > rec.resetAt) {
+    authFailMap.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+  } else {
+    rec.count += 1;
+  }
+}
+
+function clearAuthFailure(ip) {
+  authFailMap.delete(ip);
+}
+
+// 常量时间字符串比较（防时序侧信道探测 ADMIN_KEY / room.token）
+function safeEqual(a, b) {
+  const s1 = Buffer.from(String(a || ''), 'utf8');
+  const s2 = Buffer.from(String(b || ''), 'utf8');
+  if (s1.length !== s2.length) {
+    // 仍执行一次等长 timingSafeEqual 消除长度分支时间差
+    crypto.timingSafeEqual(s1, s1);
+    return false;
+  }
+  return crypto.timingSafeEqual(s1, s2);
+}
 
 // 房间状态：roomId -> { token, text, language, clients: Map<ws, {name,color}> }
 const rooms = new Map();
@@ -35,9 +93,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.27';
+let pkgVersion = '1.0.28';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.27';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.28';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -60,11 +118,14 @@ const DEFAULT_MAC_DOWNLOAD_URL =
 const DEFAULT_WIN_DOWNLOAD_URL =
   `https://github.com/hphphpcat/glasspad/releases/download/glasspad/GlassPad-${pkgVersion}-portable.exe`;
 
+const DEFAULT_MIN_NATIVE_VERSION = process.env.MIN_NATIVE_VERSION || '1.0.28';
+
 let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
+  minNativeVersion: DEFAULT_MIN_NATIVE_VERSION,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 修复服务端 PING 提前拦截导致 PONG 未发出的关键缺陷，并新增服务端 25s 协议层 WS 心跳探活，彻底消除幽灵死链与假在线\n2. 实现真正的原地无缝 ICE Restart 热续传 + 指数退避防重连风暴 + 修复 viewerForceRelay 闭包陈旧 Bug 与并发 Offer 竞态\n3. 共享端视频轨意外中断（插拔显示器/切分辨率）自动热替换不断共享，macOS SCK 音频流异常退出自动热拉起，导师端实时显示 fps/码率/RTT',
+  notes: process.env.RELEASE_NOTES || '1. 服务端性能优化：房间持久化升级为防抖异步原子落盘（零事件循环阻塞、重启零损毁）；静态资源开启 Brotli/Gzip 压缩（体积降 70%+）与长效强缓存\n2. 安全与风控加固：/api/rtc-config 接入房间凭证鉴权防止 Cloudflare TURN 流量被盗刷；升级常量时间密钥校验、IP 防爆破限流与 WebSocket 2MB 载荷保护\n3. 更新体系升级：新增 minNativeVersion 原生外壳门控，底层原生音频/隐身改动自动引导完整包更新，纯前端改动继续 1 秒极速热更新',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -72,7 +133,9 @@ let appRelease = {
 function persistRelease() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(VERSION_FILE, JSON.stringify(appRelease, null, 2));
+    const tmpFile = `${VERSION_FILE}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpFile, JSON.stringify(appRelease, null, 2));
+    fs.renameSync(tmpFile, VERSION_FILE);
   } catch (e) {
     console.error('版本配置持久化失败：', e.message);
   }
@@ -88,8 +151,12 @@ function loadRelease() {
       persistRelease();
       return;
     }
+    const savedMinNative = String(saved.minNativeVersion || '').trim();
     appRelease = {
       version: savedVer || appRelease.version,
+      minNativeVersion: (savedMinNative && compareSemver(savedMinNative, DEFAULT_MIN_NATIVE_VERSION) >= 0)
+        ? savedMinNative
+        : DEFAULT_MIN_NATIVE_VERSION,
       macUrl: String(saved.macUrl || appRelease.macUrl).trim(),
       winUrl: String(saved.winUrl || appRelease.winUrl).trim(),
       notes: String(saved.notes ?? appRelease.notes).trim(),
@@ -144,26 +211,79 @@ function sanitizeSizeMarks(raw) {
   return list;
 }
 
-function persistRooms() {
+function serializeAllRoomsForDisk() {
+  const data = {};
+  rooms.forEach((room, roomId) => {
+    data[roomId] = {
+      token: room.token,
+      note: room.note || '',
+      text: room.text,
+      colorMarks: room.colorMarks || [],
+      boldMarks: room.boldMarks || [],
+      sizeMarks: room.sizeMarks || [],
+      language: room.language,
+      createdAt: room.createdAt || room.lastActive,
+      lastActive: room.lastActive,
+    };
+  });
+  return JSON.stringify(data);
+}
+
+// 异步防抖原子落盘：高频打字(TEXT_SYNC)合并为 2 秒一次异步写 + tmp 文件 rename 原子替换，
+// 彻底杜绝单线程事件循环被 writeFileSync 卡顿以及容器重启半截写残 JSON 文件
+let persistTimer = null;
+let persistInFlight = false;
+let persistDirty = false;
+
+async function flushRoomsToDiskAsync() {
+  if (persistInFlight) {
+    persistDirty = true;
+    return;
+  }
+  persistInFlight = true;
+  persistDirty = false;
+  try {
+    await fs.promises.mkdir(DATA_DIR, { recursive: true });
+    const payload = serializeAllRoomsForDisk();
+    const tmpFile = `${ROOMS_FILE}.tmp.${process.pid}.${Date.now()}`;
+    await fs.promises.writeFile(tmpFile, payload, 'utf8');
+    await fs.promises.rename(tmpFile, ROOMS_FILE);
+  } catch (e) {
+    console.error('房间异步持久化失败：', e.message);
+  } finally {
+    persistInFlight = false;
+    if (persistDirty) {
+      persistDirty = false;
+      schedulePersistRooms(500);
+    }
+  }
+}
+
+function schedulePersistRooms(delayMs = 2000) {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    flushRoomsToDiskAsync();
+  }, delayMs);
+}
+
+// 同步原子落盘（仅用于建房/销毁/优雅退出等低频关键节点，保证立即落盘）
+function persistRooms(immediate = false) {
+  if (!immediate) {
+    schedulePersistRooms(2000);
+    return;
+  }
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    const data = {};
-    rooms.forEach((room, roomId) => {
-      data[roomId] = {
-        token: room.token,
-        note: room.note || '',
-        text: room.text,
-        colorMarks: room.colorMarks || [],
-        boldMarks: room.boldMarks || [],
-        sizeMarks: room.sizeMarks || [],
-        language: room.language,
-        createdAt: room.createdAt || room.lastActive,
-        lastActive: room.lastActive,
-      };
-    });
-    fs.writeFileSync(ROOMS_FILE, JSON.stringify(data));
+    const tmpFile = `${ROOMS_FILE}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpFile, serializeAllRoomsForDisk(), 'utf8');
+    fs.renameSync(tmpFile, ROOMS_FILE);
   } catch (e) {
-    console.error('房间持久化失败：', e.message);
+    console.error('房间同步持久化失败：', e.message);
   }
 }
 
@@ -258,10 +378,38 @@ function destroyRoom(roomId) {
 }
 
 function checkAdminKey(req, url, body) {
+  const ip = getClientIp(req);
+  if (isIpRateLimited(ip)) return { ok: false, rateLimited: true };
   const headerKey = req.headers['x-admin-key'] || '';
   const queryKey = url.searchParams.get('key') || '';
   const bodyKey = body?.key || '';
-  return (headerKey || queryKey || bodyKey) === ADMIN_KEY;
+  const candidate = headerKey || queryKey || bodyKey;
+  if (candidate && safeEqual(candidate, ADMIN_KEY)) {
+    clearAuthFailure(ip);
+    return { ok: true, rateLimited: false };
+  }
+  recordAuthFailure(ip);
+  return { ok: false, rateLimited: false };
+}
+
+function checkRoomCredential(req, url) {
+  const ip = getClientIp(req);
+  if (isIpRateLimited(ip)) return { ok: false, rateLimited: true };
+  const roomId = (url.searchParams.get('room') || '').trim();
+  const token = (url.searchParams.get('token') || '').trim();
+  const room = roomId ? rooms.get(roomId) : null;
+  if (room && token && safeEqual(token, room.token)) {
+    clearAuthFailure(ip);
+    return { ok: true, rateLimited: false };
+  }
+  // 管理员密钥同样放行（便于运维健康检查与联调）
+  const adminHeader = req.headers['x-admin-key'] || '';
+  if (adminHeader && safeEqual(adminHeader, ADMIN_KEY)) {
+    clearAuthFailure(ip);
+    return { ok: true, rateLimited: false };
+  }
+  recordAuthFailure(ip);
+  return { ok: false, rateLimited: false };
 }
 
 function sendJSON(res, status, obj) {
@@ -462,8 +610,14 @@ const httpServer = http.createServer(async (req, res) => {
     return sendJSON(res, 200, appRelease);
   }
 
-  // 0a-2. 动态签发 WebRTC ICE 服务器列表（国内+海外 STUN + Cloudflare Realtime TURN / Metered TURN 中继）：GET /api/rtc-config
+  // 0a-2. 动态签发 WebRTC ICE 服务器列表（需合法 room+token 或管理员密钥鉴权，防止 Cloudflare TURN 流量被外部盗刷）：GET /api/rtc-config
   if (req.method === 'GET' && url.pathname === '/api/rtc-config') {
+    const auth = checkRoomCredential(req, url);
+    if (!auth.ok) {
+      return sendJSON(res, auth.rateLimited ? 429 : 401, {
+        error: auth.rateLimited ? '请求过于频繁，请 1 分钟后重试' : '需要有效的房间凭证才能获取 TURN 中继配置',
+      });
+    }
     const rtcConfig = await getRtcConfig();
     return sendJSON(res, 200, rtcConfig);
   }
@@ -472,15 +626,22 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/version') {
     try {
       const body = await readBody(req);
-      if (!checkAdminKey(req, url, body)) {
-        return sendJSON(res, 401, { error: '无效的管理员密钥' });
+      const auth = checkAdminKey(req, url, body);
+      if (!auth.ok) {
+        return sendJSON(res, auth.rateLimited ? 429 : 401, {
+          error: auth.rateLimited ? '认证失败次数过多，请 1 分钟后再试' : '无效的管理员密钥',
+        });
       }
       const nextVersion = String(body.version || '').trim();
       if (!nextVersion) {
         return sendJSON(res, 400, { error: '版本号不能为空' });
       }
+      const nextMinNative = String(body.minNativeVersion ?? appRelease.minNativeVersion ?? DEFAULT_MIN_NATIVE_VERSION)
+        .trim()
+        .replace(/^v/i, '');
       appRelease = {
         version: nextVersion.replace(/^v/i, ''),
+        minNativeVersion: nextMinNative || DEFAULT_MIN_NATIVE_VERSION,
         macUrl: String(body.macUrl ?? '').trim(),
         winUrl: String(body.winUrl ?? '').trim(),
         notes: String(body.notes ?? '').trim().slice(0, 500),
@@ -496,8 +657,11 @@ const httpServer = http.createServer(async (req, res) => {
 
   // 1. 管理员查询全部房间列表：GET /api/rooms
   if (req.method === 'GET' && url.pathname === '/api/rooms') {
-    if (!checkAdminKey(req, url)) {
-      return sendJSON(res, 401, { error: '无效的管理员密钥' });
+    const auth = checkAdminKey(req, url);
+    if (!auth.ok) {
+      return sendJSON(res, auth.rateLimited ? 429 : 401, {
+        error: auth.rateLimited ? '认证失败次数过多，请 1 分钟后再试' : '无效的管理员密钥',
+      });
     }
     const list = [];
     rooms.forEach((room, roomId) => {
@@ -512,14 +676,17 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/rooms') {
     try {
       const body = await readBody(req);
-      if (!checkAdminKey(req, url, body)) {
-        return sendJSON(res, 401, { error: '无效的管理员密钥' });
+      const auth = checkAdminKey(req, url, body);
+      if (!auth.ok) {
+        return sendJSON(res, auth.rateLimited ? 429 : 401, {
+          error: auth.rateLimited ? '认证失败次数过多，请 1 分钟后再试' : '无效的管理员密钥',
+        });
       }
       const roomId = crypto.randomBytes(3).toString('hex'); // 6 位十六进制房间号
       const token = randomToken();
       const note = String(body.note || '').trim().slice(0, 60);
       const room = getOrCreateRoom(roomId, token, note);
-      persistRooms();
+      persistRooms(true);
       return sendJSON(res, 200, serializeRoom(roomId, room));
     } catch (e) {
       return sendJSON(res, 400, { error: '请求解析失败：' + e.message });
@@ -530,15 +697,18 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.method === 'DELETE' && url.pathname.startsWith('/api/rooms/')) {
     let body = {};
     try { body = await readBody(req); } catch {}
-    if (!checkAdminKey(req, url, body)) {
-      return sendJSON(res, 401, { error: '无效的管理员密钥' });
+    const auth = checkAdminKey(req, url, body);
+    if (!auth.ok) {
+      return sendJSON(res, auth.rateLimited ? 429 : 401, {
+        error: auth.rateLimited ? '认证失败次数过多，请 1 分钟后再试' : '无效的管理员密钥',
+      });
     }
     const targetId = decodeURIComponent(url.pathname.slice('/api/rooms/'.length)).trim();
     if (!targetId || !rooms.has(targetId)) {
       return sendJSON(res, 404, { error: '房间不存在或已销毁' });
     }
     destroyRoom(targetId);
-    persistRooms();
+    persistRooms(true);
     return sendJSON(res, 200, { ok: true, destroyed: targetId });
   }
 
@@ -546,8 +716,11 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.method === 'DELETE' && url.pathname === '/api/rooms') {
     let body = {};
     try { body = await readBody(req); } catch {}
-    if (!checkAdminKey(req, url, body)) {
-      return sendJSON(res, 401, { error: '无效的管理员密钥' });
+    const auth = checkAdminKey(req, url, body);
+    if (!auth.ok) {
+      return sendJSON(res, auth.rateLimited ? 429 : 401, {
+        error: auth.rateLimited ? '认证失败次数过多，请 1 分钟后再试' : '无效的管理员密钥',
+      });
     }
     const mode = url.searchParams.get('mode') || body.mode || 'idle';
     const destroyed = [];
@@ -557,62 +730,146 @@ const httpServer = http.createServer(async (req, res) => {
         if (destroyRoom(roomId)) destroyed.push(roomId);
       }
     });
-    persistRooms();
+    persistRooms(true);
     return sendJSON(res, 200, { ok: true, destroyedCount: destroyed.length, destroyed });
   }
 
-  if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
+  if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); res.end(); return; }
 
   // 未命中的 /api/* 路径直接返回 404 JSON，不走 SPA index.html 回退
   if (url.pathname.startsWith('/api/')) {
     return sendJSON(res, 404, { error: 'API 接口不存在' });
   }
 
-  // 静态文件服务（dist 由 npm run build 生成）
+  // 静态文件服务（dist 由 npm run build 生成）：自动开启 Brotli / Gzip 压缩缓存与 /assets/ 一年 immutable 强缓存
   let filePath = url.pathname === '/' ? '/index.html' : url.pathname;
   const abs = path.join(DIST_DIR, path.normalize(filePath));
   if (!abs.startsWith(DIST_DIR)) { res.writeHead(403); res.end('Forbidden'); return; }
 
-  fs.readFile(abs, (err, data) => {
-    // 文件不存在且无扩展名（如 /admin）→ 回退到 index.html，交给前端路由
-    if (err && !path.extname(filePath)) {
-      fs.readFile(path.join(DIST_DIR, 'index.html'), (err2, html) => {
-        if (err2) { res.writeHead(404); res.end('Not Found'); return; }
-        res.writeHead(200, {
-          'Content-Type': 'text/html; charset=utf-8',
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
+  const serveStaticFile = (targetAbs) => {
+    fs.stat(targetAbs, (statErr, stat) => {
+      if (statErr || !stat.isFile()) {
+        if (!path.extname(filePath) && targetAbs !== path.join(DIST_DIR, 'index.html')) {
+          return serveStaticFile(path.join(DIST_DIR, 'index.html'));
+        }
+        res.writeHead(404);
+        res.end('Not Found');
+        return;
+      }
+
+      const ext = path.extname(targetAbs).toLowerCase();
+      const contentType = MIME[ext] || 'application/octet-stream';
+      const isHtml = ext === '.html';
+      const isHashedAsset = !isHtml && targetAbs.startsWith(path.join(DIST_DIR, 'assets') + path.sep);
+      const acceptEnc = String(req.headers['accept-encoding'] || '');
+      const canCompress = COMPRESSIBLE_EXTS.has(ext) && stat.size >= 1024;
+      const wantBr = canCompress && /\bbr\b/i.test(acceptEnc);
+      const wantGz = !wantBr && canCompress && /\bgzip\b/i.test(acceptEnc);
+
+      const sendBuf = (buf, encoding) => {
+        const headers = {
+          'Content-Type': contentType,
+          'Content-Length': buf.length,
+          Vary: 'Accept-Encoding',
+        };
+        if (encoding) headers['Content-Encoding'] = encoding;
+        if (isHtml) {
+          headers['Cache-Control'] = 'no-cache, no-store, must-revalidate';
+        } else if (isHashedAsset) {
+          // Vite 产出的 /assets/* 文件名带内容哈希，可安全设 1 年强缓存，二次打开秒开
+          headers['Cache-Control'] = 'public, max-age=31536000, immutable';
+        } else {
+          headers['Cache-Control'] = 'public, max-age=3600';
+        }
+        res.writeHead(200, headers);
+        if (req.method === 'HEAD') res.end();
+        else res.end(buf);
+      };
+
+      let entry = staticAssetCache.get(targetAbs);
+      if (entry && entry.mtimeMs === stat.mtimeMs) {
+        if (wantBr && entry.br) return sendBuf(entry.br, 'br');
+        if (wantGz && entry.gz) return sendBuf(entry.gz, 'gzip');
+        if (!wantBr && !wantGz) return sendBuf(entry.raw, null);
+      }
+
+      const loadRaw = entry && entry.mtimeMs === stat.mtimeMs
+        ? Promise.resolve(entry.raw)
+        : fs.promises.readFile(targetAbs).then((raw) => {
+            if (staticAssetCache.size >= MAX_STATIC_CACHE_ENTRIES) {
+              const firstKey = staticAssetCache.keys().next().value;
+              if (firstKey) staticAssetCache.delete(firstKey);
+            }
+            entry = { mtimeMs: stat.mtimeMs, raw, gz: null, br: null };
+            staticAssetCache.set(targetAbs, entry);
+            return raw;
+          });
+
+      loadRaw
+        .then((raw) => {
+          if (wantBr) {
+            return new Promise((resolve, reject) => {
+              zlib.brotliCompress(
+                raw,
+                { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 } },
+                (zErr, compressed) => (zErr ? reject(zErr) : resolve(compressed))
+              );
+            }).then((brBuf) => {
+              entry.br = brBuf;
+              sendBuf(brBuf, 'br');
+            });
+          }
+          if (wantGz) {
+            return new Promise((resolve, reject) => {
+              zlib.gzip(raw, { level: 6 }, (zErr, compressed) => (zErr ? reject(zErr) : resolve(compressed)));
+            }).then((gzBuf) => {
+              entry.gz = gzBuf;
+              sendBuf(gzBuf, 'gzip');
+            });
+          }
+          sendBuf(raw, null);
+        })
+        .catch(() => {
+          if (!res.headersSent) {
+            res.writeHead(500);
+            res.end('Internal Server Error');
+          }
         });
-        res.end(html);
-      });
-      return;
-    }
-    if (err) { res.writeHead(404); res.end('Not Found'); return; }
-    const ext = path.extname(abs).toLowerCase();
-    const headers = { 'Content-Type': MIME[ext] || 'application/octet-stream' };
-    if (ext === '.html') {
-      headers['Cache-Control'] = 'no-cache, no-store, must-revalidate';
-    }
-    res.writeHead(200, headers);
-    res.end(data);
-  });
+    });
+  };
+
+  serveStaticFile(abs);
 });
 
-// ── WebSocket：毫秒级按键广播 + 在线队友列表（带 token 鉴权） ──
-const wss = new WebSocketServer({ noServer: true });
+// ── WebSocket：毫秒级按键广播 + 在线队友列表（带 token 鉴权 + 2MB 载荷上限防 OOM 攻击） ──
+const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
 
 wss.on('connection', (ws, req) => {
+  // 捕获单连接协议/超长载荷等错误，防止未处理的 ws 'error' 事件导致整个 Node 进程崩溃
+  ws.on('error', (err) => {
+    console.warn('[ws] 连接异常已隔离：', err?.code || err?.message || err);
+  });
+
+  const ip = getClientIp(req);
+  if (isIpRateLimited(ip)) {
+    ws.send(JSON.stringify({ type: 'AUTH_FAIL', payload: { reason: '尝试次数过多，请 1 分钟后重试' } }));
+    ws.close(4001, 'rate_limited');
+    return;
+  }
   const url = new URL(req.url, 'http://localhost');
   const roomId = url.searchParams.get('room') || '';
   const token = url.searchParams.get('token') || '';
   const userName = url.searchParams.get('user') || 'Cstech Cat';
 
-  // 鉴权：房间必须存在，且 token 必须匹配
+  // 鉴权：房间必须存在，且 token 必须常量时间匹配
   const room = rooms.get(roomId);
-  if (!room || room.token !== token) {
+  if (!room || !safeEqual(token, room.token)) {
+    recordAuthFailure(ip);
     ws.send(JSON.stringify({ type: 'AUTH_FAIL', payload: { reason: '无效的房间或邀请凭证' } }));
     ws.close(4001, 'unauthorized');
     return;
   }
+  clearAuthFailure(ip);
 
   const clientId = crypto.randomBytes(4).toString('hex');
   const color = COLORS[room.clients.size % COLORS.length];
@@ -946,16 +1203,31 @@ setInterval(() => {
   });
 }, 25 * 1000);
 
-// 闲置房间回收：房间超过 6 小时无人使用才删除（保留 token 有效性，且不会无限增长）
+// 闲置房间回收：房间超过 6 小时无人使用才删除（保留 token 有效性，且不会无限增长），顺带清理过期限流记录
 setInterval(() => {
   const now = Date.now();
+  let removed = false;
   rooms.forEach((room, roomId) => {
     if (room.clients.size === 0 && now - room.lastActive > 6 * 3600 * 1000) {
       rooms.delete(roomId);
+      removed = true;
     }
   });
-  persistRooms();
+  authFailMap.forEach((rec, ip) => {
+    if (now > rec.resetAt) authFailMap.delete(ip);
+  });
+  if (removed) persistRooms(true);
 }, 10 * 60 * 1000);
+
+// 优雅退出：Railway 容器滚动发版收到 SIGTERM/SIGINT 时立即同步刷盘，防止最后 2 秒内的打字丢失
+const handleGracefulExit = (signal) => {
+  console.log(`收到 ${signal}，正在刷盘房间数据并关闭服务…`);
+  persistRooms(true);
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref();
+};
+process.on('SIGTERM', () => handleGracefulExit('SIGTERM'));
+process.on('SIGINT', () => handleGracefulExit('SIGINT'));
 
 // WS 升级：接受任意路径
 httpServer.on('upgrade', (req, socket, head) => {

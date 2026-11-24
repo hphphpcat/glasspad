@@ -28,18 +28,29 @@ function getHttpApiBase(wsBaseOverride) {
   return raw.replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:').replace(/\/+$/, '');
 }
 
-async function fetchRtcIceConfig(wsBaseOverride, forceRefresh = false) {
+async function fetchRtcIceConfig(wsBaseOverride, forceRefresh = false, authCreds = null) {
   const now = Date.now();
-  // 只有当已拿到 TURN 凭证时才缓存 10 分钟；stun-only 只缓存 5 秒避免卡死在旧配置上
+  const room = String(authCreds?.roomId || '').trim();
+  const token = String(authCreds?.token || '').trim();
+  const credKey = `${room}:${token}`;
+  // 只有当已拿到 TURN 凭证且房间凭证未切换时才缓存 10 分钟；stun-only 只缓存 5 秒避免卡死在旧配置上
   const ttlMs = cachedRtcConfig?.hasTurn ? 10 * 60 * 1000 : 5 * 1000;
-  if (!forceRefresh && cachedRtcConfig && now - cachedRtcConfig.fetchedAt < ttlMs) {
+  if (
+    !forceRefresh &&
+    cachedRtcConfig &&
+    cachedRtcConfig.credKey === credKey &&
+    now - cachedRtcConfig.fetchedAt < ttlMs
+  ) {
     return cachedRtcConfig;
   }
   try {
     const apiBase = getHttpApiBase(wsBaseOverride);
+    const qs = room && token
+      ? `?room=${encodeURIComponent(room)}&token=${encodeURIComponent(token)}`
+      : '';
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(`${apiBase}/api/rtc-config`, { signal: controller.signal, cache: 'no-store' });
+    const res = await fetch(`${apiBase}/api/rtc-config${qs}`, { signal: controller.signal, cache: 'no-store' });
     clearTimeout(timer);
     if (res.ok) {
       const data = await res.json();
@@ -48,6 +59,7 @@ async function fetchRtcIceConfig(wsBaseOverride, forceRefresh = false) {
           iceServers: data.iceServers,
           hasTurn: Boolean(data.hasTurn),
           provider: data.provider || 'unknown',
+          credKey,
           fetchedAt: now,
         };
         return cachedRtcConfig;
@@ -58,6 +70,7 @@ async function fetchRtcIceConfig(wsBaseOverride, forceRefresh = false) {
     iceServers: DEFAULT_RTC_ICE_SERVERS,
     hasTurn: false,
     provider: 'stun-only',
+    credKey,
     fetchedAt: now,
   };
 }
@@ -749,7 +762,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.27';
+  let currentVersion = '1.0.28';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -777,7 +790,18 @@ async function performUpdateCheck(customBase) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     const latestVersion = String(data.version || currentVersion).trim().replace(/^v/i, '');
-    const hasUpdate = compareSemverClient(latestVersion, currentVersion) > 0;
+    const minNativeVersion = String(data.minNativeVersion || '').trim().replace(/^v/i, '');
+    let baseVersion = currentVersion;
+    if (window.electronAPI?.getAppVersion) {
+      try {
+        const info = await window.electronAPI.getAppVersion();
+        if (info?.baseVersion) baseVersion = info.baseVersion;
+      } catch {}
+    }
+    const requiresNativeUpdate = Boolean(
+      isClientApp && minNativeVersion && compareSemverClient(minNativeVersion, baseVersion) > 0
+    );
+    const hasUpdate = compareSemverClient(latestVersion, currentVersion) > 0 || requiresNativeUpdate;
     const downloadUrl = isWindows
       ? (data.winUrl || data.downloadUrl || '')
       : (data.macUrl || data.downloadUrl || '');
@@ -785,7 +809,10 @@ async function performUpdateCheck(customBase) {
       ok: true,
       hasUpdate,
       currentVersion,
+      baseVersion,
       latestVersion,
+      minNativeVersion,
+      requiresNativeUpdate,
       downloadUrl,
       macUrl: data.macUrl || '',
       winUrl: data.winUrl || '',
@@ -1182,7 +1209,7 @@ export default function App() {
     session.peerGens.set(viewerId, offerGen);
     removeViewerPeer(viewerId);
 
-    const rtcCfg = await fetchRtcIceConfig(wsBase, forceRelay);
+    const rtcCfg = await fetchRtcIceConfig(wsBase, forceRelay, { roomId, token });
     if (shareSessionRef.current !== session || session.stopped) return;
     if (session.peerGens.get(viewerId) !== offerGen) return; // 已有更新的观看请求，丢弃过期任务
 
@@ -1888,7 +1915,7 @@ export default function App() {
         }
         setViewerConnMode(wantRelay ? 'TURN 强制中继连接中…' : '正在穿透网络…');
 
-        const rtcCfg = await fetchRtcIceConfig(wsBase, wantRelay);
+        const rtcCfg = await fetchRtcIceConfig(wsBase, wantRelay, { roomId, token });
         if (viewerOfferGenRef.current !== offerGen) return; // 已有更新的 Offer 抵达，丢弃本次过期的建连
 
         const useRelayOnly = Boolean(wantRelay && rtcCfg.hasTurn);
@@ -2254,7 +2281,7 @@ export default function App() {
     if (!sess || sess.stopped || !listenerId) return;
     removeVoiceListenerPeer(listenerId);
 
-    const rtcCfg = await fetchRtcIceConfig(wsBase, forceRelay);
+    const rtcCfg = await fetchRtcIceConfig(wsBase, forceRelay, { roomId, token });
     if (mentorVoiceSessionRef.current !== sess || sess.stopped) return;
 
     const useRelayOnly = Boolean(forceRelay && rtcCfg.hasTurn);
@@ -2426,7 +2453,7 @@ export default function App() {
         if (!earlyVoiceIceRef.current.has(from)) {
           earlyVoiceIceRef.current.set(from, []);
         }
-        const rtcCfg = await fetchRtcIceConfig(wsBase);
+        const rtcCfg = await fetchRtcIceConfig(wsBase, false, { roomId, token });
         const pc = new RTCPeerConnection({
           iceServers: rtcCfg.iceServers,
           bundlePolicy: 'max-bundle',
@@ -4261,11 +4288,13 @@ function SelectionColorPicker({ pickerColor, hasSelection, onApplyColor }) {
   );
 }
 
-// ── 更新详情弹窗：展示最新版本号、更新日志与 1 秒极速热更新（免下载 98MB 安装包） ──
+// ── 更新详情弹窗：展示最新版本号、更新日志与智能更新（纯前端改动 1 秒热更新；含底层原生改动自动走完整安装包） ──
 function UpdateModal({ updateInfo, onClose }) {
   const platformLabel = isWindows ? 'Windows (.exe)' : 'macOS (.dmg)';
   const primaryUrl = updateInfo.downloadUrl || (isWindows ? updateInfo.winUrl : updateInfo.macUrl) || '';
-  const canHotUpdate = Boolean(window.electronAPI?.applyHotUpdate);
+  const requiresNativeUpdate = Boolean(updateInfo.requiresNativeUpdate);
+  // 若服务端声明本次更新需要新版原生外壳（如隐身/防节流/音频驱动升级），禁用 1 秒热更新，强制引导完整安装包更新
+  const canHotUpdate = Boolean(window.electronAPI?.applyHotUpdate && !requiresNativeUpdate);
   const canInAppUpdate = Boolean(window.electronAPI?.downloadAndInstallUpdate && primaryUrl);
 
   const [updating, setUpdating] = useState(false);
@@ -4368,6 +4397,7 @@ function UpdateModal({ updateInfo, onClose }) {
               </div>
               <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '2px' }}>
                 当前版本 v{updateInfo.currentVersion} → 最新版本 v{updateInfo.latestVersion}
+                {requiresNativeUpdate && updateInfo.baseVersion ? `（底层外壳 v${updateInfo.baseVersion} 需升级）` : ''}
               </div>
             </div>
           </div>
@@ -4383,6 +4413,15 @@ function UpdateModal({ updateInfo, onClose }) {
             </button>
           )}
         </div>
+
+        {requiresNativeUpdate && (
+          <div style={{
+            background: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.4)',
+            borderRadius: '8px', padding: '8px 11px', fontSize: '12px', color: '#fcd34d', lineHeight: 1.5,
+          }}>
+            本次更新包含底层原生升级（隐身加固 / 音频引擎 / 防后台节流），需安装完整包至 v{updateInfo.minNativeVersion}+ 才能完整生效。
+          </div>
+        )}
 
         {updateInfo.notes ? (
           <div style={{
@@ -4440,7 +4479,7 @@ function UpdateModal({ updateInfo, onClose }) {
             </button>
           )}
 
-          {primaryUrl && (canHotUpdate || canInAppUpdate) && (
+          {primaryUrl && canHotUpdate && canInAppUpdate && (
             <button
               onClick={handleFullInstallerUpdate}
               disabled={updating}
