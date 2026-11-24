@@ -7,9 +7,58 @@ const isWindows = window.electronAPI?.platform === 'win32' || /Win/i.test(naviga
 const modKey = isWindows ? 'Ctrl+' : '⌘';
 const uiFont = 'ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif';
 const codeFont = 'ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, Menlo, "Microsoft YaHei UI", monospace';
-const RTC_ICE_SERVERS = [
-  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+const DEFAULT_RTC_ICE_SERVERS = [
+  {
+    urls: [
+      'stun:stun.cloudflare.com:3478',
+      'stun:stun.miwifi.com:3478',
+      'stun:stun.qq.com:3478',
+      'stun:stun.l.google.com:19302',
+    ],
+  },
 ];
+
+let cachedRtcConfig = null; // { iceServers, hasTurn, provider, fetchedAt }
+
+function getHttpApiBase(wsBaseOverride) {
+  const defaultWs = window.location.protocol === 'file:'
+    ? 'wss://glasspad.up.railway.app'
+    : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
+  const raw = wsBaseOverride || import.meta.env.VITE_WS_URL || defaultWs;
+  return raw.replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:').replace(/\/+$/, '');
+}
+
+async function fetchRtcIceConfig(wsBaseOverride, forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedRtcConfig && now - cachedRtcConfig.fetchedAt < 10 * 60 * 1000) {
+    return cachedRtcConfig;
+  }
+  try {
+    const apiBase = getHttpApiBase(wsBaseOverride);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(`${apiBase}/api/rtc-config`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data?.iceServers) && data.iceServers.length > 0) {
+        cachedRtcConfig = {
+          iceServers: data.iceServers,
+          hasTurn: Boolean(data.hasTurn),
+          provider: data.provider || 'unknown',
+          fetchedAt: now,
+        };
+        return cachedRtcConfig;
+      }
+    }
+  } catch {}
+  return {
+    iceServers: DEFAULT_RTC_ICE_SERVERS,
+    hasTurn: false,
+    provider: 'stun-only',
+    fetchedAt: now,
+  };
+}
 
 // macOS：枚举音频输入设备，识别 BlackHole（系统音环回）与物理麦克风（排除 BlackHole 及所有虚拟设备）
 async function getMacAudioSources() {
@@ -467,7 +516,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.22';
+  let currentVersion = '1.0.23';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -613,6 +662,7 @@ export default function App() {
   const [remoteShareState, setRemoteShareState] = useState({ active: false, sharerId: null, micOn: false, systemAudio: false });
   const [showViewerPane, setShowViewerPane] = useState(true);
   const [viewerConnected, setViewerConnected] = useState(false);
+  const [viewerConnMode, setViewerConnMode] = useState(''); // '' | 'P2P 直连' | 'TURN 中继' | 'NAT 穿透失败'
   const [viewerMuted, setViewerMuted] = useState(false);
 
   // ── 客户端版本与检查更新状态 ──
@@ -772,9 +822,11 @@ export default function App() {
   const closeViewerConnection = () => {
     const cur = viewerPcRef.current;
     if (cur) {
+      if (cur.reconnectTimer) clearTimeout(cur.reconnectTimer);
       cur.pc.onicecandidate = null;
       cur.pc.ontrack = null;
       cur.pc.onconnectionstatechange = null;
+      cur.pc.oniceconnectionstatechange = null;
       try { cur.pc.close(); } catch {}
       viewerPcRef.current = null;
     }
@@ -782,6 +834,7 @@ export default function App() {
       remoteVideoRef.current.srcObject = null;
     }
     setViewerConnected(false);
+    setViewerConnMode('');
   };
 
   // ── 屏幕共享：关闭单个观看者的 PeerConnection（共享端） ──
@@ -792,6 +845,7 @@ export default function App() {
     if (entry) {
       entry.pc.onicecandidate = null;
       entry.pc.onconnectionstatechange = null;
+      entry.pc.oniceconnectionstatechange = null;
       try { entry.pc.close(); } catch {}
       session.peers.delete(viewerId);
     }
@@ -803,9 +857,13 @@ export default function App() {
     if (!session || !viewerId) return;
     removeViewerPeer(viewerId);
 
+    const rtcCfg = await fetchRtcIceConfig(wsBase);
+    if (shareSessionRef.current !== session || session.stopped) return;
+
     const pc = new RTCPeerConnection({
-      iceServers: RTC_ICE_SERVERS,
+      iceServers: rtcCfg.iceServers,
       bundlePolicy: 'max-bundle',
+      iceCandidatePoolSize: 2,
     });
     const entry = { pc, pendingIce: [] };
     session.peers.set(viewerId, entry);
@@ -1315,13 +1373,40 @@ export default function App() {
     try {
       if (sdp && sdp.type === 'offer') {
         closeViewerConnection();
+        const rtcCfg = await fetchRtcIceConfig(wsBase);
         const pc = new RTCPeerConnection({
-          iceServers: RTC_ICE_SERVERS,
+          iceServers: rtcCfg.iceServers,
           bundlePolicy: 'max-bundle',
+          iceCandidatePoolSize: 2,
         });
         const remoteStream = new MediaStream();
-        const viewerState = { pc, sharerId: from, pendingIce: [], stream: remoteStream };
+        const viewerState = { pc, sharerId: from, pendingIce: [], stream: remoteStream, reconnectTimer: null };
         viewerPcRef.current = viewerState;
+
+        const detectConnMode = async () => {
+          try {
+            const stats = await pc.getStats();
+            let selectedPair = null;
+            stats.forEach((r) => {
+              if (r.type === 'transport' && r.selectedCandidatePairId) {
+                selectedPair = stats.get(r.selectedCandidatePairId);
+              }
+            });
+            if (!selectedPair) {
+              stats.forEach((r) => {
+                if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded')) {
+                  selectedPair = r;
+                }
+              });
+            }
+            if (selectedPair) {
+              const local = stats.get(selectedPair.localCandidateId);
+              const remote = stats.get(selectedPair.remoteCandidateId);
+              const isRelay = local?.candidateType === 'relay' || remote?.candidateType === 'relay';
+              setViewerConnMode(isRelay ? 'TURN 中继' : 'P2P 直连');
+            }
+          } catch {}
+        };
 
         pc.ontrack = (ev) => {
           // 观看端压低 WebRTC JitterBuffer 延迟（目标 50ms），保持音画实时紧跟
@@ -1340,6 +1425,7 @@ export default function App() {
             remoteVideoRef.current.play().catch(() => {});
           }
           setViewerConnected(true);
+          detectConnMode();
         };
 
         pc.onicecandidate = (ev) => {
@@ -1351,10 +1437,37 @@ export default function App() {
           }
         };
 
+        const scheduleViewerReconnect = () => {
+          if (viewerPcRef.current !== viewerState) return;
+          if (viewerState.reconnectTimer) return;
+          viewerState.reconnectTimer = setTimeout(() => {
+            viewerState.reconnectTimer = null;
+            if (viewerPcRef.current === viewerState && wsRef.current?.readyState === 1) {
+              wsRef.current.send(JSON.stringify({ type: 'SCREEN_VIEWER_JOIN' }));
+            }
+          }, 3000);
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+            setViewerConnected(true);
+            detectConnMode();
+          } else if (pc.iceConnectionState === 'failed') {
+            setViewerConnected(false);
+            setViewerConnMode(rtcCfg.hasTurn ? '中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
+            scheduleViewerReconnect();
+          }
+        };
+
         pc.onconnectionstatechange = () => {
           if (pc.connectionState === 'connected') {
             setViewerConnected(true);
-          } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+            detectConnMode();
+          } else if (pc.connectionState === 'failed') {
+            setViewerConnected(false);
+            setViewerConnMode(rtcCfg.hasTurn ? '中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
+            scheduleViewerReconnect();
+          } else if (pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
             setViewerConnected(false);
           }
         };
@@ -2445,7 +2558,9 @@ export default function App() {
                   background: viewerConnected ? '#10b981' : '#f59e0b',
                 }} />
                 <span style={{ color: '#e2e8f0', fontWeight: 600 }}>
-                  {viewerConnected ? '客户桌面实时画面 (WebRTC)' : '正在连接客户桌面…'}
+                  {viewerConnected
+                    ? `客户桌面实时画面 (${viewerConnMode || 'WebRTC'})`
+                    : (viewerConnMode || '正在连接客户桌面…')}
                 </span>
                 <span style={{ color: '#64748b', fontSize: '11.5px' }}>
                   · 客户麦克风: {remoteShareState.micOn ? '已开启' : '已关闭'} · 系统音: {remoteShareState.systemAudio ? '有' : '无'}
@@ -2494,10 +2609,13 @@ export default function App() {
               />
               {!viewerConnected && (
                 <div style={{
-                  position: 'absolute', color: '#94a3b8', fontSize: '13px',
-                  background: 'rgba(15, 23, 34, 0.85)', padding: '8px 14px', borderRadius: '6px',
+                  position: 'absolute', color: viewerConnMode.includes('失败') ? '#fca5a5' : '#94a3b8', fontSize: '13px',
+                  background: 'rgba(15, 23, 34, 0.88)', padding: '8px 14px', borderRadius: '6px',
+                  border: viewerConnMode.includes('失败') ? '1px solid rgba(239, 68, 68, 0.4)' : 'none',
                 }}>
-                  正在建立 WebRTC 点对点视频流…
+                  {viewerConnMode.includes('失败')
+                    ? `${viewerConnMode} · 请在服务端配置 CF_TURN_KEY_ID / CF_TURN_API_TOKEN`
+                    : '正在建立 WebRTC 视频流（优先 P2P，跨区/代理自动走 TURN 中继）…'}
                 </div>
               )}
             </div>

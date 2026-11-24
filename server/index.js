@@ -1,6 +1,7 @@
 // GlassPad 服务端：单端口同源（静态页 + WebSocket 打字同步 + 管理员建房鉴权）
 // 部署到 Railway 后，一个 URL 同时提供页面与 wss:// 长连接
 const http = require('http');
+const https = require('https');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -34,9 +35,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.22';
+let pkgVersion = '1.0.23';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.22';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.23';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -63,7 +64,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 终极隐身加固：macOS Info.plist 内置 LSUIElement，启动全程零 Dock 图标、零左上角菜单栏、零 Cmd+Tab 痕迹\n2. 零首帧闪现启动 + Win11/macOS 全面停用会重置防截屏句柄的原生毛玻璃 API，全屏共享 100% 零泄漏\n3. 客户端单实例锁 + 彻底禁绝原生右键/Tooltip/Monaco 悬浮弹窗；支持边放音乐边说话(DTD 双讲检测)',
+  notes: process.env.RELEASE_NOTES || '1. 新增 Cloudflare Realtime TURN / Metered TURN 中继支持（含 TLS 443 穿透）与国内+海外多 STUN，解决台湾 IP、代理节点、跨国与公司内网共享黑屏\n2. 观看端新增自动重连与连接方式实时显示（P2P 直连 / TURN 中继）\n3. 全屏共享终极隐身加固（LSUIElement 零 Dock 菜单栏痕迹 + 零首帧闪现 + DTD 边放音乐边说话）',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -271,6 +272,164 @@ function sendJSON(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// ── WebRTC ICE/TURN 凭证动态签发与缓存（解决跨国/台湾 IP/代理节点/对称 NAT 黑屏） ──
+const FALLBACK_STUN_SERVERS = [
+  {
+    urls: [
+      'stun:stun.cloudflare.com:3478',
+      'stun:stun.miwifi.com:3478',
+      'stun:stun.qq.com:3478',
+      'stun:stun.l.google.com:19302',
+    ],
+  },
+];
+
+let cachedTurnResult = null; // { iceServers, provider, expiresAt }
+
+function httpsJsonRequest(urlStr, options = {}, bodyObj = null) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const payload = bodyObj ? JSON.stringify(bodyObj) : null;
+    const headers = { ...(options.headers || {}) };
+    if (payload) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = Buffer.byteLength(payload);
+    }
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        port: u.port || 443,
+        path: u.pathname + u.search,
+        method: options.method || 'GET',
+        headers,
+        timeout: 8000,
+      },
+      (res) => {
+        let raw = '';
+        res.on('data', (chunk) => { raw += chunk; });
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 200)}`));
+          }
+          try {
+            resolve(JSON.parse(raw));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+    req.on('timeout', () => { req.destroy(new Error('timeout')); });
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+// 过滤浏览器禁止的 53 端口 TURN URL（避免部分网络下等待 53 端口超时）
+function sanitizeIceServers(servers) {
+  if (!Array.isArray(servers)) return [];
+  return servers
+    .map((s) => {
+      if (!s || !s.urls) return null;
+      const list = (Array.isArray(s.urls) ? s.urls : [s.urls]).filter(
+        (u) => typeof u === 'string' && !/:53(\?|$)/.test(u)
+      );
+      if (list.length === 0) return null;
+      const out = { urls: list };
+      if (s.username) out.username = s.username;
+      if (s.credential) out.credential = s.credential;
+      return out;
+    })
+    .filter(Boolean);
+}
+
+async function getRtcConfig() {
+  const now = Date.now();
+  if (cachedTurnResult && cachedTurnResult.expiresAt > now) {
+    return {
+      iceServers: cachedTurnResult.iceServers,
+      hasTurn: cachedTurnResult.hasTurn,
+      provider: cachedTurnResult.provider,
+    };
+  }
+
+  // 方案 1（推荐）：Cloudflare Realtime TURN（每月免费 1TB，全球 Anycast 含台湾/香港/日本，支持 UDP/TCP/TLS 443）
+  const cfKeyId = (process.env.CF_TURN_KEY_ID || '').trim();
+  const cfApiToken = (process.env.CF_TURN_API_TOKEN || '').trim();
+  if (cfKeyId && cfApiToken) {
+    try {
+      const ttl = 86400; // 24 小时临时凭证
+      const data = await httpsJsonRequest(
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(cfKeyId)}/credentials/generate-ice-servers`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${cfApiToken}` },
+        },
+        { ttl }
+      );
+      const cfServers = sanitizeIceServers(data?.iceServers);
+      if (cfServers.length > 0) {
+        const merged = [...FALLBACK_STUN_SERVERS, ...cfServers];
+        cachedTurnResult = {
+          iceServers: merged,
+          hasTurn: true,
+          provider: 'cloudflare',
+          // 提前 2 小时刷新，或至少缓存 1 小时
+          expiresAt: now + Math.max(3600, ttl - 7200) * 1000,
+        };
+        return { iceServers: merged, hasTurn: true, provider: 'cloudflare' };
+      }
+    } catch (e) {
+      console.error('[rtc-config] Cloudflare TURN 凭证获取失败：', e.message);
+    }
+  }
+
+  // 方案 2（备选）：Metered.ca TURN（每月免费 50GB，支持 TCP/TLS 443）
+  const meteredApp = (process.env.METERED_APP_NAME || '').trim();
+  const meteredKey = (process.env.METERED_API_KEY || '').trim();
+  if (meteredApp && meteredKey) {
+    try {
+      const data = await httpsJsonRequest(
+        `https://${encodeURIComponent(meteredApp)}.metered.live/api/v1/turn/credentials?apiKey=${encodeURIComponent(meteredKey)}`
+      );
+      const mServers = sanitizeIceServers(data);
+      if (mServers.length > 0) {
+        const merged = [...FALLBACK_STUN_SERVERS, ...mServers];
+        cachedTurnResult = {
+          iceServers: merged,
+          hasTurn: true,
+          provider: 'metered',
+          expiresAt: now + 3600 * 1000,
+        };
+        return { iceServers: merged, hasTurn: true, provider: 'metered' };
+      }
+    } catch (e) {
+      console.error('[rtc-config] Metered TURN 凭证获取失败：', e.message);
+    }
+  }
+
+  // 方案 3（自定义 JSON）：通过环境变量 CUSTOM_ICE_SERVERS 直接传入 JSON 数组
+  const customRaw = (process.env.CUSTOM_ICE_SERVERS || '').trim();
+  if (customRaw) {
+    try {
+      const parsed = sanitizeIceServers(JSON.parse(customRaw));
+      if (parsed.length > 0) {
+        const merged = [...FALLBACK_STUN_SERVERS, ...parsed];
+        return { iceServers: merged, hasTurn: true, provider: 'custom' };
+      }
+    } catch (e) {
+      console.error('[rtc-config] CUSTOM_ICE_SERVERS 解析失败：', e.message);
+    }
+  }
+
+  return {
+    iceServers: FALLBACK_STUN_SERVERS,
+    hasTurn: false,
+    provider: 'stun-only',
+  };
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -299,6 +458,12 @@ const httpServer = http.createServer(async (req, res) => {
   // 0a. 客户端查询最新版本信息：GET /api/version（公开接口，供 Win/Mac 客户端检查更新）
   if (req.method === 'GET' && url.pathname === '/api/version') {
     return sendJSON(res, 200, appRelease);
+  }
+
+  // 0a-2. 动态签发 WebRTC ICE 服务器列表（国内+海外 STUN + Cloudflare Realtime TURN / Metered TURN 中继）：GET /api/rtc-config
+  if (req.method === 'GET' && url.pathname === '/api/rtc-config') {
+    const rtcConfig = await getRtcConfig();
+    return sendJSON(res, 200, rtcConfig);
   }
 
   // 0b. 管理员发布/修改客户端版本与下载链接：POST /api/version
