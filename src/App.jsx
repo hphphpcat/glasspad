@@ -403,6 +403,7 @@ function clampFontSize(val) {
 }
 
 // 动态注入局部字号 Monaco inlineClassName 样式，实现选中文字单独放大/缩小
+// 注意：不写死 line-height: 28px，改为 inherit，由 Monaco 根据当前文档最大字号动态放宽行高，避免 24–28px 大字上下重叠裁切
 const injectedInlineSizeClasses = new Set();
 function getInlineSizeClassName(size) {
   const s = clampFontSize(size);
@@ -415,7 +416,7 @@ function getInlineSizeClassName(size) {
       styleEl.id = 'gp-inline-size-styles';
       document.head.appendChild(styleEl);
     }
-    styleEl.textContent += `.monaco-editor .view-line span.${className}, .monaco-editor .view-line span.${className} span { font-size: ${s}px !important; line-height: 28px !important; }\n`;
+    styleEl.textContent += `.monaco-editor .view-line span.${className}, .monaco-editor .view-line span.${className} span { font-size: ${s}px !important; line-height: inherit !important; }\n`;
     injectedInlineSizeClasses.add(className);
   }
   return className;
@@ -762,7 +763,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.28';
+  let currentVersion = '1.0.29';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -895,6 +896,8 @@ export default function App() {
   const [frostedGlass, setFrostedGlass] = useState(() => localStorage.getItem('pad_frost_v2') === 'true');
   // 导师端局部文字样式工具条状态（字号/加粗/颜色均仅作用于选中文本，客户端无修改入口）
   const [selectionFontSize, setSelectionFontSize] = useState(String(DEFAULT_FONT_SIZE));
+  const [editorMaxFontSize, setEditorMaxFontSize] = useState(DEFAULT_FONT_SIZE);
+  const [editorWrapCols, setEditorWrapCols] = useState(0);
   const [pickerColor, setPickerColor] = useState('#34d399');
   const [hasSelection, setHasSelection] = useState(false);
   const [colorTip, setColorTip] = useState('');
@@ -942,6 +945,7 @@ export default function App() {
 
   const wsRef = useRef(null);
   const myClientIdRef = useRef('');
+  const editorContainerRef = useRef(null);
   const editorRef = useRef(null);
   const isRemote = useRef(false);
   const remoteSelDecorations = useRef(null); // 对方选区的高亮装饰集合
@@ -3061,6 +3065,62 @@ export default function App() {
     boldMarksDecorations.current.set(decorations);
   };
 
+  // 根据文档当前最大局部字号 + 编辑器实际内容宽度，计算安全软换行基准：
+  // Monaco 的 wordWrap 按全局 fontSize(15px) 测算单行字符数，用 inlineClassName 局部放大到 22-28px 后实际像素宽度会超出视口右侧。
+  // 动态计算按最大字号缩放后的 wordWrapColumn + 同步放宽 lineHeight，彻底杜绝网页端/客户端大字体溢出屏幕或上下重叠！
+  const syncEditorWrapForSizeMarks = (marks) => {
+    let maxSize = DEFAULT_FONT_SIZE;
+    for (const m of marks || []) {
+      if (m && Number(m.size) > maxSize) maxSize = clampFontSize(m.size);
+    }
+    setEditorMaxFontSize(maxSize);
+
+    const editor = editorRef.current;
+    if (!editor) return;
+    if (maxSize <= DEFAULT_FONT_SIZE) {
+      setEditorWrapCols(0);
+      try {
+        editor.updateOptions({
+          wordWrap: 'on',
+          lineHeight: 28,
+        });
+      } catch {}
+      return;
+    }
+
+    const layoutInfo = editor.getLayoutInfo?.();
+    const contentWidth = layoutInfo?.contentWidth || Math.max(240, (editorContainerRef.current?.clientWidth || 600) - 70);
+    // 等宽字体在 15px 下约 9px/半角字符；大字号按比例放大并预留 14% 保险余量（兼顾中英文混排与加粗）
+    const baseCharWidth = editor.getOption?.(50)?.typicalHalfwidthCharacterWidth || 9; // EditorOption.fontInfo = 50
+    const scaledCharWidth = baseCharWidth * (maxSize / DEFAULT_FONT_SIZE) * 1.12;
+    const safeCols = Math.max(12, Math.floor((contentWidth - 18) / Math.max(6, scaledCharWidth)));
+    const safeLineHeight = Math.max(28, Math.ceil(maxSize * 1.52));
+
+    setEditorWrapCols(safeCols);
+    try {
+      editor.updateOptions({
+        wordWrap: 'wordWrapColumn',
+        wordWrapColumn: safeCols,
+        lineHeight: safeLineHeight,
+      });
+    } catch {}
+  };
+
+  // 窗口缩放、分屏显隐切换、或浏览器缩放时，同步重算大字体下的安全换行列数
+  useEffect(() => {
+    const el = editorContainerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      if (editorRef.current) {
+        editorRef.current.layout();
+        syncEditorWrapForSizeMarks(sizeMarksRef.current);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // 将局部字号区间渲染为 Monaco inlineClassName 装饰
   const renderSizeMarks = (marks) => {
     const editor = editorRef.current;
@@ -3090,6 +3150,7 @@ export default function App() {
       });
     }
     sizeMarksDecorations.current.set(decorations);
+    syncEditorWrapForSizeMarks(marks);
   };
 
   // 获取导师端当前有效选区：优先取编辑器实时非空选区，若因点击顶栏/弹出颜色面板短暂失焦则回退到最近一次非空选区并恢复
@@ -3647,7 +3708,7 @@ export default function App() {
               </span>
             )}
 
-            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', maxWidth: '100%' }}>
               {colorTip && (
                 <span style={{ color: '#f59e0b', fontSize: '11.5px', whiteSpace: 'nowrap' }}>
                   {colorTip}
@@ -3894,6 +3955,7 @@ export default function App() {
 
         {/* 提词编辑器区（客户端只读，实时渲染导师标注的局部文字颜色） */}
         <div
+          ref={editorContainerRef}
           style={{
             flex: 1,
             minWidth: 0,
@@ -3947,7 +4009,10 @@ export default function App() {
             if (remoteCursorsRef.current.size > 0) renderAllRemoteCursors();
             monaco.editor.setTheme('glasspad-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
-            requestAnimationFrame(() => editor.layout());
+            requestAnimationFrame(() => {
+              editor.layout();
+              syncEditorWrapForSizeMarks(sizeMarksRef.current);
+            });
             // 导师端注册加粗快捷键
             if (!isClientApp) {
               editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, handleToggleSelectionBold);
@@ -4023,14 +4088,15 @@ export default function App() {
             automaticLayout: true,
             fontFamily: codeFont,
             fontSize: DEFAULT_FONT_SIZE,
-            lineHeight: 28,
+            lineHeight: Math.max(28, Math.ceil(editorMaxFontSize * 1.52)),
             padding: { top: 8, bottom: 16 },
             lineNumbersMinChars: 4,
             glyphMargin: false,
             folding: false,
             disableMonospaceOptimizations: true,
             fontLigatures: false,
-            wordWrap: 'on',
+            wordWrap: editorWrapCols > 0 ? 'wordWrapColumn' : 'on',
+            ...(editorWrapCols > 0 ? { wordWrapColumn: editorWrapCols } : {}),
             wrappingStrategy: 'advanced',
             minimap: { enabled: false },
             stickyScroll: { enabled: false },

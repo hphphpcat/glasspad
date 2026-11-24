@@ -93,9 +93,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.28';
+let pkgVersion = '1.0.29';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.28';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.29';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -125,7 +125,7 @@ let appRelease = {
   minNativeVersion: DEFAULT_MIN_NATIVE_VERSION,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 服务端性能优化：房间持久化升级为防抖异步原子落盘（零事件循环阻塞、重启零损毁）；静态资源开启 Brotli/Gzip 压缩（体积降 70%+）与长效强缓存\n2. 安全与风控加固：/api/rtc-config 接入房间凭证鉴权防止 Cloudflare TURN 流量被盗刷；升级常量时间密钥校验、IP 防爆破限流与 WebSocket 2MB 载荷保护\n3. 更新体系升级：新增 minNativeVersion 原生外壳门控，底层原生音频/隐身改动自动引导完整包更新，纯前端改动继续 1 秒极速热更新',
+  notes: process.env.RELEASE_NOTES || '1. 修复局部字体放大后网页端/客户端文字溢出右侧屏幕与上下行重叠问题：按文档最大字号与实时视口宽度动态重算软换行列数与行高，支持窗口缩放与分屏自适应\n2. 导师端顶栏右侧工具条支持自动换行，避免窄屏/浏览器放大时右侧控件溢出屏幕',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
