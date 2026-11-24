@@ -35,9 +35,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.23';
+let pkgVersion = '1.0.24';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.23';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.24';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -64,7 +64,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增 Cloudflare Realtime TURN / Metered TURN 中继支持（含 TLS 443 穿透）与国内+海外多 STUN，解决台湾 IP、代理节点、跨国与公司内网共享黑屏\n2. 观看端新增自动重连与连接方式实时显示（P2P 直连 / TURN 中继）\n3. 全屏共享终极隐身加固（LSUIElement 零 Dock 菜单栏痕迹 + 零首帧闪现 + DTD 边放音乐边说话）',
+  notes: process.env.RELEASE_NOTES || '1. 新增导师端开麦（独立 WebRTC 语音通话通道 + Cloudflare TURN 跨区穿透），客户端自动收听并可一键静音\n2. 优化光标名字标签：仅鼠标主动点击/框选时显示名字，打字/删除/粘贴不再被动弹出名字\n3. 根治跨区/台湾 IP 共享黑屏：修复 ICE 竞态丢包 + 8 秒无画面自动切换强制 TURN 中继 + 顶栏一键切中继线路',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -184,6 +184,7 @@ function loadRooms() {
         sharerId: null,
         sharerMicOn: false,
         sharerSystemAudio: false,
+        voiceSpeakers: new Set(),
         createdAt: r.createdAt || r.lastActive || Date.now(),
         lastActive: r.lastActive || Date.now(),
       });
@@ -213,6 +214,7 @@ function getOrCreateRoom(roomId, token, note = '') {
       sharerId: null,
       sharerMicOn: false,
       sharerSystemAudio: false,
+      voiceSpeakers: new Set(),
       createdAt: now,
       lastActive: now,
     });
@@ -576,14 +578,21 @@ const httpServer = http.createServer(async (req, res) => {
     if (err && !path.extname(filePath)) {
       fs.readFile(path.join(DIST_DIR, 'index.html'), (err2, html) => {
         if (err2) { res.writeHead(404); res.end('Not Found'); return; }
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+        });
         res.end(html);
       });
       return;
     }
     if (err) { res.writeHead(404); res.end('Not Found'); return; }
     const ext = path.extname(abs).toLowerCase();
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    const headers = { 'Content-Type': MIME[ext] || 'application/octet-stream' };
+    if (ext === '.html') {
+      headers['Cache-Control'] = 'no-cache, no-store, must-revalidate';
+    }
+    res.writeHead(200, headers);
     res.end(data);
   });
 });
@@ -643,7 +652,22 @@ wss.on('connection', (ws, req) => {
     });
   };
 
-  // 下发当前房间文字内容、局部字体颜色标记、自身的 clientId 以及当前屏幕共享状态
+  // 广播当前正在开麦的导师/发言者列表
+  const broadcastVoiceState = () => {
+    if (!room.voiceSpeakers) room.voiceSpeakers = new Set();
+    const speakers = Array.from(room.voiceSpeakers).map((id) => {
+      const targetWs = findWsByClientId(id);
+      const info = targetWs ? room.clients.get(targetWs) : null;
+      return { id, name: info?.name || '导师' };
+    });
+    const msg = JSON.stringify({ type: 'VOICE_STATE', payload: { speakers } });
+    room.clients.forEach((_, c) => {
+      if (c.readyState === 1) c.send(msg);
+    });
+  };
+
+  // 下发当前房间文字内容、局部字体颜色标记、自身的 clientId、屏幕共享状态以及当前开麦导师列表
+  if (!room.voiceSpeakers) room.voiceSpeakers = new Set();
   ws.send(JSON.stringify({
     type: 'INIT',
     payload: {
@@ -659,6 +683,11 @@ wss.on('connection', (ws, req) => {
         micOn: Boolean(room.sharerMicOn),
         systemAudio: Boolean(room.sharerSystemAudio),
       },
+      voiceSpeakers: Array.from(room.voiceSpeakers).map((id) => {
+        const targetWs = findWsByClientId(id);
+        const info = targetWs ? room.clients.get(targetWs) : null;
+        return { id, name: info?.name || '导师' };
+      }),
     },
   }));
   broadcastPresence();
@@ -727,7 +756,7 @@ wss.on('connection', (ws, req) => {
         }
       });
     } else if (msg.type === 'SEL_SYNC') {
-      // 光标与选区同步（CoderPad 风格）：附带发送者的 clientId、姓名与代表色广播给房间内其他成员
+      // 光标与选区同步（CoderPad 风格）：附带发送者的 clientId、姓名、代表色与是否主动点击标志(showFlag)广播给房间内其他成员
       const senderInfo = room.clients.get(ws) || { id: clientId, name: userName, color };
       const outMsg = JSON.stringify({
         type: 'SEL_SYNC',
@@ -736,6 +765,7 @@ wss.on('connection', (ws, req) => {
           name: senderInfo.name,
           color: senderInfo.color,
           selections: Array.isArray(msg.payload?.selections) ? msg.payload.selections : [],
+          showFlag: Boolean(msg.payload?.showFlag),
         },
       });
       room.clients.forEach((_, c) => {
@@ -776,13 +806,16 @@ wss.on('connection', (ws, req) => {
         broadcastShareState();
       }
     } else if (msg.type === 'SCREEN_VIEWER_JOIN') {
-      // 观看端（导师）请求订阅画面，转发给当前共享方以触发 WebRTC Offer
+      // 观看端（导师）请求订阅画面，转发给当前共享方以触发 WebRTC Offer（透传 forceRelay 强制 TURN 中继标志）
       if (room.sharerId) {
         const sharerWs = findWsByClientId(room.sharerId);
         if (sharerWs) {
           sharerWs.send(JSON.stringify({
             type: 'SCREEN_VIEWER_JOIN',
-            payload: { viewerId: clientId },
+            payload: {
+              viewerId: clientId,
+              forceRelay: Boolean(msg.payload?.forceRelay),
+            },
           }));
         }
       }
@@ -809,11 +842,65 @@ wss.on('connection', (ws, req) => {
           },
         }));
       }
+    } else if (msg.type === 'VOICE_START') {
+      // 导师端开启麦克风语音通话
+      if (!room.voiceSpeakers) room.voiceSpeakers = new Set();
+      room.voiceSpeakers.add(clientId);
+      room.lastActive = Date.now();
+      broadcastVoiceState();
+    } else if (msg.type === 'VOICE_STOP') {
+      if (room.voiceSpeakers?.has(clientId)) {
+        room.voiceSpeakers.delete(clientId);
+        broadcastVoiceState();
+      }
+    } else if (msg.type === 'VOICE_LISTENER_JOIN') {
+      const targetWs = findWsByClientId(msg.payload?.speakerId);
+      if (targetWs) {
+        targetWs.send(JSON.stringify({
+          type: 'VOICE_LISTENER_JOIN',
+          payload: { listenerId: clientId, forceRelay: Boolean(msg.payload?.forceRelay) },
+        }));
+      }
+    } else if (msg.type === 'VOICE_LISTENER_LEAVE') {
+      const targetWs = findWsByClientId(msg.payload?.speakerId);
+      if (targetWs) {
+        targetWs.send(JSON.stringify({
+          type: 'VOICE_LISTENER_LEAVE',
+          payload: { listenerId: clientId },
+        }));
+      }
+    } else if (msg.type === 'VOICE_SIGNAL') {
+      // 独立语音通道的 WebRTC 信令转发（与屏幕共享 RTC_SIGNAL 完全隔离）
+      const targetWs = findWsByClientId(msg.payload?.to);
+      if (targetWs) {
+        targetWs.send(JSON.stringify({
+          type: 'VOICE_SIGNAL',
+          payload: {
+            from: clientId,
+            sdp: msg.payload.sdp || null,
+            candidate: msg.payload.candidate || null,
+          },
+        }));
+      }
     }
   });
 
   ws.on('close', () => {
     room.clients.delete(ws);
+    if (room.voiceSpeakers?.has(clientId)) {
+      room.voiceSpeakers.delete(clientId);
+      broadcastVoiceState();
+    } else if (room.voiceSpeakers?.size > 0) {
+      room.voiceSpeakers.forEach((speakerId) => {
+        const speakerWs = findWsByClientId(speakerId);
+        if (speakerWs) {
+          speakerWs.send(JSON.stringify({
+            type: 'VOICE_LISTENER_LEAVE',
+            payload: { listenerId: clientId },
+          }));
+        }
+      });
+    }
     if (room.sharerId === clientId) {
       room.sharerId = null;
       room.sharerMicOn = false;

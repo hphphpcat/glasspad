@@ -30,14 +30,16 @@ function getHttpApiBase(wsBaseOverride) {
 
 async function fetchRtcIceConfig(wsBaseOverride, forceRefresh = false) {
   const now = Date.now();
-  if (!forceRefresh && cachedRtcConfig && now - cachedRtcConfig.fetchedAt < 10 * 60 * 1000) {
+  // 只有当已拿到 TURN 凭证时才缓存 10 分钟；stun-only 只缓存 5 秒避免卡死在旧配置上
+  const ttlMs = cachedRtcConfig?.hasTurn ? 10 * 60 * 1000 : 5 * 1000;
+  if (!forceRefresh && cachedRtcConfig && now - cachedRtcConfig.fetchedAt < ttlMs) {
     return cachedRtcConfig;
   }
   try {
     const apiBase = getHttpApiBase(wsBaseOverride);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(`${apiBase}/api/rtc-config`, { signal: controller.signal });
+    const res = await fetch(`${apiBase}/api/rtc-config`, { signal: controller.signal, cache: 'no-store' });
     clearTimeout(timer);
     if (res.ok) {
       const data = await res.json();
@@ -516,7 +518,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.23';
+  let currentVersion = '1.0.24';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -662,8 +664,15 @@ export default function App() {
   const [remoteShareState, setRemoteShareState] = useState({ active: false, sharerId: null, micOn: false, systemAudio: false });
   const [showViewerPane, setShowViewerPane] = useState(true);
   const [viewerConnected, setViewerConnected] = useState(false);
-  const [viewerConnMode, setViewerConnMode] = useState(''); // '' | 'P2P 直连' | 'TURN 中继' | 'NAT 穿透失败'
+  const [viewerConnMode, setViewerConnMode] = useState(''); // '' | 'P2P 直连' | 'TURN 中继' | '连接中…' | ...
+  const [viewerForceRelay, setViewerForceRelay] = useState(false); // 跨区/代理黑屏时一键或自动切换强制 TURN 中继
   const [viewerMuted, setViewerMuted] = useState(false);
+
+  // ── 导师端开麦语音通话状态（独立 WebRTC 音频通道，支持全房间听见导师声音） ──
+  const [mentorMicOn, setMentorMicOn] = useState(false);
+  const [mentorMicError, setMentorMicError] = useState('');
+  const [activeVoiceSpeakers, setActiveVoiceSpeakers] = useState([]); // [{ id, name }]
+  const [mentorVoiceMuted, setMentorVoiceMuted] = useState(false); // 收听端是否静音导师语音
 
   // ── 客户端版本与检查更新状态 ──
   const [appVersion, setAppVersion] = useState('1.0.0');
@@ -693,8 +702,15 @@ export default function App() {
   const shareSessionRef = useRef(null); // { displayStream, micStream, audioCtx, micTrack, sysAudioTrack, videoTrack, audioTrack, peers: Map<viewerId, { pc, pendingIce: [] }> }
   const speakerDuckedRef = useRef(false); // 开麦时是否已压低扬声器音量（避免外放被麦克风拾取产生重音）
   // 导师端观看屏幕用到的 WebRTC / Video 引用
-  const viewerPcRef = useRef(null); // { pc, sharerId, pendingIce: [], stream: MediaStream }
+  const viewerPcRef = useRef(null); // { pc, sharerId, pendingIce: [], stream: MediaStream, reconnectTimer, frameWatchTimer, forceRelay }
+  const earlyViewerIceRef = useRef(new Map()); // Map<sharerId, RTCIceCandidateInit[]> 缓存 offer await 期间提前到达的 ICE 候选，彻底消灭竞态丢包
   const remoteVideoRef = useRef(null);
+
+  // 导师开麦独立语音通道 WebRTC 引用
+  const mentorVoiceSessionRef = useRef(null); // { stream, audioTrack, peers: Map<listenerId, { pc, pendingIce: [] }> }
+  const voiceListenerPcsRef = useRef(new Map()); // Map<speakerId, { pc, audioEl, stream, pendingIce: [], reconnectTimer }>
+  const earlyVoiceIceRef = useRef(new Map()); // Map<speakerId, RTCIceCandidateInit[]>
+  const mentorVoiceMutedRef = useRef(false);
 
   // 桌面端：检测系统是否支持毛玻璃 + 启动时获取版本号并静默检查更新
   useEffect(() => {
@@ -823,6 +839,7 @@ export default function App() {
     const cur = viewerPcRef.current;
     if (cur) {
       if (cur.reconnectTimer) clearTimeout(cur.reconnectTimer);
+      if (cur.frameWatchTimer) clearTimeout(cur.frameWatchTimer);
       cur.pc.onicecandidate = null;
       cur.pc.ontrack = null;
       cur.pc.onconnectionstatechange = null;
@@ -852,16 +869,18 @@ export default function App() {
   };
 
   // ── 屏幕共享：为指定观看者创建 WebRTC Offer 并推流（共享端） ──
-  const createOfferForViewer = async (viewerId) => {
+  const createOfferForViewer = async (viewerId, forceRelay = false) => {
     const session = shareSessionRef.current;
     if (!session || !viewerId) return;
     removeViewerPeer(viewerId);
 
-    const rtcCfg = await fetchRtcIceConfig(wsBase);
+    const rtcCfg = await fetchRtcIceConfig(wsBase, forceRelay);
     if (shareSessionRef.current !== session || session.stopped) return;
 
+    const useRelayOnly = Boolean(forceRelay && rtcCfg.hasTurn);
     const pc = new RTCPeerConnection({
       iceServers: rtcCfg.iceServers,
+      iceTransportPolicy: useRelayOnly ? 'relay' : 'all',
       bundlePolicy: 'max-bundle',
       iceCandidatePoolSize: 2,
     });
@@ -1373,14 +1392,33 @@ export default function App() {
     try {
       if (sdp && sdp.type === 'offer') {
         closeViewerConnection();
-        const rtcCfg = await fetchRtcIceConfig(wsBase);
+        // 先占位 earlyViewerIceRef，避免 await fetchRtcIceConfig 期间到达的 ICE 候选全部被丢弃！
+        if (!earlyViewerIceRef.current.has(from)) {
+          earlyViewerIceRef.current.set(from, []);
+        }
+        const wantRelay = Boolean(viewerForceRelay);
+        setViewerConnMode(wantRelay ? 'TURN 强制中继连接中…' : '正在穿透网络…');
+
+        const rtcCfg = await fetchRtcIceConfig(wsBase, wantRelay);
+        const useRelayOnly = Boolean(wantRelay && rtcCfg.hasTurn);
         const pc = new RTCPeerConnection({
           iceServers: rtcCfg.iceServers,
+          iceTransportPolicy: useRelayOnly ? 'relay' : 'all',
           bundlePolicy: 'max-bundle',
           iceCandidatePoolSize: 2,
         });
         const remoteStream = new MediaStream();
-        const viewerState = { pc, sharerId: from, pendingIce: [], stream: remoteStream, reconnectTimer: null };
+        const earlyQueued = earlyViewerIceRef.current.get(from) || [];
+        earlyViewerIceRef.current.delete(from);
+        const viewerState = {
+          pc,
+          sharerId: from,
+          pendingIce: [...earlyQueued],
+          stream: remoteStream,
+          reconnectTimer: null,
+          frameWatchTimer: null,
+          forceRelay: useRelayOnly,
+        };
         viewerPcRef.current = viewerState;
 
         const detectConnMode = async () => {
@@ -1408,6 +1446,44 @@ export default function App() {
           } catch {}
         };
 
+        const requestJoinWithRelay = (relayFlag) => {
+          if (wsRef.current?.readyState === 1) {
+            wsRef.current.send(JSON.stringify({
+              type: 'SCREEN_VIEWER_JOIN',
+              payload: { forceRelay: Boolean(relayFlag) },
+            }));
+          }
+        };
+
+        // 看门狗：8 秒内如果还没真正解码出视频帧（videoWidth === 0），自动升级为「强制 TURN 中继 (TLS 443)」重连！
+        // 彻底解决跨区/台湾代理节点下 ICE 卡在 checking 或 P2P 假连通但黑屏的问题
+        viewerState.frameWatchTimer = setTimeout(() => {
+          if (viewerPcRef.current !== viewerState) return;
+          const v = remoteVideoRef.current;
+          const hasDecodedFrame = Boolean(v && v.videoWidth > 0 && v.videoHeight > 0);
+          if (hasDecodedFrame) return;
+          if (!viewerState.forceRelay && rtcCfg.hasTurn) {
+            setViewerForceRelay(true);
+            setViewerConnMode('P2P 超时，自动切换 TURN 中继…');
+            requestJoinWithRelay(true);
+          } else {
+            setViewerConnMode('未收到画面，正在重试 TURN 中继…');
+            requestJoinWithRelay(true);
+          }
+        }, 8000);
+
+        const tryPlayVideo = () => {
+          const v = remoteVideoRef.current;
+          if (!v) return;
+          v.srcObject = remoteStream;
+          v.play().catch(() => {
+            // 浏览器阻止带声音自动播放时，先自动静音确保画面能秒出（用户可点顶栏取消静音）
+            v.muted = true;
+            setViewerMuted(true);
+            v.play().catch(() => {});
+          });
+        };
+
         pc.ontrack = (ev) => {
           // 观看端压低 WebRTC JitterBuffer 延迟（目标 50ms），保持音画实时紧跟
           try {
@@ -1416,16 +1492,15 @@ export default function App() {
             }
           } catch {}
           if (ev.streams && ev.streams[0]) {
-            ev.streams[0].getTracks().forEach((t) => remoteStream.addTrack(t));
-          } else if (ev.track) {
+            ev.streams[0].getTracks().forEach((t) => {
+              if (!remoteStream.getTrackById(t.id)) remoteStream.addTrack(t);
+            });
+          } else if (ev.track && !remoteStream.getTrackById(ev.track.id)) {
             remoteStream.addTrack(ev.track);
           }
-          if (remoteVideoRef.current) {
-            remoteVideoRef.current.srcObject = remoteStream;
-            remoteVideoRef.current.play().catch(() => {});
-          }
-          setViewerConnected(true);
-          detectConnMode();
+          // 注意：不再在 ontrack 时立刻把 viewerConnected 设为 true（ontrack 只是 SDP 解析出轨道，此时 ICE 还没连上，画出来是黑屏！）
+          // 真正等到 ICE connected/completed 或 <video> onloadeddata 解码出首帧时才亮绿灯
+          tryPlayVideo();
         };
 
         pc.onicecandidate = (ev) => {
@@ -1437,25 +1512,30 @@ export default function App() {
           }
         };
 
-        const scheduleViewerReconnect = () => {
+        const scheduleViewerReconnect = (escalateToRelay = false) => {
           if (viewerPcRef.current !== viewerState) return;
           if (viewerState.reconnectTimer) return;
           viewerState.reconnectTimer = setTimeout(() => {
             viewerState.reconnectTimer = null;
-            if (viewerPcRef.current === viewerState && wsRef.current?.readyState === 1) {
-              wsRef.current.send(JSON.stringify({ type: 'SCREEN_VIEWER_JOIN' }));
+            if (viewerPcRef.current === viewerState) {
+              const nextRelay = Boolean(escalateToRelay || viewerState.forceRelay);
+              if (nextRelay) setViewerForceRelay(true);
+              requestJoinWithRelay(nextRelay);
             }
-          }, 3000);
+          }, 2500);
         };
 
         pc.oniceconnectionstatechange = () => {
           if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
             setViewerConnected(true);
             detectConnMode();
+            tryPlayVideo();
+          } else if (pc.iceConnectionState === 'checking') {
+            setViewerConnMode(useRelayOnly ? 'TURN 中继握手中…' : '正在穿透网络…');
           } else if (pc.iceConnectionState === 'failed') {
             setViewerConnected(false);
-            setViewerConnMode(rtcCfg.hasTurn ? '中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
-            scheduleViewerReconnect();
+            setViewerConnMode(rtcCfg.hasTurn ? '切换 TURN 中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
+            scheduleViewerReconnect(rtcCfg.hasTurn);
           }
         };
 
@@ -1463,18 +1543,23 @@ export default function App() {
           if (pc.connectionState === 'connected') {
             setViewerConnected(true);
             detectConnMode();
+            tryPlayVideo();
           } else if (pc.connectionState === 'failed') {
             setViewerConnected(false);
-            setViewerConnMode(rtcCfg.hasTurn ? '中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
-            scheduleViewerReconnect();
+            setViewerConnMode(rtcCfg.hasTurn ? '切换 TURN 中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
+            scheduleViewerReconnect(rtcCfg.hasTurn);
           } else if (pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
             setViewerConnected(false);
           }
         };
 
         await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-        while (viewerState.pendingIce.length > 0) {
-          const c = viewerState.pendingIce.shift();
+        // 把 offer 期间以及 await 期间提前到达的所有 ICE 候选一次性补进去
+        const extraEarly = earlyViewerIceRef.current.get(from) || [];
+        earlyViewerIceRef.current.delete(from);
+        const allPending = [...viewerState.pendingIce, ...extraEarly];
+        viewerState.pendingIce = [];
+        for (const c of allPending) {
           await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
         }
         const answer = await pc.createAnswer();
@@ -1485,12 +1570,19 @@ export default function App() {
             payload: { to: from, sdp: pc.localDescription },
           }));
         }
-      } else if (candidate && viewerPcRef.current && viewerPcRef.current.sharerId === from) {
+      } else if (candidate) {
         const vState = viewerPcRef.current;
-        if (vState.pc.remoteDescription) {
-          await vState.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+        if (vState && vState.sharerId === from) {
+          if (vState.pc.remoteDescription) {
+            await vState.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+          } else {
+            vState.pendingIce.push(candidate);
+          }
         } else {
-          vState.pendingIce.push(candidate);
+          // viewerPcRef 还在 await fetchRtcIceConfig 尚未创建完成：先暂存，绝不丢弃！
+          const q = earlyViewerIceRef.current.get(from) || [];
+          q.push(candidate);
+          earlyViewerIceRef.current.set(from, q);
         }
       }
     } catch (err) {
@@ -1498,20 +1590,349 @@ export default function App() {
     }
   };
 
-  // 组件卸载时释放共享资源
+  // ── 导师开麦独立语音通道（WebRTC，走同一 Cloudflare TURN 中继，支持跨区/代理穿透） ──
+  const removeVoiceListenerPeer = (listenerId) => {
+    const sess = mentorVoiceSessionRef.current;
+    if (!sess) return;
+    const entry = sess.peers.get(listenerId);
+    if (entry) {
+      entry.pc.onicecandidate = null;
+      entry.pc.onconnectionstatechange = null;
+      try { entry.pc.close(); } catch {}
+      sess.peers.delete(listenerId);
+    }
+  };
+
+  const stopMentorMic = (notifyServer = true) => {
+    const sess = mentorVoiceSessionRef.current;
+    if (sess) {
+      sess.stopped = true;
+      sess.peers.forEach((entry) => {
+        entry.pc.onicecandidate = null;
+        entry.pc.onconnectionstatechange = null;
+        try { entry.pc.close(); } catch {}
+      });
+      sess.peers.clear();
+      try { sess.stream?.getTracks?.().forEach((t) => t.stop()); } catch {}
+      mentorVoiceSessionRef.current = null;
+    }
+    setMentorMicOn(false);
+    setMentorMicError('');
+    if (notifyServer && wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify({ type: 'VOICE_STOP' }));
+    }
+  };
+
+  const createVoiceOfferForListener = async (listenerId, forceRelay = false) => {
+    const sess = mentorVoiceSessionRef.current;
+    if (!sess || sess.stopped || !listenerId) return;
+    removeVoiceListenerPeer(listenerId);
+
+    const rtcCfg = await fetchRtcIceConfig(wsBase, forceRelay);
+    if (mentorVoiceSessionRef.current !== sess || sess.stopped) return;
+
+    const useRelayOnly = Boolean(forceRelay && rtcCfg.hasTurn);
+    const pc = new RTCPeerConnection({
+      iceServers: rtcCfg.iceServers,
+      iceTransportPolicy: useRelayOnly ? 'relay' : 'all',
+      bundlePolicy: 'max-bundle',
+      iceCandidatePoolSize: 2,
+    });
+    const entry = { pc, pendingIce: [] };
+    sess.peers.set(listenerId, entry);
+
+    if (sess.audioTrack) {
+      const sender = pc.addTrack(sess.audioTrack, sess.stream);
+      try {
+        const params = sender.getParameters() || {};
+        if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+        params.encodings[0].maxBitrate = 64_000;
+        params.encodings[0].priority = 'high';
+        params.encodings[0].networkPriority = 'high';
+        sender.setParameters(params).catch(() => {});
+      } catch {}
+    }
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate && wsRef.current?.readyState === 1) {
+        wsRef.current.send(JSON.stringify({
+          type: 'VOICE_SIGNAL',
+          payload: { to: listenerId, candidate: ev.candidate.toJSON() },
+        }));
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+        removeVoiceListenerPeer(listenerId);
+      }
+    };
+
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      if (wsRef.current?.readyState === 1) {
+        wsRef.current.send(JSON.stringify({
+          type: 'VOICE_SIGNAL',
+          payload: { to: listenerId, sdp: pc.localDescription },
+        }));
+      }
+    } catch {
+      removeVoiceListenerPeer(listenerId);
+    }
+  };
+
+  const startMentorMic = async () => {
+    if (mentorVoiceSessionRef.current) return;
+    setMentorMicError('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 48000,
+        },
+      });
+      const audioTrack = stream.getAudioTracks()[0] || null;
+      if (!audioTrack) {
+        stream.getTracks().forEach((t) => t.stop());
+        setMentorMicError('未检测到可用麦克风');
+        return;
+      }
+      if ('contentHint' in audioTrack) {
+        try { audioTrack.contentHint = 'speech'; } catch {}
+      }
+      const sess = { stopped: false, stream, audioTrack, peers: new Map() };
+      mentorVoiceSessionRef.current = sess;
+      audioTrack.addEventListener('ended', () => {
+        if (!sess.stopped) stopMentorMic(true);
+      });
+      setMentorMicOn(true);
+      if (wsRef.current?.readyState === 1) {
+        wsRef.current.send(JSON.stringify({ type: 'VOICE_START' }));
+      }
+    } catch (err) {
+      setMentorMicError(err?.name === 'NotAllowedError' ? '请允许浏览器使用麦克风权限' : '开启麦克风失败');
+    }
+  };
+
+  const toggleMentorMic = () => {
+    if (mentorMicOn) stopMentorMic(true);
+    else startMentorMic();
+  };
+
+  const closeVoiceListener = (speakerId) => {
+    const cur = voiceListenerPcsRef.current.get(speakerId);
+    if (!cur) return;
+    if (cur.reconnectTimer) clearTimeout(cur.reconnectTimer);
+    cur.pc.onicecandidate = null;
+    cur.pc.ontrack = null;
+    cur.pc.oniceconnectionstatechange = null;
+    cur.pc.onconnectionstatechange = null;
+    try { cur.pc.close(); } catch {}
+    if (cur.audioEl) {
+      try {
+        cur.audioEl.pause();
+        cur.audioEl.srcObject = null;
+        cur.audioEl.remove();
+      } catch {}
+    }
+    voiceListenerPcsRef.current.delete(speakerId);
+    earlyVoiceIceRef.current.delete(speakerId);
+  };
+
+  const closeAllVoiceListeners = () => {
+    Array.from(voiceListenerPcsRef.current.keys()).forEach((id) => closeVoiceListener(id));
+  };
+
+  const handleVoiceSignal = async ({ from, sdp, candidate }) => {
+    if (!from) return;
+
+    // A. 如果本地是开麦发言方（导师端）：接收收听端的 Answer 或 ICE
+    if (mentorVoiceSessionRef.current && mentorVoiceSessionRef.current.peers.has(from)) {
+      const entry = mentorVoiceSessionRef.current.peers.get(from);
+      try {
+        if (sdp && sdp.type === 'answer') {
+          await entry.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+          while (entry.pendingIce.length > 0) {
+            const c = entry.pendingIce.shift();
+            await entry.pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+          }
+        } else if (candidate) {
+          if (entry.pc.remoteDescription) {
+            await entry.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+          } else {
+            entry.pendingIce.push(candidate);
+          }
+        }
+      } catch {}
+      return;
+    }
+
+    // B. 收听方（客户端 / 同房其他成员）：接收导师发来的语音 Offer 或 ICE
+    try {
+      if (sdp && sdp.type === 'offer') {
+        closeVoiceListener(from);
+        if (!earlyVoiceIceRef.current.has(from)) {
+          earlyVoiceIceRef.current.set(from, []);
+        }
+        const rtcCfg = await fetchRtcIceConfig(wsBase);
+        const pc = new RTCPeerConnection({
+          iceServers: rtcCfg.iceServers,
+          bundlePolicy: 'max-bundle',
+          iceCandidatePoolSize: 2,
+        });
+        const remoteStream = new MediaStream();
+        const audioEl = document.createElement('audio');
+        audioEl.autoplay = true;
+        audioEl.playsInline = true;
+        audioEl.muted = Boolean(mentorVoiceMutedRef.current);
+        audioEl.style.display = 'none';
+        document.body.appendChild(audioEl);
+
+        const earlyQueued = earlyVoiceIceRef.current.get(from) || [];
+        earlyVoiceIceRef.current.delete(from);
+        const lState = { pc, audioEl, stream: remoteStream, pendingIce: [...earlyQueued], reconnectTimer: null };
+        voiceListenerPcsRef.current.set(from, lState);
+
+        pc.ontrack = (ev) => {
+          try {
+            if (ev.receiver && 'playoutDelayHint' in ev.receiver) ev.receiver.playoutDelayHint = 0.04;
+          } catch {}
+          if (ev.streams && ev.streams[0]) {
+            ev.streams[0].getTracks().forEach((t) => {
+              if (!remoteStream.getTrackById(t.id)) remoteStream.addTrack(t);
+            });
+          } else if (ev.track && !remoteStream.getTrackById(ev.track.id)) {
+            remoteStream.addTrack(ev.track);
+          }
+          audioEl.srcObject = remoteStream;
+          audioEl.muted = Boolean(mentorVoiceMutedRef.current);
+          audioEl.play().catch(() => {});
+        };
+
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate && wsRef.current?.readyState === 1) {
+            wsRef.current.send(JSON.stringify({
+              type: 'VOICE_SIGNAL',
+              payload: { to: from, candidate: ev.candidate.toJSON() },
+            }));
+          }
+        };
+
+        const scheduleVoiceRetry = () => {
+          if (voiceListenerPcsRef.current.get(from) !== lState || lState.reconnectTimer) return;
+          lState.reconnectTimer = setTimeout(() => {
+            lState.reconnectTimer = null;
+            if (voiceListenerPcsRef.current.get(from) === lState && wsRef.current?.readyState === 1) {
+              wsRef.current.send(JSON.stringify({
+                type: 'VOICE_LISTENER_JOIN',
+                payload: { speakerId: from, forceRelay: rtcCfg.hasTurn },
+              }));
+            }
+          }, 2500);
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          if (pc.iceConnectionState === 'failed') scheduleVoiceRetry();
+        };
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'failed') scheduleVoiceRetry();
+        };
+
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        const extraEarly = earlyVoiceIceRef.current.get(from) || [];
+        earlyVoiceIceRef.current.delete(from);
+        const allPending = [...lState.pendingIce, ...extraEarly];
+        lState.pendingIce = [];
+        for (const c of allPending) {
+          await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+        }
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        if (wsRef.current?.readyState === 1) {
+          wsRef.current.send(JSON.stringify({
+            type: 'VOICE_SIGNAL',
+            payload: { to: from, sdp: pc.localDescription },
+          }));
+        }
+      } else if (candidate) {
+        const lState = voiceListenerPcsRef.current.get(from);
+        if (lState) {
+          if (lState.pc.remoteDescription) {
+            await lState.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+          } else {
+            lState.pendingIce.push(candidate);
+          }
+        } else {
+          const q = earlyVoiceIceRef.current.get(from) || [];
+          q.push(candidate);
+          earlyVoiceIceRef.current.set(from, q);
+        }
+      }
+    } catch (err) {
+      console.error('[voice] signal error:', err);
+    }
+  };
+
+  // 组件卸载时释放共享与语音资源
   useEffect(() => {
     return () => {
       stopScreenShare(false);
       closeViewerConnection();
+      stopMentorMic(false);
+      closeAllVoiceListeners();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 同步静音开关到所有正在播放的导师语音 <audio> 元素
+  useEffect(() => {
+    mentorVoiceMutedRef.current = mentorVoiceMuted;
+    voiceListenerPcsRef.current.forEach((entry) => {
+      if (entry.audioEl) {
+        entry.audioEl.muted = mentorVoiceMuted;
+        if (!mentorVoiceMuted) entry.audioEl.play().catch(() => {});
+      }
+    });
+  }, [mentorVoiceMuted]);
+
+  // 自动订阅房间内正在开麦的导师语音（排除自己）
+  useEffect(() => {
+    if (!wsConnected) {
+      closeAllVoiceListeners();
+      return;
+    }
+    const activeIds = new Set(
+      (activeVoiceSpeakers || [])
+        .map((s) => s?.id)
+        .filter((id) => id && id !== myClientIdRef.current)
+    );
+    // 清理已闭麦的导师连接
+    Array.from(voiceListenerPcsRef.current.keys()).forEach((id) => {
+      if (!activeIds.has(id)) closeVoiceListener(id);
+    });
+    // 订阅新开麦的导师
+    activeIds.forEach((speakerId) => {
+      if (!voiceListenerPcsRef.current.has(speakerId)) {
+        wsRef.current?.send(JSON.stringify({
+          type: 'VOICE_LISTENER_JOIN',
+          payload: { speakerId, forceRelay: false },
+        }));
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeVoiceSpeakers, wsConnected]);
 
   // 导师端：当房间有活跃屏幕共享且打开了预览面板时，自动发起观看请求
   useEffect(() => {
     if (isClientApp) return;
     if (remoteShareState.active && showViewerPane && wsConnected) {
-      wsRef.current?.send(JSON.stringify({ type: 'SCREEN_VIEWER_JOIN' }));
+      wsRef.current?.send(JSON.stringify({
+        type: 'SCREEN_VIEWER_JOIN',
+        payload: { forceRelay: viewerForceRelay },
+      }));
     } else {
       closeViewerConnection();
       if (remoteShareState.active && !showViewerPane && wsConnected) {
@@ -1566,6 +1987,10 @@ export default function App() {
             },
           }));
         }
+        // 若导师端本地正在开麦（断线重连后），自动重新广播开麦状态
+        if (mentorVoiceSessionRef.current && !mentorVoiceSessionRef.current.stopped) {
+          ws.send(JSON.stringify({ type: 'VOICE_START' }));
+        }
       };
 
       ws.onmessage = (e) => {
@@ -1577,10 +2002,15 @@ export default function App() {
           setParticipants([]);
           stopScreenShare(false);
           closeViewerConnection();
+          stopMentorMic(false);
+          closeAllVoiceListeners();
         } else if (type === 'INIT' || type === 'TEXT_SYNC') {
           if (payload.clientId) myClientIdRef.current = payload.clientId;
           if (payload.screenShare) {
             setRemoteShareState(payload.screenShare);
+          }
+          if (Array.isArray(payload.voiceSpeakers)) {
+            setActiveVoiceSpeakers(payload.voiceSpeakers);
           }
           const clean = normalizeLF(payload.text);
           // 先增量写入编辑器（保留选区），再同步 React 状态
@@ -1625,11 +2055,19 @@ export default function App() {
         } else if (type === 'SCREEN_SHARE_FORCE_STOP') {
           stopScreenShare(false);
         } else if (type === 'SCREEN_VIEWER_JOIN') {
-          if (payload?.viewerId) createOfferForViewer(payload.viewerId);
+          if (payload?.viewerId) createOfferForViewer(payload.viewerId, Boolean(payload.forceRelay));
         } else if (type === 'SCREEN_VIEWER_LEAVE') {
           if (payload?.viewerId) removeViewerPeer(payload.viewerId);
         } else if (type === 'RTC_SIGNAL') {
           handleRtcSignal(payload || {});
+        } else if (type === 'VOICE_STATE') {
+          setActiveVoiceSpeakers(Array.isArray(payload?.speakers) ? payload.speakers : []);
+        } else if (type === 'VOICE_LISTENER_JOIN') {
+          if (payload?.listenerId) createVoiceOfferForListener(payload.listenerId, Boolean(payload.forceRelay));
+        } else if (type === 'VOICE_LISTENER_LEAVE') {
+          if (payload?.listenerId) removeVoiceListenerPeer(payload.listenerId);
+        } else if (type === 'VOICE_SIGNAL') {
+          handleVoiceSignal(payload || {});
         }
       };
 
@@ -1775,14 +2213,24 @@ export default function App() {
     if (!payload) return;
     const cid = payload.clientId || 'legacy';
     if (cid === myClientIdRef.current) return;
+    // 只有对方显式点击/选区时（payload.showFlag === true）才亮出名字标签；打字、删除、粘贴等被动光标移动绝不弹出名字
+    const shouldShowFlag = payload.showFlag === true;
     remoteCursorsRef.current.set(cid, {
       name: payload.name || 'User',
       color: payload.color || '#f59e0b',
       selections: Array.isArray(payload.selections) ? payload.selections : [],
-      showFlag: true,
+      showFlag: shouldShowFlag,
     });
     renderAllRemoteCursors();
-    scheduleHideCursorFlag(cid);
+    if (shouldShowFlag) {
+      scheduleHideCursorFlag(cid);
+    } else {
+      const prevTimer = cursorFlagTimersRef.current.get(cid);
+      if (prevTimer) {
+        clearTimeout(prevTimer);
+        cursorFlagTimersRef.current.delete(cid);
+      }
+    }
   };
 
   const syncRemoteCursorsWithPresence = (list) => {
@@ -1800,8 +2248,6 @@ export default function App() {
       } else if (p.name !== cur.name || p.color !== cur.color) {
         cur.name = p.name;
         cur.color = p.color;
-        cur.showFlag = true;
-        scheduleHideCursorFlag(cid);
         changed = true;
       }
     });
@@ -2325,6 +2771,23 @@ export default function App() {
                 </label>
               )}
 
+              {/* 导师语音收听指示与一键静音（仅当有导师正在开麦时显示） */}
+              {activeVoiceSpeakers.filter((s) => s?.id !== myClientIdRef.current).length > 0 && (
+                <button
+                  onClick={() => setMentorVoiceMuted((v) => !v)}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '5px',
+                    background: mentorVoiceMuted ? 'rgba(239, 68, 68, 0.16)' : 'rgba(16, 185, 129, 0.18)',
+                    color: mentorVoiceMuted ? '#f87171' : '#34d399',
+                    border: `1px solid ${mentorVoiceMuted ? 'rgba(239, 68, 68, 0.4)' : 'rgba(16, 185, 129, 0.45)'}`,
+                    borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 600,
+                    cursor: 'pointer', whiteSpace: 'nowrap',
+                  }}
+                >
+                  <span>{mentorVoiceMuted ? '🔇 导师已静音' : '🎙 导师语音中'}</span>
+                </button>
+              )}
+
               {/* 当前传给导师的音频来源提示 */}
               {isSharingScreen && (
                 <span style={{ color: '#64748b', fontSize: '11px', whiteSpace: 'nowrap' }}>
@@ -2366,6 +2829,44 @@ export default function App() {
               <span style={{ color: '#f1f5f9', fontWeight: 600, fontSize: '13px' }}>GlassPad</span>
             </div>
             <button onClick={clearPad} style={btn}>Clear</button>
+
+            {/* 导师端开麦按钮（独立 WebRTC 语音通道，直接传给房间内候选人/其他成员） */}
+            <button
+              onClick={toggleMentorMic}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: '6px',
+                background: mentorMicOn ? 'rgba(16, 185, 129, 0.22)' : 'rgba(31, 41, 55, 0.85)',
+                color: mentorMicOn ? '#34d399' : '#e2e8f0',
+                border: `1px solid ${mentorMicOn ? 'rgba(16, 185, 129, 0.55)' : '#374151'}`,
+                borderRadius: '6px', padding: '4px 10px', fontSize: '12px', fontWeight: 600,
+                cursor: 'pointer', whiteSpace: 'nowrap',
+              }}
+              title={mentorMicOn ? '点击关闭导师麦克风' : '点击开启导师麦克风，直接对候选人讲话'}
+            >
+              <span style={{
+                width: '7px', height: '7px', borderRadius: '50%',
+                background: mentorMicOn ? '#10b981' : '#64748b',
+              }} />
+              {mentorMicOn ? '🎙 导师开麦中' : '🎙 导师开麦'}
+            </button>
+            {mentorMicError && (
+              <span style={{ color: '#f87171', fontSize: '11.5px', whiteSpace: 'nowrap' }}>
+                {mentorMicError}
+              </span>
+            )}
+            {activeVoiceSpeakers.filter((s) => s?.id !== myClientIdRef.current).length > 0 && (
+              <button
+                onClick={() => setMentorVoiceMuted((v) => !v)}
+                style={{
+                  background: mentorVoiceMuted ? 'rgba(239, 68, 68, 0.16)' : 'rgba(56, 189, 248, 0.16)',
+                  color: mentorVoiceMuted ? '#f87171' : '#38bdf8',
+                  border: `1px solid ${mentorVoiceMuted ? 'rgba(239, 68, 68, 0.4)' : 'rgba(56, 189, 248, 0.4)'}`,
+                  borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', cursor: 'pointer', whiteSpace: 'nowrap',
+                }}
+              >
+                {mentorVoiceMuted ? '🔇 队友静音' : '🔊 听队友语音'}
+              </button>
+            )}
 
             {/* 导师端：当候选人开启屏幕共享时显示实时观看控制 */}
             {remoteShareState.active ? (
@@ -2570,6 +3071,25 @@ export default function App() {
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <button
                   onClick={() => {
+                    const nextRelay = !viewerForceRelay;
+                    setViewerForceRelay(nextRelay);
+                    setViewerConnMode(nextRelay ? '切换 TURN 强制中继…' : '切换智能直连…');
+                    wsRef.current?.send(JSON.stringify({
+                      type: 'SCREEN_VIEWER_JOIN',
+                      payload: { forceRelay: nextRelay },
+                    }));
+                  }}
+                  style={{
+                    background: viewerForceRelay ? 'rgba(56, 189, 248, 0.2)' : '#1e293b',
+                    color: viewerForceRelay ? '#38bdf8' : '#cbd5e1',
+                    border: `1px solid ${viewerForceRelay ? 'rgba(56, 189, 248, 0.5)' : '#334155'}`,
+                    borderRadius: '5px', padding: '3px 8px', fontSize: '11.5px', cursor: 'pointer',
+                  }}
+                >
+                  {viewerForceRelay ? '中继模式 ✓' : '切中继线路'}
+                </button>
+                <button
+                  onClick={() => {
                     const next = !viewerMuted;
                     setViewerMuted(next);
                     if (remoteVideoRef.current) remoteVideoRef.current.muted = next;
@@ -2605,6 +3125,7 @@ export default function App() {
                 autoPlay
                 playsInline
                 muted={viewerMuted}
+                onLoadedData={() => setViewerConnected(true)}
                 style={{ width: '100%', height: '100%', objectFit: 'contain' }}
               />
               {!viewerConnected && (
@@ -2682,8 +3203,8 @@ export default function App() {
             if (!isClientApp) {
               editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, handleToggleSelectionBold);
             }
-            // 双端（导师 + 候选人）：点击任意位置或框选时，实时同步光标与选区位置，对方在该位置显示 CoderPad 风格的名字标签
-            editor.onDidChangeCursorSelection(() => {
+            // 双端（导师 + 候选人）：只有鼠标显式点击/框选（source === 'mouse'）时才显示名字标签；打字、删除、粘贴等被动光标移动不弹名字
+            editor.onDidChangeCursorSelection((ev) => {
               const selections = (editor.getSelections() || []).map((s) => ({
                 startLineNumber: s.startLineNumber,
                 startColumn: s.startColumn,
@@ -2714,7 +3235,33 @@ export default function App() {
                 }
               }
               if (wsRef.current?.readyState !== 1) return;
-              wsRef.current.send(JSON.stringify({ type: 'SEL_SYNC', payload: { selections } }));
+              // 仅鼠标点击/框选触发名字标签（排除键盘输入/删除/粘贴/远端文本同步引起的被动光标移动）
+              const isExplicitClick = ev?.source === 'mouse';
+              wsRef.current.send(JSON.stringify({
+                type: 'SEL_SYNC',
+                payload: { selections, showFlag: isExplicitClick },
+              }));
+            });
+            // 鼠标重复点击编辑器同一位置时，selection 未变化不会触发 onDidChangeCursorSelection，这里用 onMouseDown 补发一次带 showFlag: true
+            editor.onMouseDown((mouseEv) => {
+              if (!mouseEv?.target?.position) return;
+              requestAnimationFrame(() => {
+                if (wsRef.current?.readyState !== 1) return;
+                const selections = (editor.getSelections() || []).map((s) => ({
+                  startLineNumber: s.startLineNumber,
+                  startColumn: s.startColumn,
+                  endLineNumber: s.endLineNumber,
+                  endColumn: s.endColumn,
+                  positionLineNumber: s.positionLineNumber,
+                  positionColumn: s.positionColumn,
+                }));
+                if (selections.length > 0) {
+                  wsRef.current.send(JSON.stringify({
+                    type: 'SEL_SYNC',
+                    payload: { selections, showFlag: true },
+                  }));
+                }
+              });
             });
           }}
           options={{
