@@ -35,9 +35,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.26';
+let pkgVersion = '1.0.27';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.26';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.27';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -64,7 +64,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 同时共享（与腾讯会议并行）深度稳定性优化：禁用后台/隐身节流 + 共享期 powerSaveBlocker 防系统休眠挂起 + 优先 H.264 硬件编码 + 按观看人数动态限码限帧\n2. 弱网瞬断无感自愈：修复推流端 disconnected 秒杀连接缺陷（6s 宽限期），观看端/语音端均接入断链自动恢复与 18s 画面僵死看门狗\n3. 信令防假在线：服务端响应 PING/PONG，客户端 12s 心跳 + 35s 死链主动踢断 + 系统 online 事件秒级拉起',
+  notes: process.env.RELEASE_NOTES || '1. 修复服务端 PING 提前拦截导致 PONG 未发出的关键缺陷，并新增服务端 25s 协议层 WS 心跳探活，彻底消除幽灵死链与假在线\n2. 实现真正的原地无缝 ICE Restart 热续传 + 指数退避防重连风暴 + 修复 viewerForceRelay 闭包陈旧 Bug 与并发 Offer 竞态\n3. 共享端视频轨意外中断（插拔显示器/切分辨率）自动热替换不断共享，macOS SCK 音频流异常退出自动热拉起，导师端实时显示 fps/码率/RTT',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -692,10 +692,13 @@ wss.on('connection', (ws, req) => {
   }));
   broadcastPresence();
 
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   ws.on('message', (raw) => {
+    ws.isAlive = true;
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (msg.type === 'PING') return; // 心跳，不回显
 
     if (msg.type === 'PING') {
       if (ws.readyState === 1) {
@@ -812,7 +815,7 @@ wss.on('connection', (ws, req) => {
         broadcastShareState();
       }
     } else if (msg.type === 'SCREEN_VIEWER_JOIN') {
-      // 观看端（导师）请求订阅画面，转发给当前共享方以触发 WebRTC Offer（透传 forceRelay 强制 TURN 中继标志）
+      // 观看端（导师）请求订阅画面，转发给当前共享方以触发 WebRTC Offer（透传 forceRelay 与 iceRestart 标志）
       if (room.sharerId) {
         const sharerWs = findWsByClientId(room.sharerId);
         if (sharerWs) {
@@ -821,6 +824,7 @@ wss.on('connection', (ws, req) => {
             payload: {
               viewerId: clientId,
               forceRelay: Boolean(msg.payload?.forceRelay),
+              iceRestart: Boolean(msg.payload?.iceRestart),
             },
           }));
         }
@@ -836,7 +840,7 @@ wss.on('connection', (ws, req) => {
         }
       }
     } else if (msg.type === 'RTC_SIGNAL') {
-      // 点对点转发 WebRTC Offer / Answer / ICE Candidate
+      // 点对点转发 WebRTC Offer / Answer / ICE Candidate（透传 iceRestart / forceRelay 元信息）
       const targetWs = findWsByClientId(msg.payload?.to);
       if (targetWs) {
         targetWs.send(JSON.stringify({
@@ -845,6 +849,8 @@ wss.on('connection', (ws, req) => {
             from: clientId,
             sdp: msg.payload.sdp || null,
             candidate: msg.payload.candidate || null,
+            iceRestart: Boolean(msg.payload.iceRestart),
+            forceRelay: typeof msg.payload.forceRelay === 'boolean' ? msg.payload.forceRelay : undefined,
           },
         }));
       }
@@ -926,6 +932,19 @@ wss.on('connection', (ws, req) => {
     // 房间由定时器在闲置超时后统一回收
   });
 });
+
+// WS 协议层心跳探活：每 25 秒向所有在线连接发送原生 ping 帧，超时未响应直接 terminate，
+// 防止客户端异常断网/休眠导致服务端残存幽灵 sharerId，卡死新观看者或占用房间共享位
+setInterval(() => {
+  wss.clients.forEach((client) => {
+    if (client.isAlive === false) {
+      try { client.terminate(); } catch {}
+      return;
+    }
+    client.isAlive = false;
+    try { client.ping(); } catch {}
+  });
+}, 25 * 1000);
 
 // 闲置房间回收：房间超过 6 小时无人使用才删除（保留 token 有效性，且不会无限增长）
 setInterval(() => {

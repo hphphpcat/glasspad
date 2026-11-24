@@ -440,71 +440,108 @@ ipcMain.handle('RESTORE_AUDIO_OUTPUT', async () => {
 });
 
 // ── 腾讯会议同款：macOS ScreenCaptureKit 原生系统音频内录流（零驱动、不改系统输出设备、自动排除自身进程音频）──
+// 支持意外退出时自动热拉起（显示器插拔/切换分辨率/全屏空间变化时 SCStream 可能触发 didStopWithError），保证共享期间系统音永不掉线
 let nativeAudioProc = null;
+let nativeAudioWanted = false;
+let nativeAudioRestartTimer = null;
+let nativeAudioRestartAttempts = 0;
 
 function stopNativeAudioStream() {
+  nativeAudioWanted = false;
+  nativeAudioRestartAttempts = 0;
+  if (nativeAudioRestartTimer) {
+    clearTimeout(nativeAudioRestartTimer);
+    nativeAudioRestartTimer = null;
+  }
   if (nativeAudioProc) {
     try { nativeAudioProc.kill('SIGTERM'); } catch {}
     nativeAudioProc = null;
   }
 }
 
-ipcMain.handle('START_NATIVE_AUDIO_STREAM', async () => {
-  if (process.platform !== 'darwin') return { ok: false, error: '仅 macOS 支持' };
-  stopNativeAudioStream();
+function spawnNativeAudioHelper(onInitialResult) {
   const helperPath = resolveBlackHoleHelperPath();
-  if (!fs.existsSync(helperPath)) return { ok: false, error: '原生音频组件缺失' };
+  if (!fs.existsSync(helperPath)) {
+    onInitialResult?.({ ok: false, error: '原生音频组件缺失' });
+    return;
+  }
 
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (res) => {
+  let settled = false;
+  const finish = (res) => {
+    if (!settled) {
+      settled = true;
+      onInitialResult?.(res);
+    }
+  };
+
+  const child = spawn(helperPath, ['sck-stream', String(process.pid)], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  nativeAudioProc = child;
+
+  let remainder = Buffer.alloc(0);
+  child.stdout.on('data', (chunk) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const buf = remainder.length > 0 ? Buffer.concat([remainder, chunk]) : chunk;
+    const frameBytes = 8; // 2ch * Float32(4B)
+    const usableLen = buf.length - (buf.length % frameBytes);
+    if (usableLen > 0) {
+      const sendBuf = buf.subarray(0, usableLen);
+      mainWindow.webContents.send('NATIVE_AUDIO_PCM', sendBuf);
+    }
+    remainder = buf.subarray(usableLen);
+  });
+
+  child.stderr.on('data', (data) => {
+    const msg = data.toString();
+    if (msg.includes('SCK_READY')) {
+      nativeAudioRestartAttempts = 0;
+      finish({ ok: true, mode: 'sck' });
+    } else if (msg.includes('SCK_NO_DISPLAY') || msg.includes('SCK_START_ERR') || msg.includes('SCK_INIT_ERR')) {
       if (!settled) {
-        settled = true;
-        resolve(res);
-      }
-    };
-
-    const child = spawn(helperPath, ['sck-stream', String(process.pid)], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    nativeAudioProc = child;
-
-    let remainder = Buffer.alloc(0);
-    child.stdout.on('data', (chunk) => {
-      if (!mainWindow || mainWindow.isDestroyed()) return;
-      const buf = remainder.length > 0 ? Buffer.concat([remainder, chunk]) : chunk;
-      const frameBytes = 8; // 2ch * Float32(4B)
-      const usableLen = buf.length - (buf.length % frameBytes);
-      if (usableLen > 0) {
-        const sendBuf = buf.subarray(0, usableLen);
-        mainWindow.webContents.send('NATIVE_AUDIO_PCM', sendBuf);
-      }
-      remainder = buf.subarray(usableLen);
-    });
-
-    child.stderr.on('data', (data) => {
-      const msg = data.toString();
-      if (msg.includes('SCK_READY')) {
-        finish({ ok: true, mode: 'sck' });
-      } else if (msg.includes('SCK_NO_DISPLAY') || msg.includes('SCK_START_ERR') || msg.includes('SCK_INIT_ERR')) {
         stopNativeAudioStream();
         finish({ ok: false, error: msg.trim() });
       }
-    });
+    }
+  });
 
-    child.on('error', (err) => {
+  child.on('error', (err) => {
+    if (!settled) {
       stopNativeAudioStream();
       finish({ ok: false, error: err.message });
-    });
+    }
+  });
 
-    child.on('exit', (code) => {
-      if (nativeAudioProc === child) nativeAudioProc = null;
+  child.on('exit', (code) => {
+    if (nativeAudioProc === child) nativeAudioProc = null;
+    if (!settled) {
       finish({ ok: false, error: `SCK exited (${code})` });
-    });
+      return;
+    }
+    // 已成功启动后若中途异常退出（如显示器插拔、切分辨率、OS 短暂回收 SCStream），最多自动热拉起 6 次
+    if (nativeAudioWanted && nativeAudioRestartAttempts < 6) {
+      nativeAudioRestartAttempts += 1;
+      const delayMs = Math.min(4000, 600 * nativeAudioRestartAttempts);
+      nativeAudioRestartTimer = setTimeout(() => {
+        nativeAudioRestartTimer = null;
+        if (nativeAudioWanted) spawnNativeAudioHelper(null);
+      }, delayMs);
+    }
+  });
 
+  if (onInitialResult) {
     setTimeout(() => {
       finish({ ok: false, error: 'SCK_TIMEOUT' });
-    }, 1500);
+    }, 1800);
+  }
+}
+
+ipcMain.handle('START_NATIVE_AUDIO_STREAM', async () => {
+  if (process.platform !== 'darwin') return { ok: false, error: '仅 macOS 支持' };
+  stopNativeAudioStream();
+  nativeAudioWanted = true;
+  return new Promise((resolve) => {
+    spawnNativeAudioHelper(resolve);
   });
 });
 

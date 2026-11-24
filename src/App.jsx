@@ -749,7 +749,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.26';
+  let currentVersion = '1.0.27';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -896,6 +896,7 @@ export default function App() {
   const [showViewerPane, setShowViewerPane] = useState(true);
   const [viewerConnected, setViewerConnected] = useState(false);
   const [viewerConnMode, setViewerConnMode] = useState(''); // '' | 'P2P 直连' | 'TURN 中继' | '连接中…' | ...
+  const [viewerStatsText, setViewerStatsText] = useState(''); // 实时链路健康指标（如 24fps · 1.4Mbps · 42ms）
   const [viewerForceRelay, setViewerForceRelay] = useState(false); // 跨区/代理黑屏时一键或自动切换强制 TURN 中继
   const [viewerMuted, setViewerMuted] = useState(false);
 
@@ -933,7 +934,10 @@ export default function App() {
   const shareSessionRef = useRef(null); // { displayStream, micStream, audioCtx, micTrack, sysAudioTrack, videoTrack, audioTrack, peers: Map<viewerId, { pc, pendingIce: [] }> }
   const speakerDuckedRef = useRef(false); // 开麦时是否已压低扬声器音量（避免外放被麦克风拾取产生重音）
   // 导师端观看屏幕用到的 WebRTC / Video 引用
-  const viewerPcRef = useRef(null); // { pc, sharerId, pendingIce: [], stream: MediaStream, reconnectTimer, frameWatchTimer, forceRelay }
+  const viewerPcRef = useRef(null); // { pc, sharerId, pendingIce: [], stream: MediaStream, reconnectTimer, frameWatchTimer, disconnectTimer, stallTimer, forceRelay, genId }
+  const viewerForceRelayRef = useRef(false); // 与 viewerForceRelay 同步的 Ref，彻底消除 WS 回调闭包读取陈旧值 Bug
+  const viewerOfferGenRef = useRef(0); // 每次收到新 Offer 递增，防止慢返回的旧 fetchRtcIceConfig 覆盖新连接
+  const viewerRetryCountRef = useRef(0); // 退避重连计数器（成功出帧后清零），防断网时重连风暴
   const earlyViewerIceRef = useRef(new Map()); // Map<sharerId, RTCIceCandidateInit[]> 缓存 offer await 期间提前到达的 ICE 候选，彻底消灭竞态丢包
   const remoteVideoRef = useRef(null);
 
@@ -1066,6 +1070,13 @@ export default function App() {
     window.electronAPI?.setFrostedGlass?.(enabled);
   };
 
+  // 同步更新强制中继状态（同时写入 State 与 Ref，保证异步 WS/WebRTC 回调永远读到最新值）
+  const updateViewerForceRelay = (next) => {
+    const val = Boolean(next);
+    viewerForceRelayRef.current = val;
+    setViewerForceRelay(val);
+  };
+
   // ── 屏幕共享：清理观看端 WebRTC 连接 ──
   const closeViewerConnection = () => {
     const cur = viewerPcRef.current;
@@ -1086,6 +1097,7 @@ export default function App() {
     }
     setViewerConnected(false);
     setViewerConnMode('');
+    setViewerStatsText('');
   };
 
   // 按当前在线观看者人数动态调整每路视频码率与帧率，避免多导师同时看 + 腾讯会议并行时上行带宽与 CPU 被挤爆
@@ -1126,13 +1138,53 @@ export default function App() {
   };
 
   // ── 屏幕共享：为指定观看者创建 WebRTC Offer 并推流（共享端） ──
-  const createOfferForViewer = async (viewerId, forceRelay = false) => {
+  // 支持在已有 PeerConnection 上执行无缝 ICE Restart（热续传、不黑屏不重建解码器），也支持策略切换时干净重建
+  const createOfferForViewer = async (viewerId, forceRelay = false, iceRestart = false) => {
     const session = shareSessionRef.current;
     if (!session || !viewerId) return;
+
+    const existing = session.peers.get(viewerId);
+    // 情况 1：请求无缝 ICE Restart 且当前已有同策略存活 PC -> 原地重协商热续传，画面零闪烁！
+    if (
+      iceRestart &&
+      existing &&
+      existing.forceRelay === Boolean(forceRelay) &&
+      existing.pc.signalingState !== 'closed' &&
+      existing.pc.connectionState !== 'closed'
+    ) {
+      try {
+        if (existing.disconnectTimer) {
+          clearTimeout(existing.disconnectTimer);
+          existing.disconnectTimer = null;
+        }
+        const offer = await existing.pc.createOffer({ iceRestart: true });
+        const tunedOffer = {
+          type: offer.type,
+          sdp: enhanceOpusSdp(offer.sdp, { stereo: Boolean(session.sysAudioTrack), maxAverageBitrate: 96000 }),
+        };
+        await existing.pc.setLocalDescription(tunedOffer);
+        if (wsRef.current?.readyState === 1) {
+          wsRef.current.send(JSON.stringify({
+            type: 'RTC_SIGNAL',
+            payload: { to: viewerId, sdp: existing.pc.localDescription, iceRestart: true, forceRelay: Boolean(existing.forceRelay) },
+          }));
+        }
+        return;
+      } catch {
+        // 原地 ICE Restart 失败则降级为完整重建
+      }
+    }
+
+    // 情况 2：首次建连或切换 P2P/TURN 策略 -> 使用递增 generation 防止并发 Join 互相覆盖
+    const offerGen = (session.offerGen || 0) + 1;
+    session.offerGen = offerGen;
+    if (!session.peerGens) session.peerGens = new Map();
+    session.peerGens.set(viewerId, offerGen);
     removeViewerPeer(viewerId);
 
     const rtcCfg = await fetchRtcIceConfig(wsBase, forceRelay);
     if (shareSessionRef.current !== session || session.stopped) return;
+    if (session.peerGens.get(viewerId) !== offerGen) return; // 已有更新的观看请求，丢弃过期任务
 
     const useRelayOnly = Boolean(forceRelay && rtcCfg.hasTurn);
     const pc = new RTCPeerConnection({
@@ -1141,7 +1193,7 @@ export default function App() {
       bundlePolicy: 'max-bundle',
       iceCandidatePoolSize: 2,
     });
-    const entry = { pc, pendingIce: [], videoSender: null, disconnectTimer: null };
+    const entry = { pc, pendingIce: [], videoSender: null, disconnectTimer: null, forceRelay: useRelayOnly, gen: offerGen };
     session.peers.set(viewerId, entry);
 
     const sharedStream = session.outboundStream || session.displayStream;
@@ -1178,14 +1230,14 @@ export default function App() {
 
     const schedulePeerDisconnectCleanup = () => {
       if (entry.disconnectTimer) return;
-      // 遇到网络瞬断(disconnected)不再秒杀连接！给予 6 秒自愈宽限期，若未自动恢复则清理释放资源（观看端会拉起重连）
+      // 遇到网络瞬断(disconnected)先等待 2.5 秒尝试原地 ICE Restart，若 8 秒内仍未恢复再释放资源
       entry.disconnectTimer = setTimeout(() => {
         entry.disconnectTimer = null;
         if (session.peers.get(viewerId) !== entry) return;
         if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
           removeViewerPeer(viewerId);
         }
-      }, 6000);
+      }, 8000);
     };
 
     const clearPeerDisconnectCleanup = () => {
@@ -1222,10 +1274,11 @@ export default function App() {
         sdp: enhanceOpusSdp(offer.sdp, { stereo: Boolean(session.sysAudioTrack), maxAverageBitrate: 96000 }),
       };
       await pc.setLocalDescription(tunedOffer);
+      if (session.peers.get(viewerId) !== entry) return;
       if (wsRef.current?.readyState === 1) {
         wsRef.current.send(JSON.stringify({
           type: 'RTC_SIGNAL',
-          payload: { to: viewerId, sdp: pc.localDescription },
+          payload: { to: viewerId, sdp: pc.localDescription, forceRelay: useRelayOnly },
         }));
       }
     } catch (err) {
@@ -1633,9 +1686,51 @@ export default function App() {
       window.electronAPI?.setPowerKeepAwake?.(true).catch?.(() => {});
 
       if (videoTrack) {
-        videoTrack.addEventListener('ended', () => {
-          if (!session.stopped) stopScreenShare(true);
-        });
+        const attachVideoRecovery = (track) => {
+          track.addEventListener('ended', async () => {
+            if (session.stopped || shareSessionRef.current !== session) return;
+            // 显示器插拔/切换全屏空间/分辨率变化可能导致抓屏轨意外 ended：
+            // 优先静默重新抓取视频轨并用 sender.replaceTrack 无缝热替换给所有观看端（不踢人、不断音、不中断共享）
+            try {
+              const recovered = await navigator.mediaDevices.getDisplayMedia({
+                video: {
+                  width: { ideal: 1920, max: 1920 },
+                  height: { ideal: 1080, max: 1080 },
+                  frameRate: { ideal: 24, max: 24 },
+                },
+                audio: false,
+              });
+              const newVideo = recovered.getVideoTracks()[0];
+              if (!newVideo || session.stopped || shareSessionRef.current !== session) {
+                recovered.getTracks().forEach((t) => t.stop());
+                if (!session.stopped) stopScreenShare(true);
+                return;
+              }
+              if ('contentHint' in newVideo) {
+                try { newVideo.contentHint = 'detail'; } catch {}
+              }
+              session.displayStream = recovered;
+              session.videoTrack = newVideo;
+              if (session.outboundStream) {
+                session.outboundStream.getVideoTracks().forEach((t) => {
+                  try { session.outboundStream.removeTrack(t); } catch {}
+                });
+                session.outboundStream.addTrack(newVideo);
+              }
+              const replaceTasks = [];
+              session.peers.forEach((entry) => {
+                if (entry.videoSender && typeof entry.videoSender.replaceTrack === 'function') {
+                  replaceTasks.push(entry.videoSender.replaceTrack(newVideo).catch(() => {}));
+                }
+              });
+              await Promise.all(replaceTasks);
+              attachVideoRecovery(newVideo);
+            } catch {
+              if (!session.stopped) stopScreenShare(true);
+            }
+          });
+        };
+        attachVideoRecovery(videoTrack);
       }
 
       setIsSharingScreen(true);
@@ -1720,7 +1815,7 @@ export default function App() {
   };
 
   // ── 屏幕共享：处理收到的 WebRTC 信令（Offer / Answer / ICE） ──
-  const handleRtcSignal = async ({ from, sdp, candidate }) => {
+  const handleRtcSignal = async ({ from, sdp, candidate, iceRestart, forceRelay: offerForceRelay }) => {
     if (!from) return;
 
     // A. 如果本地是共享端：收到观看端的 Answer 或 ICE
@@ -1750,15 +1845,52 @@ export default function App() {
     // B. 如果本地是观看端（导师端）：收到共享端的 Offer 或 ICE
     try {
       if (sdp && sdp.type === 'offer') {
+        const curViewer = viewerPcRef.current;
+        // B1. 无缝 ICE Restart 热续传：在原 PC 上直接应答新 Offer，不销毁播放器也不闪烁黑屏！
+        if (
+          iceRestart &&
+          curViewer &&
+          curViewer.sharerId === from &&
+          curViewer.pc.signalingState !== 'closed' &&
+          curViewer.pc.connectionState !== 'closed'
+        ) {
+          try {
+            await curViewer.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            const answer = await curViewer.pc.createAnswer();
+            const tunedAnswer = {
+              type: answer.type,
+              sdp: enhanceOpusSdp(answer.sdp, { stereo: true, maxAverageBitrate: 96000 }),
+            };
+            await curViewer.pc.setLocalDescription(tunedAnswer);
+            if (wsRef.current?.readyState === 1) {
+              wsRef.current.send(JSON.stringify({
+                type: 'RTC_SIGNAL',
+                payload: { to: from, sdp: curViewer.pc.localDescription },
+              }));
+            }
+            return;
+          } catch {
+            // 原地续传失败时回退到干净重建
+          }
+        }
+
+        // B2. 全新建立连接：递增 offerGen 彻底杜绝并发 Offer 异步返回后旧 PC 覆盖新 PC
+        const offerGen = ++viewerOfferGenRef.current;
         closeViewerConnection();
         // 先占位 earlyViewerIceRef，避免 await fetchRtcIceConfig 期间到达的 ICE 候选全部被丢弃！
         if (!earlyViewerIceRef.current.has(from)) {
           earlyViewerIceRef.current.set(from, []);
         }
-        const wantRelay = Boolean(viewerForceRelay);
+        // 永远从最新 Ref 与 Offer 自身元信息决定中继策略，彻底根治 React 闭包陈旧 Bug
+        const wantRelay = typeof offerForceRelay === 'boolean' ? offerForceRelay : Boolean(viewerForceRelayRef.current);
+        if (wantRelay !== viewerForceRelayRef.current) {
+          updateViewerForceRelay(wantRelay);
+        }
         setViewerConnMode(wantRelay ? 'TURN 强制中继连接中…' : '正在穿透网络…');
 
         const rtcCfg = await fetchRtcIceConfig(wsBase, wantRelay);
+        if (viewerOfferGenRef.current !== offerGen) return; // 已有更新的 Offer 抵达，丢弃本次过期的建连
+
         const useRelayOnly = Boolean(wantRelay && rtcCfg.hasTurn);
         const pc = new RTCPeerConnection({
           iceServers: rtcCfg.iceServers,
@@ -1772,6 +1904,7 @@ export default function App() {
         const viewerState = {
           pc,
           sharerId: from,
+          genId: offerGen,
           pendingIce: [...earlyQueued],
           stream: remoteStream,
           reconnectTimer: null,
@@ -1779,7 +1912,11 @@ export default function App() {
           disconnectTimer: null,
           stallTimer: null,
           lastBytesReceived: -1,
+          lastVideoBytes: -1,
+          lastFramesDecoded: -1,
+          lastStatsAt: 0,
           stallStrikes: 0,
+          iceRestartTried: false,
           forceRelay: useRelayOnly,
         };
         viewerPcRef.current = viewerState;
@@ -1809,16 +1946,16 @@ export default function App() {
           } catch {}
         };
 
-        const requestJoinWithRelay = (relayFlag) => {
+        const requestJoinWithRelay = (relayFlag, useIceRestart = false) => {
           if (wsRef.current?.readyState === 1) {
             wsRef.current.send(JSON.stringify({
               type: 'SCREEN_VIEWER_JOIN',
-              payload: { forceRelay: Boolean(relayFlag) },
+              payload: { forceRelay: Boolean(relayFlag), iceRestart: Boolean(useIceRestart) },
             }));
           }
         };
 
-        // 看门狗：8 秒内如果还没真正解码出视频帧（videoWidth === 0），自动升级为「强制 TURN 中继 (TLS 443)」重连！
+        // 看门狗：7 秒内如果还没真正解码出视频帧（videoWidth === 0），自动升级为「强制 TURN 中继 (TLS 443)」重连！
         // 彻底解决跨区/台湾代理节点下 ICE 卡在 checking 或 P2P 假连通但黑屏的问题
         viewerState.frameWatchTimer = setTimeout(() => {
           if (viewerPcRef.current !== viewerState) return;
@@ -1826,19 +1963,19 @@ export default function App() {
           const hasDecodedFrame = Boolean(v && v.videoWidth > 0 && v.videoHeight > 0);
           if (hasDecodedFrame) return;
           if (!viewerState.forceRelay && rtcCfg.hasTurn) {
-            setViewerForceRelay(true);
+            updateViewerForceRelay(true);
             setViewerConnMode('P2P 超时，自动切换 TURN 中继…');
-            requestJoinWithRelay(true);
+            requestJoinWithRelay(true, false);
           } else {
             setViewerConnMode('未收到画面，正在重试 TURN 中继…');
-            requestJoinWithRelay(true);
+            requestJoinWithRelay(true, false);
           }
-        }, 8000);
+        }, 7000);
 
         const tryPlayVideo = () => {
           const v = remoteVideoRef.current;
           if (!v) return;
-          v.srcObject = remoteStream;
+          if (v.srcObject !== remoteStream) v.srcObject = remoteStream;
           v.play().catch(() => {
             // 浏览器阻止带声音自动播放时，先自动静音确保画面能秒出（用户可点顶栏取消静音）
             v.muted = true;
@@ -1875,17 +2012,23 @@ export default function App() {
           }
         };
 
-        const scheduleViewerReconnect = (escalateToRelay = false) => {
+        // 指数退避重连（1.5s -> 2.5s -> 4s -> 6s -> 8s 上限），彻底防止断网/弱网时的重连风暴
+        const scheduleViewerReconnect = (escalateToRelay = false, preferIceRestart = false) => {
           if (viewerPcRef.current !== viewerState) return;
           if (viewerState.reconnectTimer) return;
+          const attempt = viewerRetryCountRef.current;
+          const delayMs = Math.min(8000, Math.round(1500 * Math.pow(1.45, Math.min(attempt, 5))));
+          viewerRetryCountRef.current = Math.min(attempt + 1, 6);
           viewerState.reconnectTimer = setTimeout(() => {
             viewerState.reconnectTimer = null;
             if (viewerPcRef.current === viewerState) {
               const nextRelay = Boolean(escalateToRelay || viewerState.forceRelay);
-              if (nextRelay) setViewerForceRelay(true);
-              requestJoinWithRelay(nextRelay);
+              if (nextRelay) updateViewerForceRelay(true);
+              const canIceRestart = Boolean(preferIceRestart && nextRelay === viewerState.forceRelay && !viewerState.iceRestartTried);
+              if (canIceRestart) viewerState.iceRestartTried = true;
+              requestJoinWithRelay(nextRelay, canIceRestart);
             }
-          }, 2200);
+          }, delayMs);
         };
 
         const clearViewerDisconnectTimer = () => {
@@ -1897,49 +2040,101 @@ export default function App() {
 
         const scheduleViewerDisconnectRecovery = () => {
           if (viewerPcRef.current !== viewerState || viewerState.disconnectTimer) return;
-          setViewerConnMode('网络波动，等待自动恢复…');
-          // 给予 3.5 秒自然恢复宽限期，若未回连则自动重建（有 TURN 时直接升中继，避免反复卡 P2P）
+          setViewerConnMode('网络波动，热恢复中…');
+          // 1) 1.5 秒内未自动恢复 -> 先发原地 ICE Restart（不关播放器、不黑屏无缝续传）；
+          // 2) 若已尝试过 ICE Restart 仍断开 -> 升级强制 TURN 中继重建
           viewerState.disconnectTimer = setTimeout(() => {
             viewerState.disconnectTimer = null;
             if (viewerPcRef.current !== viewerState) return;
             if (pc.connectionState !== 'connected' && pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
-              setViewerConnected(false);
-              setViewerConnMode(rtcCfg.hasTurn ? '网络瞬断，自动切换 TURN 中继恢复中…' : '网络瞬断，自动重连中…');
-              scheduleViewerReconnect(rtcCfg.hasTurn);
+              if (!viewerState.iceRestartTried) {
+                viewerState.iceRestartTried = true;
+                setViewerConnMode('网络瞬断，正在无缝热续传…');
+                requestJoinWithRelay(viewerState.forceRelay, true);
+                // 给热续传 4 秒窗口，若仍未回到 connected 再彻底切 TURN 重建
+                viewerState.disconnectTimer = setTimeout(() => {
+                  viewerState.disconnectTimer = null;
+                  if (viewerPcRef.current !== viewerState) return;
+                  if (pc.connectionState !== 'connected' && pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
+                    setViewerConnected(false);
+                    setViewerConnMode(rtcCfg.hasTurn ? '热续传超时，切换 TURN 中继重建…' : '热续传超时，正在重建连接…');
+                    scheduleViewerReconnect(rtcCfg.hasTurn, false);
+                  }
+                }, 4000);
+              } else {
+                setViewerConnected(false);
+                setViewerConnMode(rtcCfg.hasTurn ? '网络瞬断，切换 TURN 中继恢复中…' : '网络瞬断，自动重连中…');
+                scheduleViewerReconnect(rtcCfg.hasTurn, false);
+              }
             }
-          }, 3500);
+          }, 1500);
         };
 
-        // 运行时防「假连通定格」看门狗：每 6 秒检查入站总字节（音+视）是否持续增长，
-        // 连续 3 次（18 秒）零字节新增说明底层 UDP 路径已僵死（跨区代理长时间挂机常见），自动静默切换 TURN 重建
+        // 运行时双监控（每 4 秒采样）：
+        // 1) 实时计算并展示帧率、码率、RTT 延迟，让导师一眼看清链路质量；
+        // 2) 连续 3 次（12 秒）入站零字节新增说明底层 UDP 路径僵死，先无缝 ICE Restart，再兜底切 TURN 重建
         viewerState.stallTimer = setInterval(async () => {
           if (viewerPcRef.current !== viewerState) return;
           if (pc.connectionState !== 'connected' && pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') return;
           try {
             const stats = await pc.getStats();
+            const now = Date.now();
             let totalBytes = 0;
+            let videoBytes = 0;
+            let framesDecoded = 0;
+            let rttMs = null;
+
             stats.forEach((r) => {
               if (r.type === 'inbound-rtp' && typeof r.bytesReceived === 'number') {
                 totalBytes += r.bytesReceived;
+                if (r.kind === 'video' || r.mediaType === 'video') {
+                  videoBytes = r.bytesReceived;
+                  if (typeof r.framesDecoded === 'number') framesDecoded = r.framesDecoded;
+                }
+              }
+              if (r.type === 'candidate-pair' && (r.nominated || r.state === 'succeeded') && typeof r.currentRoundTripTime === 'number') {
+                rttMs = Math.round(r.currentRoundTripTime * 1000);
               }
             });
+
+            if (viewerState.lastStatsAt > 0) {
+              const dtSec = Math.max(0.5, (now - viewerState.lastStatsAt) / 1000);
+              const kbps = Math.round(((Math.max(0, videoBytes - viewerState.lastVideoBytes)) * 8) / 1000 / dtSec);
+              const fps = Math.round(Math.max(0, framesDecoded - viewerState.lastFramesDecoded) / dtSec);
+              const bwStr = kbps >= 1000 ? `${(kbps / 1000).toFixed(1)}Mbps` : `${kbps}kbps`;
+              const rttStr = rttMs !== null ? ` · ${rttMs}ms` : '';
+              setViewerStatsText(`${fps}fps · ${bwStr}${rttStr}`);
+            }
+            viewerState.lastVideoBytes = videoBytes;
+            viewerState.lastFramesDecoded = framesDecoded;
+            viewerState.lastStatsAt = now;
+
             if (viewerState.lastBytesReceived >= 0 && totalBytes <= viewerState.lastBytesReceived) {
               viewerState.stallStrikes += 1;
               if (viewerState.stallStrikes >= 3) {
                 viewerState.stallStrikes = 0;
-                setViewerConnMode('检测到画面流停滞，正在自动重建连接…');
-                requestJoinWithRelay(rtcCfg.hasTurn ? true : viewerState.forceRelay);
+                if (!viewerState.iceRestartTried) {
+                  viewerState.iceRestartTried = true;
+                  setViewerConnMode('检测到画面流停滞，无缝热续传中…');
+                  requestJoinWithRelay(viewerState.forceRelay, true);
+                } else {
+                  setViewerConnMode('检测到画面流停滞，正在切换中继重建…');
+                  if (rtcCfg.hasTurn) updateViewerForceRelay(true);
+                  requestJoinWithRelay(rtcCfg.hasTurn ? true : viewerState.forceRelay, false);
+                }
               }
             } else {
               viewerState.stallStrikes = 0;
             }
             viewerState.lastBytesReceived = totalBytes;
           } catch {}
-        }, 6000);
+        }, 4000);
 
         pc.oniceconnectionstatechange = () => {
           if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
             clearViewerDisconnectTimer();
+            viewerState.iceRestartTried = false;
+            viewerRetryCountRef.current = 0;
             setViewerConnected(true);
             detectConnMode();
             tryPlayVideo();
@@ -1951,13 +2146,15 @@ export default function App() {
             clearViewerDisconnectTimer();
             setViewerConnected(false);
             setViewerConnMode(rtcCfg.hasTurn ? '切换 TURN 中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
-            scheduleViewerReconnect(rtcCfg.hasTurn);
+            scheduleViewerReconnect(rtcCfg.hasTurn, false);
           }
         };
 
         pc.onconnectionstatechange = () => {
           if (pc.connectionState === 'connected') {
             clearViewerDisconnectTimer();
+            viewerState.iceRestartTried = false;
+            viewerRetryCountRef.current = 0;
             setViewerConnected(true);
             detectConnMode();
             tryPlayVideo();
@@ -1967,7 +2164,7 @@ export default function App() {
             clearViewerDisconnectTimer();
             setViewerConnected(false);
             setViewerConnMode(rtcCfg.hasTurn ? '切换 TURN 中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
-            scheduleViewerReconnect(rtcCfg.hasTurn);
+            scheduleViewerReconnect(rtcCfg.hasTurn, false);
           } else if (pc.connectionState === 'closed') {
             clearViewerDisconnectTimer();
             setViewerConnected(false);
@@ -2409,11 +2606,20 @@ export default function App() {
   useEffect(() => {
     if (isClientApp) return;
     if (remoteShareState.active && showViewerPane && wsConnected) {
+      // 如果当前已经有健康连接且共享人没变（例如仅仅 WS 闪断恢复），不要重复重建导致闪屏
+      const cur = viewerPcRef.current;
+      if (
+        cur &&
+        cur.sharerId === remoteShareState.sharerId &&
+        (cur.pc.connectionState === 'connected' || cur.pc.iceConnectionState === 'connected' || cur.pc.iceConnectionState === 'completed')
+      ) {
+        return;
+      }
       wsRef.current?.send(JSON.stringify({
         type: 'SCREEN_VIEWER_JOIN',
-        payload: { forceRelay: viewerForceRelay },
+        payload: { forceRelay: viewerForceRelayRef.current, iceRestart: false },
       }));
-    } else {
+    } else if (!remoteShareState.active || !showViewerPane) {
       closeViewerConnection();
       if (remoteShareState.active && !showViewerPane && wsConnected) {
         wsRef.current?.send(JSON.stringify({ type: 'SCREEN_VIEWER_LEAVE' }));
@@ -2539,7 +2745,7 @@ export default function App() {
         } else if (type === 'SCREEN_SHARE_FORCE_STOP') {
           stopScreenShare(false);
         } else if (type === 'SCREEN_VIEWER_JOIN') {
-          if (payload?.viewerId) createOfferForViewer(payload.viewerId, Boolean(payload.forceRelay));
+          if (payload?.viewerId) createOfferForViewer(payload.viewerId, Boolean(payload.forceRelay), Boolean(payload.iceRestart));
         } else if (type === 'SCREEN_VIEWER_LEAVE') {
           if (payload?.viewerId) removeViewerPeer(payload.viewerId);
         } else if (type === 'RTC_SIGNAL') {
@@ -2589,7 +2795,7 @@ export default function App() {
         if (viewerPcRef.current && viewerPcRef.current.pc.connectionState !== 'connected') {
           cur.send(JSON.stringify({
             type: 'SCREEN_VIEWER_JOIN',
-            payload: { forceRelay: Boolean(viewerPcRef.current.forceRelay) },
+            payload: { forceRelay: Boolean(viewerPcRef.current.forceRelay), iceRestart: true },
           }));
         }
       }
@@ -3574,6 +3780,11 @@ export default function App() {
                     ? `客户桌面实时画面 (${viewerConnMode || 'WebRTC'})`
                     : (viewerConnMode || '正在连接客户桌面…')}
                 </span>
+                {viewerConnected && viewerStatsText && (
+                  <span style={{ color: '#38bdf8', fontSize: '11px', fontFamily: codeFont }}>
+                    {viewerStatsText}
+                  </span>
+                )}
                 <span style={{ color: '#64748b', fontSize: '11.5px' }}>
                   · 客户麦克风: {remoteShareState.micOn ? '已开启' : '已关闭'} · 系统音: {remoteShareState.systemAudio ? '有' : '无'}
                 </span>
@@ -3582,12 +3793,12 @@ export default function App() {
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <button
                   onClick={() => {
-                    const nextRelay = !viewerForceRelay;
-                    setViewerForceRelay(nextRelay);
+                    const nextRelay = !viewerForceRelayRef.current;
+                    updateViewerForceRelay(nextRelay);
                     setViewerConnMode(nextRelay ? '切换 TURN 强制中继…' : '切换智能直连…');
                     wsRef.current?.send(JSON.stringify({
                       type: 'SCREEN_VIEWER_JOIN',
-                      payload: { forceRelay: nextRelay },
+                      payload: { forceRelay: nextRelay, iceRestart: false },
                     }));
                   }}
                   style={{
