@@ -87,7 +87,159 @@ async function getMacAudioSources() {
   }
 }
 
+// 音频编码抗丢包优化：强制在 SDP 中为 Opus 开启带内前向纠错 (useinbandfec=1) 与高码率语音/立体声参数，
+// 显著提升跨国/台湾代理/弱网下的语音清晰度与抗丢包能力，减少吞字与机器人声
+function enhanceOpusSdp(sdp, { stereo = false, maxAverageBitrate = 96000 } = {}) {
+  if (!sdp || typeof sdp !== 'string') return sdp;
+  const lines = sdp.split(/\r?\n/);
+  let opusPayload = null;
+  for (const line of lines) {
+    const m = line.match(/^a=rtpmap:(\d+)\s+opus\/48000/i);
+    if (m) {
+      opusPayload = m[1];
+      break;
+    }
+  }
+  if (!opusPayload) return sdp;
+
+  const desired = {
+    minptime: '10',
+    useinbandfec: '1',
+    usedtx: '0',
+    maxaveragebitrate: String(maxAverageBitrate),
+  };
+  if (stereo) {
+    desired.stereo = '1';
+    desired['sprop-stereo'] = '1';
+  }
+
+  let patched = false;
+  const fmtpPrefix = `a=fmtp:${opusPayload} `;
+  const out = lines.map((line) => {
+    if (!line.startsWith(fmtpPrefix)) return line;
+    patched = true;
+    const rawParams = line.slice(fmtpPrefix.length).trim();
+    const map = new Map();
+    if (rawParams) {
+      for (const part of rawParams.split(';')) {
+        const idx = part.indexOf('=');
+        if (idx > 0) {
+          map.set(part.slice(0, idx).trim(), part.slice(idx + 1).trim());
+        } else if (part.trim()) {
+          map.set(part.trim(), '');
+        }
+      }
+    }
+    for (const [k, v] of Object.entries(desired)) {
+      map.set(k, v);
+    }
+    const merged = Array.from(map.entries())
+      .map(([k, v]) => (v === '' ? k : `${k}=${v}`))
+      .join(';');
+    return `${fmtpPrefix}${merged}`;
+  });
+
+  if (!patched) {
+    const rtpmapIdx = out.findIndex((l) => l.startsWith(`a=rtpmap:${opusPayload} `));
+    if (rtpmapIdx >= 0) {
+      const merged = Object.entries(desired).map(([k, v]) => `${k}=${v}`).join(';');
+      out.splice(rtpmapIdx + 1, 0, `${fmtpPrefix}${merged}`);
+    }
+  }
+  return out.join('\r\n');
+}
+
 // 腾讯会议同款：将主进程 ScreenCaptureKit 推送的 48kHz 双声道交错 Float32 PCM 实时合成 WebAudio MediaStream
+// 升级为独立音频渲染线程 AudioWorklet + 水位漂移自动追新保护（彻底消除主线程卡顿爆音与长时延迟累积）
+const SCK_WORKLET_CODE = `
+class SCKPcmProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    // 环形缓冲区：最多容纳 240ms 双声道交错 Float32（48000 * 0.24 * 2）
+    this.capacity = 48000 * 2;
+    this.ring = new Float32Array(this.capacity);
+    this.readPos = 0;
+    this.writePos = 0;
+    this.available = 0;
+    // 水位保护：超过 85ms 自动丢弃最旧样本追平至 25ms，永不累积延迟也不撞车产生电流声
+    this.highWater = Math.floor(48000 * 0.085) * 2;
+    this.targetWater = Math.floor(48000 * 0.025) * 2;
+    this.lastL = 0;
+    this.lastR = 0;
+
+    this.port.onmessage = (ev) => {
+      const floats = ev.data;
+      if (!floats || !floats.length) return;
+      const n = floats.length;
+      if (n >= this.capacity) {
+        const start = n - this.targetWater;
+        this.readPos = 0;
+        this.writePos = 0;
+        this.available = 0;
+        for (let i = Math.max(0, start); i < n; i++) {
+          this.ring[this.writePos] = floats[i];
+          this.writePos = (this.writePos + 1) % this.capacity;
+          this.available++;
+        }
+        return;
+      }
+      // 溢出前先丢旧，保证 readPos/writePos 永不重叠
+      if (this.available + n > this.capacity) {
+        const drop = (this.available + n - this.targetWater) & ~1;
+        this.readPos = (this.readPos + drop) % this.capacity;
+        this.available = Math.max(0, this.available - drop);
+      }
+      for (let i = 0; i < n; i++) {
+        this.ring[this.writePos] = floats[i];
+        this.writePos = (this.writePos + 1) % this.capacity;
+      }
+      this.available += n;
+      // 时钟漂移超过 85ms 时平滑跳到 25ms 处，防止几十分钟后音画脱节
+      if (this.available > this.highWater) {
+        const drop = (this.available - this.targetWater) & ~1;
+        this.readPos = (this.readPos + drop) % this.capacity;
+        this.available -= drop;
+      }
+    };
+  }
+
+  process(_inputs, outputs) {
+    const out = outputs[0];
+    if (!out || out.length < 2) return true;
+    const outL = out[0];
+    const outR = out[1];
+    const frames = outL.length;
+    const needed = frames * 2;
+    if (this.available >= needed) {
+      for (let i = 0; i < frames; i++) {
+        const l = this.ring[this.readPos];
+        const r = this.ring[(this.readPos + 1) % this.capacity];
+        outL[i] = l;
+        outR[i] = r;
+        this.readPos = (this.readPos + 2) % this.capacity;
+      }
+      this.lastL = outL[frames - 1];
+      this.lastR = outR[frames - 1];
+      this.available -= needed;
+    } else {
+      // 欠载时做指数淡出归零，避免直接填 0 产生咔哒爆破音
+      let l = this.lastL;
+      let r = this.lastR;
+      for (let i = 0; i < frames; i++) {
+        l *= 0.88;
+        r *= 0.88;
+        outL[i] = l;
+        outR[i] = r;
+      }
+      this.lastL = Math.abs(l) < 1e-5 ? 0 : l;
+      this.lastR = Math.abs(r) < 1e-5 ? 0 : r;
+    }
+    return true;
+  }
+}
+registerProcessor('sck-pcm-processor', SCKPcmProcessor);
+`;
+
 async function createNativeSCKAudioStream() {
   if (!window.electronAPI?.startNativeAudioStream || !window.electronAPI?.onNativeAudioPcm) return null;
   const res = await window.electronAPI.startNativeAudioStream();
@@ -96,11 +248,56 @@ async function createNativeSCKAudioStream() {
   const ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
   await ctx.resume();
   const dest = ctx.createMediaStreamDestination();
-  const scriptNode = ctx.createScriptProcessor(1024, 0, 2);
 
-  // 环形队列缓存双声道交错 Float32 样本
-  const ringCapacity = 48000 * 2; // 1 秒双声道容量
+  // 优先使用独立实时音频线程 AudioWorklet（零主线程卡顿爆音）
+  if (ctx.audioWorklet) {
+    let workletUrl = '';
+    try {
+      const blob = new Blob([SCK_WORKLET_CODE], { type: 'application/javascript' });
+      workletUrl = URL.createObjectURL(blob);
+      await ctx.audioWorklet.addModule(workletUrl);
+      const workletNode = new AudioWorkletNode(ctx, 'sck-pcm-processor', {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+      workletNode.connect(dest);
+
+      const offPcm = window.electronAPI.onNativeAudioPcm((rawBuf) => {
+        if (!rawBuf) return;
+        const bytes = rawBuf instanceof Uint8Array ? rawBuf : new Uint8Array(rawBuf);
+        const floatLen = Math.floor(bytes.byteLength / 4);
+        if (floatLen <= 0) return;
+        // 拷贝为独立 Float32Array 后 Transferable 零拷贝转交音频线程
+        const copy = new Float32Array(floatLen);
+        copy.set(new Float32Array(bytes.buffer, bytes.byteOffset, floatLen));
+        workletNode.port.postMessage(copy, [copy.buffer]);
+      });
+
+      return {
+        stream: dest.stream,
+        isNativeSck: true,
+        cleanup: () => {
+          try { offPcm?.(); } catch {}
+          try { workletNode.port.onmessage = null; workletNode.disconnect(); } catch {}
+          try { if (workletUrl) URL.revokeObjectURL(workletUrl); } catch {}
+          try { ctx.close(); } catch {}
+          window.electronAPI?.stopNativeAudioStream?.();
+        },
+      };
+    } catch {
+      if (workletUrl) {
+        try { URL.revokeObjectURL(workletUrl); } catch {}
+      }
+    }
+  }
+
+  // 兜底：若环境不支持 AudioWorklet，退回带水位漂移保护的 ScriptProcessorNode
+  const scriptNode = ctx.createScriptProcessor(512, 0, 2);
+  const ringCapacity = 48000 * 2;
   const ring = new Float32Array(ringCapacity);
+  const highWater = Math.floor(48000 * 0.085) * 2;
+  const targetWater = Math.floor(48000 * 0.025) * 2;
   let writePos = 0;
   let readPos = 0;
   let available = 0;
@@ -111,11 +308,21 @@ async function createNativeSCKAudioStream() {
     const floats = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
     const n = floats.length;
     if (n <= 0) return;
+    if (available + n > ringCapacity) {
+      const drop = (available + n - targetWater) & ~1;
+      readPos = (readPos + drop) % ringCapacity;
+      available = Math.max(0, available - drop);
+    }
     for (let i = 0; i < n; i++) {
       ring[writePos] = floats[i];
       writePos = (writePos + 1) % ringCapacity;
     }
-    available = Math.min(ringCapacity, available + n);
+    available += n;
+    if (available > highWater) {
+      const drop = (available - targetWater) & ~1;
+      readPos = (readPos + drop) % ringCapacity;
+      available -= drop;
+    }
   });
 
   scriptNode.onaudioprocess = (ev) => {
@@ -139,6 +346,7 @@ async function createNativeSCKAudioStream() {
   scriptNode.connect(dest);
   return {
     stream: dest.stream,
+    isNativeSck: true,
     cleanup: () => {
       try { offPcm?.(); } catch {}
       try { scriptNode.disconnect(); } catch {}
@@ -518,7 +726,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.24';
+  let currentVersion = '1.0.25';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -708,9 +916,10 @@ export default function App() {
 
   // 导师开麦独立语音通道 WebRTC 引用
   const mentorVoiceSessionRef = useRef(null); // { stream, audioTrack, peers: Map<listenerId, { pc, pendingIce: [] }> }
-  const voiceListenerPcsRef = useRef(new Map()); // Map<speakerId, { pc, audioEl, stream, pendingIce: [], reconnectTimer }>
+  const voiceListenerPcsRef = useRef(new Map()); // Map<speakerId, { pc, audioEl, stream, pendingIce: [], reconnectTimer, meterCtx, analyser, pcm }>
   const earlyVoiceIceRef = useRef(new Map()); // Map<speakerId, RTCIceCandidateInit[]>
   const mentorVoiceMutedRef = useRef(false);
+  const mentorVoiceRmsRef = useRef(0); // 客户端当前正在播放的导师语音实时电平（供 Windows/BlackHole 防回环门控使用）
 
   // 桌面端：检测系统是否支持毛玻璃 + 启动时获取版本号并静默检查更新
   useEffect(() => {
@@ -936,7 +1145,11 @@ export default function App() {
 
     try {
       const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+      const tunedOffer = {
+        type: offer.type,
+        sdp: enhanceOpusSdp(offer.sdp, { stereo: Boolean(session.sysAudioTrack), maxAverageBitrate: 96000 }),
+      };
+      await pc.setLocalDescription(tunedOffer);
       if (wsRef.current?.readyState === 1) {
         wsRef.current.send(JSON.stringify({
           type: 'RTC_SIGNAL',
@@ -1033,6 +1246,7 @@ export default function App() {
       // 0.5 macOS 优先尝试腾讯会议同款 ScreenCaptureKit 原生系统音频内录（零驱动、不改系统输出设备、键盘音量键正常、自动排除自身进程声音）
       let blackholeInstalled = false;
       let nativeSckCleanup = null;
+      let isNativeSckAudio = false;
       let sysAudioStream = null;
       let micStream = null;
       let micError = '';
@@ -1043,6 +1257,7 @@ export default function App() {
           if (sckHandle?.stream) {
             sysAudioStream = sckHandle.stream;
             nativeSckCleanup = sckHandle.cleanup;
+            isNativeSckAudio = Boolean(sckHandle.isNativeSck);
           }
         } catch {}
 
@@ -1141,41 +1356,65 @@ export default function App() {
         micAudioTrack.enabled = initialMicOn;
       }
 
-      // 3. 把系统音与麦克风合并成单路音轨，并启用「自适应双讲检测 (Double-Talk Detection, DTD) + 双向动态增益」：
-      //    - 纯系统音播放（候选人未说话）：将麦克风增益压至 0.06，阻断扬声器外放回拾造成双重重音；
-      //    - 边放系统音边说话（触发双讲）：当 micRms 显著高于外放漏音基线时，立即全开麦克风(1.0)并适度压低系统音(0.55)，确保放音乐或对方说话时候选人的每一句话都能清晰记录；
-      //    - 系统音静默：麦克风与系统音均保持 1.0。
+      // 3. WebAudio 专业混音管线：
+      //    - 防导师开麦回环（Windows loopback / Mac BlackHole）：实时监听导师语音播放电平，导师讲话时立即压低系统音回传(0.03)并保持物理麦克风可用，彻底消除导师听到自己回声/啸叫；
+      //    - 自适应双讲检测 (DTD) + 双向动态增益：纯系统音时抑制外放重音，边放音乐边说话时立即放开麦克风并适度压低系统音；
+      //    - 麦克风 85Hz 高通滤波器：切掉风扇/空调/桌面低频嗡嗡底噪；
+      //    - 混音总输出串联 DynamicsCompressorNode 软限幅器：双讲叠加峰值绝不硬削波破音。
       let audioCtx = null;
       let mixedAudioTrack = null;
       let micGainNode = null;
       let duckTimer = null;
-      if (sysAudioTrack && micAudioTrack) {
+      if (sysAudioTrack || micAudioTrack) {
         try {
           // 强制 interactive 极低延迟缓冲 + 48000Hz 对齐 WebRTC Opus 原生采样率，消除重采样延迟
           audioCtx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
           await audioCtx.resume();
           const dest = audioCtx.createMediaStreamDestination();
-          const sysSource = audioCtx.createMediaStreamSource(new MediaStream([sysAudioTrack]));
-          const micSource = audioCtx.createMediaStreamSource(new MediaStream([micAudioTrack]));
 
-          const sysAnalyser = audioCtx.createAnalyser();
-          sysAnalyser.fftSize = 512;
-          const sysGainNode = audioCtx.createGain();
-          sysGainNode.gain.value = 1.0;
-          sysSource.connect(sysAnalyser);
-          sysSource.connect(sysGainNode);
-          sysGainNode.connect(dest);
+          // 总输出软限幅器：防止系统音与人声双讲叠加超过 0dBFS 硬削波破音
+          const limiter = audioCtx.createDynamicsCompressor();
+          limiter.threshold.value = -3;
+          limiter.knee.value = 6;
+          limiter.ratio.value = 12;
+          limiter.attack.value = 0.003;
+          limiter.release.value = 0.08;
+          limiter.connect(dest);
 
-          const micAnalyser = audioCtx.createAnalyser();
-          micAnalyser.fftSize = 512;
-          micGainNode = audioCtx.createGain();
-          micGainNode.gain.value = initialMicOn ? 1.0 : 0.0;
-          micSource.connect(micAnalyser);
-          micSource.connect(micGainNode);
-          micGainNode.connect(dest);
+          let sysAnalyser = null;
+          let sysGainNode = null;
+          if (sysAudioTrack) {
+            const sysSource = audioCtx.createMediaStreamSource(new MediaStream([sysAudioTrack]));
+            sysAnalyser = audioCtx.createAnalyser();
+            sysAnalyser.fftSize = 512;
+            sysGainNode = audioCtx.createGain();
+            sysGainNode.gain.value = 1.0;
+            sysSource.connect(sysAnalyser);
+            sysSource.connect(sysGainNode);
+            sysGainNode.connect(limiter);
+          }
 
-          const sysPcm = new Uint8Array(sysAnalyser.fftSize);
-          const micPcm = new Uint8Array(micAnalyser.fftSize);
+          let micAnalyser = null;
+          if (micAudioTrack) {
+            const micSource = audioCtx.createMediaStreamSource(new MediaStream([micAudioTrack]));
+            // 85Hz 高通滤波器：过滤电脑风扇、空调与桌面共振低频嗡嗡底噪，保留清晰人声频段
+            const micHighPass = audioCtx.createBiquadFilter();
+            micHighPass.type = 'highpass';
+            micHighPass.frequency.value = 85;
+            micHighPass.Q.value = 0.7;
+
+            micAnalyser = audioCtx.createAnalyser();
+            micAnalyser.fftSize = 512;
+            micGainNode = audioCtx.createGain();
+            micGainNode.gain.value = initialMicOn ? 1.0 : 0.0;
+            micSource.connect(micHighPass);
+            micHighPass.connect(micAnalyser);
+            micHighPass.connect(micGainNode);
+            micGainNode.connect(limiter);
+          }
+
+          const sysPcm = sysAnalyser ? new Uint8Array(sysAnalyser.fftSize) : null;
+          const micPcm = micAnalyser ? new Uint8Array(micAnalyser.fftSize) : null;
           const calcRms = (arr) => {
             let s = 0;
             for (let i = 0; i < arr.length; i++) {
@@ -1185,21 +1424,47 @@ export default function App() {
             return Math.sqrt(s / arr.length);
           };
 
+          // Windows WASAPI loopback 与 Mac BlackHole 会把客户端自己播放的导师声音录回去，需要软件防回环门控；
+          // Mac ScreenCaptureKit 已设 excludesCurrentProcessAudio=true，硬件级排除自身进程，无需压低系统音
+          const needsMentorLoopbackGuard = Boolean(sysGainNode && !isNativeSckAudio);
+
           let sysHoldFrames = 0;
           let speechHoldFrames = 0;
+          let mentorHoldFrames = 0;
           let leakRatio = 0.16; // 扬声器到麦克风的声学漏音比例估计值
 
           duckTimer = setInterval(() => {
-            if (!micGainNode || !audioCtx || audioCtx.state === 'closed') return;
-            if (!micAudioTrack.enabled) {
-              micGainNode.gain.setTargetAtTime(0.0, audioCtx.currentTime, 0.015);
-              sysGainNode.gain.setTargetAtTime(1.0, audioCtx.currentTime, 0.04);
-              return;
+            if (!audioCtx || audioCtx.state === 'closed') return;
+
+            // 统计客户端当前正在播放的导师语音实时电平（任一正在收听的导师音频轨道）
+            let mentorRms = 0;
+            if (!mentorVoiceMutedRef.current && voiceListenerPcsRef.current.size > 0) {
+              voiceListenerPcsRef.current.forEach((entry) => {
+                if (entry.analyser && entry.pcm) {
+                  entry.analyser.getByteTimeDomainData(entry.pcm);
+                  const r = calcRms(entry.pcm);
+                  if (r > mentorRms) mentorRms = r;
+                }
+              });
             }
-            sysAnalyser.getByteTimeDomainData(sysPcm);
-            micAnalyser.getByteTimeDomainData(micPcm);
-            const sysRms = calcRms(sysPcm);
-            const micRms = calcRms(micPcm);
+            mentorVoiceRmsRef.current = mentorRms;
+            if (mentorRms > 0.008) {
+              mentorHoldFrames = 8; // 240ms 防回环拖尾窗口，覆盖 BlackHole/WASAPI 缓冲延迟
+            } else if (mentorHoldFrames > 0) {
+              mentorHoldFrames -= 1;
+            }
+            const mentorSpeakingNow = mentorHoldFrames > 0;
+
+            let sysRms = 0;
+            if (sysAnalyser && sysPcm) {
+              sysAnalyser.getByteTimeDomainData(sysPcm);
+              sysRms = calcRms(sysPcm);
+            }
+            let micRms = 0;
+            if (micAnalyser && micPcm) {
+              micAnalyser.getByteTimeDomainData(micPcm);
+              micRms = calcRms(micPcm);
+            }
 
             if (sysRms > 0.008) {
               sysHoldFrames = 4; // 120ms 系统音活跃窗口
@@ -1207,47 +1472,64 @@ export default function App() {
               sysHoldFrames -= 1;
             }
 
-            // 双讲判定：候选人近讲人声能量明显超过扬声器外放漏音（绝对门限 0.016 + 相对漏音比 1.85 倍）
-            const echoCeiling = sysRms * Math.max(0.28, leakRatio * 1.85);
-            const isUserSpeaking = micRms > 0.016 && micRms > echoCeiling;
-
-            if (isUserSpeaking) {
-              speechHoldFrames = 9; // 保持约 270ms 人声拖尾，防止句尾被截断
-            } else if (speechHoldFrames > 0) {
-              speechHoldFrames -= 1;
-            } else if (sysRms > 0.015 && micRms > 0.001) {
-              // 未说话且系统音稳定时，慢速自适应更新扬声器外放漏音比（限制在 0.05 ~ 0.35 之间）
-              const instRatio = Math.min(0.35, Math.max(0.05, micRms / sysRms));
-              leakRatio = leakRatio * 0.9 + instRatio * 0.1;
-            }
-
-            let targetMicGain = 1.0;
+            let targetMicGain = micAudioTrack?.enabled ? 1.0 : 0.0;
             let targetSysGain = 1.0;
-            if (sysHoldFrames > 0) {
-              if (speechHoldFrames > 0) {
-                // 边放声音边说话（Double-Talk）：全开麦克风，并适度压低系统背景音使人声清晰可辨
-                targetMicGain = 1.0;
-                targetSysGain = 0.55;
-              } else {
-                // 仅系统音播放、候选人未说话：抑制麦克风回拾，消除双重重音
-                targetMicGain = 0.06;
-                targetSysGain = 1.0;
+
+            if (sysGainNode && micGainNode && micAudioTrack?.enabled) {
+              // 双讲判定：候选人近讲人声能量明显超过扬声器外放漏音（绝对门限 0.016 + 相对漏音比 1.85 倍）
+              const echoCeiling = sysRms * Math.max(0.28, leakRatio * 1.85);
+              const isUserSpeaking = micRms > 0.016 && micRms > echoCeiling;
+
+              if (isUserSpeaking) {
+                speechHoldFrames = 9; // 保持约 270ms 人声拖尾，防止句尾被截断
+              } else if (speechHoldFrames > 0) {
+                speechHoldFrames -= 1;
+              } else if (sysRms > 0.015 && micRms > 0.001 && !mentorSpeakingNow) {
+                // 未说话且系统音稳定时，慢速自适应更新扬声器外放漏音比（限制在 0.05 ~ 0.35 之间）
+                const instRatio = Math.min(0.35, Math.max(0.05, micRms / sysRms));
+                leakRatio = leakRatio * 0.9 + instRatio * 0.1;
+              }
+
+              if (sysHoldFrames > 0) {
+                if (speechHoldFrames > 0) {
+                  // 边放声音边说话（Double-Talk）：全开麦克风，并适度压低系统背景音使人声清晰可辨
+                  targetMicGain = 1.0;
+                  targetSysGain = 0.55;
+                } else {
+                  // 仅系统音播放、候选人未说话：抑制麦克风回拾，消除双重重音
+                  targetMicGain = 0.06;
+                  targetSysGain = 1.0;
+                }
               }
             }
 
-            micGainNode.gain.setTargetAtTime(targetMicGain, audioCtx.currentTime, targetMicGain >= 1.0 ? 0.008 : 0.025);
-            sysGainNode.gain.setTargetAtTime(targetSysGain, audioCtx.currentTime, 0.04);
+            // Windows / BlackHole 模式下：导师正在开麦讲话时，立即将系统音回传增益压至 0.02（约 -34dB），
+            // 防止导师声音经由 loopback / BlackHole 倒灌回传形成大回声或啸叫；若候选人开着麦且没说话，也压低麦克风防外放回拾
+            if (needsMentorLoopbackGuard && mentorSpeakingNow) {
+              targetSysGain = 0.02;
+              if (micGainNode && micAudioTrack?.enabled && speechHoldFrames === 0) {
+                targetMicGain = 0.04;
+              }
+            }
+
+            if (micGainNode) {
+              micGainNode.gain.setTargetAtTime(targetMicGain, audioCtx.currentTime, targetMicGain >= 1.0 ? 0.008 : 0.02);
+            }
+            if (sysGainNode) {
+              sysGainNode.gain.setTargetAtTime(targetSysGain, audioCtx.currentTime, targetSysGain < 0.1 ? 0.008 : 0.035);
+            }
           }, 30);
 
           mixedAudioTrack = dest.stream.getAudioTracks()[0] || null;
         } catch {
-          // 混音失败时退化为只传系统音
-          mixedAudioTrack = sysAudioTrack;
+          // 混音失败时退化为单轨直出
+          mixedAudioTrack = sysAudioTrack || micAudioTrack || null;
         }
       } else {
-        mixedAudioTrack = sysAudioTrack || micAudioTrack || null;
+        mixedAudioTrack = null;
       }
-      if (mixedAudioTrack && 'contentHint' in mixedAudioTrack) {
+      // 只有纯麦克风时设 speech；带系统音时保留默认全频带（不强降成窄带语音，让音乐/视频与人声都饱满）
+      if (mixedAudioTrack && !sysAudioTrack && 'contentHint' in mixedAudioTrack) {
         try { mixedAudioTrack.contentHint = 'speech'; } catch {}
       }
 
@@ -1563,7 +1845,11 @@ export default function App() {
           await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
         }
         const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        const tunedAnswer = {
+          type: answer.type,
+          sdp: enhanceOpusSdp(answer.sdp, { stereo: true, maxAverageBitrate: 96000 }),
+        };
+        await pc.setLocalDescription(tunedAnswer);
         if (wsRef.current?.readyState === 1) {
           wsRef.current.send(JSON.stringify({
             type: 'RTC_SIGNAL',
@@ -1670,7 +1956,11 @@ export default function App() {
 
     try {
       const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+      const tunedOffer = {
+        type: offer.type,
+        sdp: enhanceOpusSdp(offer.sdp, { stereo: false, maxAverageBitrate: 64000 }),
+      };
+      await pc.setLocalDescription(tunedOffer);
       if (wsRef.current?.readyState === 1) {
         wsRef.current.send(JSON.stringify({
           type: 'VOICE_SIGNAL',
@@ -1731,6 +2021,7 @@ export default function App() {
     cur.pc.oniceconnectionstatechange = null;
     cur.pc.onconnectionstatechange = null;
     try { cur.pc.close(); } catch {}
+    try { cur.meterCtx?.close?.(); } catch {}
     if (cur.audioEl) {
       try {
         cur.audioEl.pause();
@@ -1793,7 +2084,16 @@ export default function App() {
 
         const earlyQueued = earlyVoiceIceRef.current.get(from) || [];
         earlyVoiceIceRef.current.delete(from);
-        const lState = { pc, audioEl, stream: remoteStream, pendingIce: [...earlyQueued], reconnectTimer: null };
+        const lState = {
+          pc,
+          audioEl,
+          stream: remoteStream,
+          pendingIce: [...earlyQueued],
+          reconnectTimer: null,
+          meterCtx: null,
+          analyser: null,
+          pcm: null,
+        };
         voiceListenerPcsRef.current.set(from, lState);
 
         pc.ontrack = (ev) => {
@@ -1810,6 +2110,21 @@ export default function App() {
           audioEl.srcObject = remoteStream;
           audioEl.muted = Boolean(mentorVoiceMutedRef.current);
           audioEl.play().catch(() => {});
+
+          // 为导师语音流挂载实时电平分析器（不接 destination 避免双重播放），供客户端 Windows/BlackHole 防回环门控实时检测
+          if (!lState.analyser && remoteStream.getAudioTracks().length > 0) {
+            try {
+              const mCtx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
+              mCtx.resume().catch(() => {});
+              const src = mCtx.createMediaStreamSource(remoteStream);
+              const an = mCtx.createAnalyser();
+              an.fftSize = 512;
+              src.connect(an);
+              lState.meterCtx = mCtx;
+              lState.analyser = an;
+              lState.pcm = new Uint8Array(an.fftSize);
+            } catch {}
+          }
         };
 
         pc.onicecandidate = (ev) => {
@@ -1850,7 +2165,11 @@ export default function App() {
           await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
         }
         const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        const tunedAnswer = {
+          type: answer.type,
+          sdp: enhanceOpusSdp(answer.sdp, { stereo: false, maxAverageBitrate: 64000 }),
+        };
+        await pc.setLocalDescription(tunedAnswer);
         if (wsRef.current?.readyState === 1) {
           wsRef.current.send(JSON.stringify({
             type: 'VOICE_SIGNAL',

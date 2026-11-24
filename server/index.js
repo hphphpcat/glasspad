@@ -35,9 +35,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.24';
+let pkgVersion = '1.0.25';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.24';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.25';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -64,7 +64,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增导师端开麦（独立 WebRTC 语音通话通道 + Cloudflare TURN 跨区穿透），客户端自动收听并可一键静音\n2. 优化光标名字标签：仅鼠标主动点击/框选时显示名字，打字/删除/粘贴不再被动弹出名字\n3. 根治跨区/台湾 IP 共享黑屏：修复 ICE 竞态丢包 + 8 秒无画面自动切换强制 TURN 中继 + 顶栏一键切中继线路',
+  notes: process.env.RELEASE_NOTES || '1. 音频引擎全面升级：Mac ScreenCaptureKit 升级独立音频线程 AudioWorklet + 85ms 水位漂移修剪，彻底消除主线程爆音与长时间延迟累积\n2. 彻底阻断 Windows loopback / Mac BlackHole 下导师开麦倒灌回声，新增 85Hz 高通去风扇底噪与 DynamicsCompressorNode 防削波限幅\n3. 强制开启 Opus 带内前向纠错(useinbandfec=1)与系统音全频立体声，跨国/弱网人声抗丢包翻倍',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
