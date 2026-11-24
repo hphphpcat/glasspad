@@ -87,6 +87,29 @@ async function getMacAudioSources() {
   }
 }
 
+// ── 视频编码硬件加速优先（降低与腾讯会议同时共享时的 CPU/GPU 争抢） ──
+// 优先把 H.264 硬件编码排到最前（Mac VideoToolbox / Win MediaFoundation 功耗仅为 VP9 软编的 1/4），VP8 次之
+function preferHardwareVideoCodec(pc, sender) {
+  try {
+    if (typeof RTCRtpSender === 'undefined' || !RTCRtpSender.getCapabilities) return;
+    const caps = RTCRtpSender.getCapabilities('video');
+    if (!caps || !Array.isArray(caps.codecs)) return;
+    const trans = pc.getTransceivers().find((t) => t.sender === sender);
+    if (!trans || typeof trans.setCodecPreferences !== 'function') return;
+    const h264 = [];
+    const vp8 = [];
+    const others = [];
+    for (const c of caps.codecs) {
+      const mime = String(c.mimeType || '').toLowerCase();
+      if (mime === 'video/h264') h264.push(c);
+      else if (mime === 'video/vp8') vp8.push(c);
+      else others.push(c);
+    }
+    const ordered = [...h264, ...vp8, ...others];
+    if (ordered.length > 0) trans.setCodecPreferences(ordered);
+  } catch {}
+}
+
 // 音频编码抗丢包优化：强制在 SDP 中为 Opus 开启带内前向纠错 (useinbandfec=1) 与高码率语音/立体声参数，
 // 显著提升跨国/台湾代理/弱网下的语音清晰度与抗丢包能力，减少吞字与机器人声
 function enhanceOpusSdp(sdp, { stereo = false, maxAverageBitrate = 96000 } = {}) {
@@ -726,7 +749,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.25';
+  let currentVersion = '1.0.26';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -1049,6 +1072,8 @@ export default function App() {
     if (cur) {
       if (cur.reconnectTimer) clearTimeout(cur.reconnectTimer);
       if (cur.frameWatchTimer) clearTimeout(cur.frameWatchTimer);
+      if (cur.disconnectTimer) clearTimeout(cur.disconnectTimer);
+      if (cur.stallTimer) clearInterval(cur.stallTimer);
       cur.pc.onicecandidate = null;
       cur.pc.ontrack = null;
       cur.pc.onconnectionstatechange = null;
@@ -1063,17 +1088,40 @@ export default function App() {
     setViewerConnMode('');
   };
 
+  // 按当前在线观看者人数动态调整每路视频码率与帧率，避免多导师同时看 + 腾讯会议并行时上行带宽与 CPU 被挤爆
+  const rebalanceSharePeersBitrate = (session) => {
+    if (!session || session.stopped) return;
+    const peerCount = Math.max(1, session.peers.size);
+    const maxBitrate = peerCount === 1 ? 1_800_000 : peerCount === 2 ? 1_200_000 : 850_000;
+    const maxFramerate = peerCount === 1 ? 24 : peerCount === 2 ? 18 : 15;
+    session.peers.forEach((entry) => {
+      if (!entry.videoSender) return;
+      try {
+        const params = entry.videoSender.getParameters() || {};
+        if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+        params.encodings[0].maxBitrate = maxBitrate;
+        params.encodings[0].maxFramerate = maxFramerate;
+        params.encodings[0].priority = 'high';
+        params.encodings[0].networkPriority = 'high';
+        params.degradationPreference = 'maintain-resolution';
+        entry.videoSender.setParameters(params).catch(() => {});
+      } catch {}
+    });
+  };
+
   // ── 屏幕共享：关闭单个观看者的 PeerConnection（共享端） ──
   const removeViewerPeer = (viewerId) => {
     const session = shareSessionRef.current;
     if (!session) return;
     const entry = session.peers.get(viewerId);
     if (entry) {
+      if (entry.disconnectTimer) clearTimeout(entry.disconnectTimer);
       entry.pc.onicecandidate = null;
       entry.pc.onconnectionstatechange = null;
       entry.pc.oniceconnectionstatechange = null;
       try { entry.pc.close(); } catch {}
       session.peers.delete(viewerId);
+      rebalanceSharePeersBitrate(session);
     }
   };
 
@@ -1093,26 +1141,17 @@ export default function App() {
       bundlePolicy: 'max-bundle',
       iceCandidatePoolSize: 2,
     });
-    const entry = { pc, pendingIce: [] };
+    const entry = { pc, pendingIce: [], videoSender: null, disconnectTimer: null };
     session.peers.set(viewerId, entry);
 
     const sharedStream = session.outboundStream || session.displayStream;
 
     if (session.videoTrack) {
       const videoSender = pc.addTrack(session.videoTrack, sharedStream);
-      // 编码器低延迟与代码清晰度优先：限制最大 2.5Mbps / 30fps，弱网宁可降帧率也不模糊代码文字
-      try {
-        const params = videoSender.getParameters() || {};
-        if (!params.encodings || params.encodings.length === 0) {
-          params.encodings = [{}];
-        }
-        params.encodings[0].maxBitrate = 2_500_000;
-        params.encodings[0].maxFramerate = 30;
-        params.encodings[0].priority = 'high';
-        params.encodings[0].networkPriority = 'high';
-        params.degradationPreference = 'maintain-resolution';
-        videoSender.setParameters(params).catch(() => {});
-      } catch {}
+      entry.videoSender = videoSender;
+      // 优先使用硬件 H.264 编码，降低与腾讯会议并行全屏共享时的 CPU/GPU 争抢
+      preferHardwareVideoCodec(pc, videoSender);
+      rebalanceSharePeersBitrate(session);
     }
     if (session.audioTrack) {
       const audioSender = pc.addTrack(session.audioTrack, sharedStream);
@@ -1137,8 +1176,41 @@ export default function App() {
       }
     };
 
+    const schedulePeerDisconnectCleanup = () => {
+      if (entry.disconnectTimer) return;
+      // 遇到网络瞬断(disconnected)不再秒杀连接！给予 6 秒自愈宽限期，若未自动恢复则清理释放资源（观看端会拉起重连）
+      entry.disconnectTimer = setTimeout(() => {
+        entry.disconnectTimer = null;
+        if (session.peers.get(viewerId) !== entry) return;
+        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+          removeViewerPeer(viewerId);
+        }
+      }, 6000);
+    };
+
+    const clearPeerDisconnectCleanup = () => {
+      if (entry.disconnectTimer) {
+        clearTimeout(entry.disconnectTimer);
+        entry.disconnectTimer = null;
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        clearPeerDisconnectCleanup();
+      } else if (pc.iceConnectionState === 'disconnected') {
+        schedulePeerDisconnectCleanup();
+      } else if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+        removeViewerPeer(viewerId);
+      }
+    };
+
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+      if (pc.connectionState === 'connected') {
+        clearPeerDisconnectCleanup();
+      } else if (pc.connectionState === 'disconnected') {
+        schedulePeerDisconnectCleanup();
+      } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         removeViewerPeer(viewerId);
       }
     };
@@ -1172,8 +1244,10 @@ export default function App() {
         session.duckTimer = null;
       }
       session.peers.forEach((entry) => {
+        if (entry.disconnectTimer) clearTimeout(entry.disconnectTimer);
         entry.pc.onicecandidate = null;
         entry.pc.onconnectionstatechange = null;
+        entry.pc.oniceconnectionstatechange = null;
         try { entry.pc.close(); } catch {}
       });
       session.peers.clear();
@@ -1192,8 +1266,9 @@ export default function App() {
     setSpeakerTipDismissed(false);
     setAudioSetupMsg('');
     setShowAudioGuide(false);
-    // 停止共享时恢复物理扬声器为系统默认输出设备（让 Mac 键盘音量加减键立即恢复正常控制）
+    // 停止共享时恢复物理扬声器为系统默认输出设备（让 Mac 键盘音量加减键立即恢复正常控制）并释放系统防休眠锁
     speakerDuckedRef.current = false;
+    window.electronAPI?.setPowerKeepAwake?.(false).catch?.(() => {});
     window.electronAPI?.restoreAudioOutput?.().catch?.(() => {});
     if (notifyServer && wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({ type: 'SCREEN_SHARE_STOP' }));
@@ -1214,7 +1289,7 @@ export default function App() {
       }
 
       // 1. 直接调用 getDisplayMedia 触发系统底层 desktopCapturer.getSources：
-      //    限制最大 1920x1080 @ 30fps，避免 Retina/4K 全分辨率软编排队积压造成音画延迟；
+      //    限制最大 1920x1080 @ 24fps，与腾讯会议全屏共享并行时显著降低 GPU/CPU 抢占与排队延迟；
       //    Windows 请求系统内录（关闭回声消除/降噪/自动增益），macOS 不请求音频（loopback 不支持）
       let displayStream;
       try {
@@ -1222,7 +1297,7 @@ export default function App() {
           video: {
             width: { ideal: 1920, max: 1920 },
             height: { ideal: 1080, max: 1080 },
-            frameRate: { ideal: 30, max: 30 },
+            frameRate: { ideal: 24, max: 24 },
           },
           audio: caps.systemAudioSupported
             ? {
@@ -1554,6 +1629,8 @@ export default function App() {
         peers: new Map(),
       };
       shareSessionRef.current = session;
+      // 共享期间请求主进程锁定防系统休眠/防进程挂起，避免窗口隐身或后台切走后音画被 OS 节流
+      window.electronAPI?.setPowerKeepAwake?.(true).catch?.(() => {});
 
       if (videoTrack) {
         videoTrack.addEventListener('ended', () => {
@@ -1699,6 +1776,10 @@ export default function App() {
           stream: remoteStream,
           reconnectTimer: null,
           frameWatchTimer: null,
+          disconnectTimer: null,
+          stallTimer: null,
+          lastBytesReceived: -1,
+          stallStrikes: 0,
           forceRelay: useRelayOnly,
         };
         viewerPcRef.current = viewerState;
@@ -1804,17 +1885,70 @@ export default function App() {
               if (nextRelay) setViewerForceRelay(true);
               requestJoinWithRelay(nextRelay);
             }
-          }, 2500);
+          }, 2200);
         };
+
+        const clearViewerDisconnectTimer = () => {
+          if (viewerState.disconnectTimer) {
+            clearTimeout(viewerState.disconnectTimer);
+            viewerState.disconnectTimer = null;
+          }
+        };
+
+        const scheduleViewerDisconnectRecovery = () => {
+          if (viewerPcRef.current !== viewerState || viewerState.disconnectTimer) return;
+          setViewerConnMode('网络波动，等待自动恢复…');
+          // 给予 3.5 秒自然恢复宽限期，若未回连则自动重建（有 TURN 时直接升中继，避免反复卡 P2P）
+          viewerState.disconnectTimer = setTimeout(() => {
+            viewerState.disconnectTimer = null;
+            if (viewerPcRef.current !== viewerState) return;
+            if (pc.connectionState !== 'connected' && pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
+              setViewerConnected(false);
+              setViewerConnMode(rtcCfg.hasTurn ? '网络瞬断，自动切换 TURN 中继恢复中…' : '网络瞬断，自动重连中…');
+              scheduleViewerReconnect(rtcCfg.hasTurn);
+            }
+          }, 3500);
+        };
+
+        // 运行时防「假连通定格」看门狗：每 6 秒检查入站总字节（音+视）是否持续增长，
+        // 连续 3 次（18 秒）零字节新增说明底层 UDP 路径已僵死（跨区代理长时间挂机常见），自动静默切换 TURN 重建
+        viewerState.stallTimer = setInterval(async () => {
+          if (viewerPcRef.current !== viewerState) return;
+          if (pc.connectionState !== 'connected' && pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') return;
+          try {
+            const stats = await pc.getStats();
+            let totalBytes = 0;
+            stats.forEach((r) => {
+              if (r.type === 'inbound-rtp' && typeof r.bytesReceived === 'number') {
+                totalBytes += r.bytesReceived;
+              }
+            });
+            if (viewerState.lastBytesReceived >= 0 && totalBytes <= viewerState.lastBytesReceived) {
+              viewerState.stallStrikes += 1;
+              if (viewerState.stallStrikes >= 3) {
+                viewerState.stallStrikes = 0;
+                setViewerConnMode('检测到画面流停滞，正在自动重建连接…');
+                requestJoinWithRelay(rtcCfg.hasTurn ? true : viewerState.forceRelay);
+              }
+            } else {
+              viewerState.stallStrikes = 0;
+            }
+            viewerState.lastBytesReceived = totalBytes;
+          } catch {}
+        }, 6000);
 
         pc.oniceconnectionstatechange = () => {
           if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+            clearViewerDisconnectTimer();
             setViewerConnected(true);
             detectConnMode();
             tryPlayVideo();
           } else if (pc.iceConnectionState === 'checking') {
             setViewerConnMode(useRelayOnly ? 'TURN 中继握手中…' : '正在穿透网络…');
+          } else if (pc.iceConnectionState === 'disconnected') {
+            scheduleViewerDisconnectRecovery();
           } else if (pc.iceConnectionState === 'failed') {
+            clearViewerDisconnectTimer();
             setViewerConnected(false);
             setViewerConnMode(rtcCfg.hasTurn ? '切换 TURN 中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
             scheduleViewerReconnect(rtcCfg.hasTurn);
@@ -1823,14 +1957,19 @@ export default function App() {
 
         pc.onconnectionstatechange = () => {
           if (pc.connectionState === 'connected') {
+            clearViewerDisconnectTimer();
             setViewerConnected(true);
             detectConnMode();
             tryPlayVideo();
+          } else if (pc.connectionState === 'disconnected') {
+            scheduleViewerDisconnectRecovery();
           } else if (pc.connectionState === 'failed') {
+            clearViewerDisconnectTimer();
             setViewerConnected(false);
             setViewerConnMode(rtcCfg.hasTurn ? '切换 TURN 中继重连中…' : 'NAT 穿透失败（需配置 TURN 中继）');
             scheduleViewerReconnect(rtcCfg.hasTurn);
-          } else if (pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+          } else if (pc.connectionState === 'closed') {
+            clearViewerDisconnectTimer();
             setViewerConnected(false);
           }
         };
@@ -1882,8 +2021,10 @@ export default function App() {
     if (!sess) return;
     const entry = sess.peers.get(listenerId);
     if (entry) {
+      if (entry.disconnectTimer) clearTimeout(entry.disconnectTimer);
       entry.pc.onicecandidate = null;
       entry.pc.onconnectionstatechange = null;
+      entry.pc.oniceconnectionstatechange = null;
       try { entry.pc.close(); } catch {}
       sess.peers.delete(listenerId);
     }
@@ -1894,8 +2035,10 @@ export default function App() {
     if (sess) {
       sess.stopped = true;
       sess.peers.forEach((entry) => {
+        if (entry.disconnectTimer) clearTimeout(entry.disconnectTimer);
         entry.pc.onicecandidate = null;
         entry.pc.onconnectionstatechange = null;
+        entry.pc.oniceconnectionstatechange = null;
         try { entry.pc.close(); } catch {}
       });
       sess.peers.clear();
@@ -1924,7 +2067,7 @@ export default function App() {
       bundlePolicy: 'max-bundle',
       iceCandidatePoolSize: 2,
     });
-    const entry = { pc, pendingIce: [] };
+    const entry = { pc, pendingIce: [], disconnectTimer: null };
     sess.peers.set(listenerId, entry);
 
     if (sess.audioTrack) {
@@ -1948,8 +2091,26 @@ export default function App() {
       }
     };
 
+    const scheduleVoicePeerCleanup = () => {
+      if (entry.disconnectTimer) return;
+      entry.disconnectTimer = setTimeout(() => {
+        entry.disconnectTimer = null;
+        if (sess.peers.get(listenerId) !== entry) return;
+        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+          removeVoiceListenerPeer(listenerId);
+        }
+      }, 6000);
+    };
+
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+      if (pc.connectionState === 'connected') {
+        if (entry.disconnectTimer) {
+          clearTimeout(entry.disconnectTimer);
+          entry.disconnectTimer = null;
+        }
+      } else if (pc.connectionState === 'disconnected') {
+        scheduleVoicePeerCleanup();
+      } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         removeVoiceListenerPeer(listenerId);
       }
     };
@@ -2150,10 +2311,10 @@ export default function App() {
         };
 
         pc.oniceconnectionstatechange = () => {
-          if (pc.iceConnectionState === 'failed') scheduleVoiceRetry();
+          if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') scheduleVoiceRetry();
         };
         pc.onconnectionstatechange = () => {
-          if (pc.connectionState === 'failed') scheduleVoiceRetry();
+          if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') scheduleVoiceRetry();
         };
 
         await pc.setRemoteDescription(new RTCSessionDescription(sdp));
@@ -2288,6 +2449,7 @@ export default function App() {
     let ws;
     let reconnectTimer;
     let closed = false;
+    let lastPongAt = Date.now();
 
     const connect = () => {
       if (closed) return;
@@ -2295,6 +2457,7 @@ export default function App() {
       wsRef.current = ws;
 
       ws.onopen = () => {
+        lastPongAt = Date.now();
         setWsConnected(true);
         // 若客户端本地正在共享屏幕（例如断线重连后），自动重新向服务端注册共享状态
         if (shareSessionRef.current && !shareSessionRef.current.stopped) {
@@ -2313,7 +2476,9 @@ export default function App() {
       };
 
       ws.onmessage = (e) => {
+        lastPongAt = Date.now();
         const { type, payload } = JSON.parse(e.data);
+        if (type === 'PONG') return;
         if (type === 'AUTH_FAIL') {
           setAuthFail(true);
         } else if (type === 'ROOM_DESTROYED') {
@@ -2400,13 +2565,40 @@ export default function App() {
     connect();
 
     const heartbeat = setInterval(() => {
-      if (wsRef.current?.readyState === 1) {
-        wsRef.current.send(JSON.stringify({ type: 'PING' }));
+      const cur = wsRef.current;
+      if (!cur) return;
+      if (cur.readyState === 1) {
+        // 超过 35 秒未收到任何服务端下行消息或 PONG（典型半开死连接/切代理后假在线），主动断开触发秒级重连
+        if (Date.now() - lastPongAt > 35000) {
+          try { cur.close(); } catch {}
+          return;
+        }
+        cur.send(JSON.stringify({ type: 'PING', payload: { t: Date.now() } }));
       }
-    }, 20000);
+    }, 12000);
+
+    // 监听操作系统网络恢复事件（切换 WiFi / 开关代理 / 唤醒睡眠）：立即踢醒死 WS 并通知观看端刷新链路
+    const handleOnline = () => {
+      if (closed) return;
+      const cur = wsRef.current;
+      if (!cur || cur.readyState === WebSocket.CLOSED || cur.readyState === WebSocket.CLOSING) {
+        clearTimeout(reconnectTimer);
+        connect();
+      } else if (cur.readyState === WebSocket.OPEN) {
+        cur.send(JSON.stringify({ type: 'PING', payload: { t: Date.now() } }));
+        if (viewerPcRef.current && viewerPcRef.current.pc.connectionState !== 'connected') {
+          cur.send(JSON.stringify({
+            type: 'SCREEN_VIEWER_JOIN',
+            payload: { forceRelay: Boolean(viewerPcRef.current.forceRelay) },
+          }));
+        }
+      }
+    };
+    window.addEventListener('online', handleOnline);
 
     return () => {
       closed = true;
+      window.removeEventListener('online', handleOnline);
       clearInterval(heartbeat);
       clearTimeout(reconnectTimer);
       ws?.close();

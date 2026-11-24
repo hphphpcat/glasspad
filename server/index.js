@@ -35,9 +35,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.25';
+let pkgVersion = '1.0.26';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.25';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.26';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -64,7 +64,7 @@ let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 音频引擎全面升级：Mac ScreenCaptureKit 升级独立音频线程 AudioWorklet + 85ms 水位漂移修剪，彻底消除主线程爆音与长时间延迟累积\n2. 彻底阻断 Windows loopback / Mac BlackHole 下导师开麦倒灌回声，新增 85Hz 高通去风扇底噪与 DynamicsCompressorNode 防削波限幅\n3. 强制开启 Opus 带内前向纠错(useinbandfec=1)与系统音全频立体声，跨国/弱网人声抗丢包翻倍',
+  notes: process.env.RELEASE_NOTES || '1. 同时共享（与腾讯会议并行）深度稳定性优化：禁用后台/隐身节流 + 共享期 powerSaveBlocker 防系统休眠挂起 + 优先 H.264 硬件编码 + 按观看人数动态限码限帧\n2. 弱网瞬断无感自愈：修复推流端 disconnected 秒杀连接缺陷（6s 宽限期），观看端/语音端均接入断链自动恢复与 18s 画面僵死看门狗\n3. 信令防假在线：服务端响应 PING/PONG，客户端 12s 心跳 + 35s 死链主动踢断 + 系统 online 事件秒级拉起',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -697,6 +697,12 @@ wss.on('connection', (ws, req) => {
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.type === 'PING') return; // 心跳，不回显
 
+    if (msg.type === 'PING') {
+      if (ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'PONG', payload: { t: msg.payload?.t || Date.now() } }));
+      }
+      return;
+    }
     if (msg.type === 'TEXT_SYNC') {
       room.text = msg.payload.text;
       const outPayload = { text: room.text };

@@ -10,6 +10,7 @@ const {
   shell,
   screen,
   Menu,
+  powerSaveBlocker,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -24,8 +25,14 @@ if (!gotSingleInstanceLock) {
   app.quit();
 }
 
+// 防止 Chromium 在窗口隐身(opacity:0)/切后台时将 WebRTC 编码、AudioContext、30ms 混音定时器与 WS 心跳降频挂起
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+
 let mainWindow;
 let isStealthHidden = false; // ⌘+B 零重建隐身状态（用 setOpacity(0)+鼠标穿透代替 hide/show，彻底杜绝唤醒时单帧闪现）
+let sharePowerBlockerId = null; // 共享期间系统防休眠/防挂起锁 ID
 const MOVE_STEP = 40;
 const DEFAULT_UPDATE_BASE = 'https://glasspad.up.railway.app';
 
@@ -222,6 +229,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       spellcheck: false,          // 禁用系统拼写检查弹窗（避免弹出不受防截屏保护的原生候选框）
+      backgroundThrottling: false, // 彻底禁用后台/隐身态定时器和 WebRTC 帧率节流，确保与腾讯会议并行共享时不卡顿不断流
     },
   });
 
@@ -296,6 +304,25 @@ function createWindow() {
     mainWindow.loadFile(localDistHtml);
   }
 }
+
+// 共享/通话期间防系统休眠与应用挂起锁（由渲染层开始/结束共享时启停，退出时兜底释放）
+ipcMain.handle('SET_POWER_KEEP_AWAKE', (_e, active) => {
+  try {
+    if (active) {
+      if (sharePowerBlockerId === null || !powerSaveBlocker.isStarted(sharePowerBlockerId)) {
+        sharePowerBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+      }
+      return { active: true, id: sharePowerBlockerId };
+    }
+    if (sharePowerBlockerId !== null && powerSaveBlocker.isStarted(sharePowerBlockerId)) {
+      powerSaveBlocker.stop(sharePowerBlockerId);
+    }
+    sharePowerBlockerId = null;
+    return { active: false };
+  } catch (err) {
+    return { active: false, error: err?.message || 'powerSaveBlocker failed' };
+  }
+});
 
 // 前端查询当前系统是否支持毛玻璃（Win10 返回 false，前端自动隐藏开关）
 ipcMain.handle('GET_FROST_SUPPORT', () => ({
@@ -983,6 +1010,12 @@ app.whenReady().then(() => {
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   stopNativeAudioStream();
+  try {
+    if (sharePowerBlockerId !== null && powerSaveBlocker.isStarted(sharePowerBlockerId)) {
+      powerSaveBlocker.stop(sharePowerBlockerId);
+    }
+    sharePowerBlockerId = null;
+  } catch {}
   if (process.platform === 'darwin') {
     try {
       const helperPath = resolveBlackHoleHelperPath();

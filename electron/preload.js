@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getMediaPermissionStatus: () => ipcRenderer.invoke('GET_MEDIA_PERMISSION_STATUS'),
   getScreenShareCaps: () => ipcRenderer.invoke('GET_SCREEN_SHARE_CAPS'),
   openPrivacySettings: (type) => ipcRenderer.invoke('OPEN_PRIVACY_SETTINGS', type),
+  setPowerKeepAwake: (active) => ipcRenderer.invoke('SET_POWER_KEEP_AWAKE', Boolean(active)),
   // macOS 系统音内录（腾讯会议同款 ScreenCaptureKit 原生流 + BlackHole 多输出兜底）
   getAudioSetupStatus: () => ipcRenderer.invoke('GET_AUDIO_SETUP_STATUS'),
   runAudioSetup: () => ipcRenderer.invoke('RUN_AUDIO_SETUP'),
