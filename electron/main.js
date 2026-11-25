@@ -248,6 +248,34 @@ function createWindow() {
     e.preventDefault();
   });
 
+  // 2b. macOS 隐身模式关闭了原生应用菜单（Menu.setApplicationMenu(null)），但 AppKit 的 ⌘C/⌘V/⌘X/⌘A/⌘Z 依赖编辑菜单；
+  //     通过 before-input-event 手动桥接标准剪贴板与撤销快捷键，既保持零菜单栏暴露，又确保客户端编辑区复制/粘贴/全选/撤销完全正常
+  if (process.platform === 'darwin') {
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+      if (input.type !== 'keyDown' || !input.meta || input.alt || input.control) return;
+      const k = String(input.key || '').toLowerCase();
+      if (k === 'c' && !input.shift) {
+        event.preventDefault();
+        mainWindow.webContents.copy();
+      } else if (k === 'v' && !input.shift) {
+        event.preventDefault();
+        mainWindow.webContents.paste();
+      } else if (k === 'x' && !input.shift) {
+        event.preventDefault();
+        mainWindow.webContents.cut();
+      } else if (k === 'a' && !input.shift) {
+        event.preventDefault();
+        mainWindow.webContents.selectAll();
+      } else if (k === 'z' && !input.shift) {
+        event.preventDefault();
+        mainWindow.webContents.undo();
+      } else if (k === 'z' && input.shift) {
+        event.preventDefault();
+        mainWindow.webContents.redo();
+      }
+    });
+  }
+
   // 3. 在所有可能触发 DWM / WindowServer 刷新窗口属性的生命周期事件上同步重申防截屏保护
   const stealthEvents = [
     'show',

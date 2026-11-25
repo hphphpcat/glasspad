@@ -772,7 +772,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.31';
+  let currentVersion = '1.0.32';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -1086,6 +1086,14 @@ export default function App() {
       setCheckingUpdate(false);
     }
   };
+
+  // 桌面端默认可编辑，同时提供一键锁死「只读防误触」切换（防止浏览时不小心按键盘改坏提词）
+  const [clientReadOnly, setClientReadOnly] = useState(() => localStorage.getItem('pad_client_readonly') === 'true');
+  const clientReadOnlyRef = useRef(clientReadOnly);
+  useEffect(() => {
+    clientReadOnlyRef.current = clientReadOnly;
+    localStorage.setItem('pad_client_readonly', String(clientReadOnly));
+  }, [clientReadOnly]);
 
   // 桌面端：透明度与本地阅读字号记忆 + ⌘[/⌘] 调透明度 + ⌘+/⌘-/⌘0 调本地字号；
   // 导师端：⌘/Ctrl + +/-/0 对选中文字放大/缩小/重置
@@ -3594,12 +3602,13 @@ export default function App() {
   };
 
   const handleTextChange = (val, ev) => {
-    if (isClientApp) return; // 客户端只读，不发送
+    if (isClientApp && clientReadOnlyRef.current) return; // 客户端切到「只读锁定」时不发送
     if (isRemote.current) {
       isRemote.current = false;
       return;
     }
     const clean = normalizeLF(val);
+    latestText.current = clean;
     if (ev?.changes?.length && colorMarksRef.current.length > 0) {
       const shifted = shiftColorMarksByChanges(colorMarksRef.current, ev.changes);
       colorMarksRef.current = shifted;
@@ -3615,7 +3624,9 @@ export default function App() {
       sizeMarksRef.current = shiftedSize;
       renderSizeMarks(shiftedSize);
     }
-    if (candidateViewportsRef.current.size > 0) {
+    if (isClientApp) {
+      scheduleReportClientViewport(false);
+    } else if (candidateViewportsRef.current.size > 0) {
       renderCandidateViewports();
     }
     setText(clean);
@@ -3899,6 +3910,21 @@ export default function App() {
                         : '无声音'}
                 </span>
               )}
+
+              {/* 客户端编辑 / 只读锁定一键切换（默认可编辑并双向实时同步给导师） */}
+              <button
+                type="button"
+                onClick={() => setClientReadOnly((v) => !v)}
+                style={{
+                  background: clientReadOnly ? 'rgba(245, 158, 11, 0.16)' : 'rgba(16, 185, 129, 0.16)',
+                  color: clientReadOnly ? '#fbbf24' : '#34d399',
+                  border: `1px solid ${clientReadOnly ? 'rgba(245, 158, 11, 0.4)' : 'rgba(16, 185, 129, 0.45)'}`,
+                  borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 600,
+                  cursor: 'pointer', whiteSpace: 'nowrap',
+                }}
+              >
+                {clientReadOnly ? '🔒 只读' : '✏️ 可编辑'}
+              </button>
 
               {/* 客户端本地阅读字号快捷调节（⌘+/⌘-/⌘0，仅影响本地阅读不影响导师） */}
               <div style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', background: 'rgba(31, 41, 55, 0.72)', border: '1px solid #374151', borderRadius: '6px', padding: '2px 4px' }}>
@@ -4321,7 +4347,7 @@ export default function App() {
           </div>
         )}
 
-        {/* 提词编辑器区（客户端只读，实时渲染导师标注的局部文字颜色） */}
+        {/* 提词编辑器区（双端实时协作编辑，客户端可一键切只读防误触，实时渲染导师标注的局部样式） */}
         <div
           ref={editorContainerRef}
           style={{
@@ -4338,8 +4364,8 @@ export default function App() {
             height="100%"
           theme="glasspad-transparent"
           language={language}
-          // 客户端不走受控 value（库在只读模式下每次 value 变化都会整体 setValue，清掉选区），
-          // 远端文字由 applyRemoteText 增量写入；导师端保持受控
+          // 客户端不走受控 value（避免每次重渲染整段 setValue 清掉光标/选区和撤销栈），
+          // 远端文字由 applyRemoteText 增量写入，本地编辑通过 handleTextChange 实时双向同步；导师端保持受控
           value={isClientApp ? undefined : text}
           defaultValue={text}
           onChange={handleTextChange}
@@ -4454,7 +4480,7 @@ export default function App() {
             });
           }}
           options={{
-            readOnly: isClientApp,
+            readOnly: isClientApp ? clientReadOnly : false,
             contextmenu: !isClientApp,
             hover: { enabled: !isClientApp },
             links: !isClientApp,

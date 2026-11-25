@@ -93,9 +93,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.31';
+let pkgVersion = '1.0.32';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.31';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.32';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -125,7 +125,7 @@ let appRelease = {
   minNativeVersion: DEFAULT_MIN_NATIVE_VERSION,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 候选人桌面端支持 ⌘+/⌘-/⌘0（Win 为 Ctrl+/Ctrl-/Ctrl0）及顶栏 A-/A+ 实时放大/缩小/重置本地阅读字号（11–32px，记忆到本地不影响导师端）\n2. 候选人端缩放时自动按偏移量联动放大导师标注的局部大字，并同步重算安全软换行、行高与向导师上报的可视阅读行范围',
+  notes: process.env.RELEASE_NOTES || '1. 候选人桌面端开放双向实时编辑：默认可编辑并毫秒级同步给导师端，顶栏新增「✏️ 可编辑 / 🔒 只读」一键锁定切换（记忆到本地，方便随时防误触）\n2. macOS 隐身模式下桥接标准剪贴板与撤销快捷键（⌘C / ⌘V / ⌘X / ⌘A / ⌘Z / ⇧⌘Z），保持零菜单栏暴露的同时编辑手感与原生编辑器完全一致',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
