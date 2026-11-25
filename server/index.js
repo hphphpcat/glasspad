@@ -93,9 +93,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.32';
+let pkgVersion = '1.0.33';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.32';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.33';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -125,7 +125,7 @@ let appRelease = {
   minNativeVersion: DEFAULT_MIN_NATIVE_VERSION,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 候选人桌面端开放双向实时编辑：默认可编辑并毫秒级同步给导师端，顶栏新增「✏️ 可编辑 / 🔒 只读」一键锁定切换（记忆到本地，方便随时防误触）\n2. macOS 隐身模式下桥接标准剪贴板与撤销快捷键（⌘C / ⌘V / ⌘X / ⌘A / ⌘Z / ⇧⌘Z），保持零菜单栏暴露的同时编辑手感与原生编辑器完全一致',
+  notes: process.env.RELEASE_NOTES || '1. 优化缩小文字时的行高计算：字号低于 15px 时移除固定 28px 下限，改为紧凑贴合行高（几乎无多余行间距，一屏显示更多行）\n2. 同步支持客户端 ⌘- 缩放与导师端局部缩小全篇两种场景，自动收紧行距',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };

@@ -410,6 +410,15 @@ function clampClientFontSize(v) {
   return Math.max(MIN_CLIENT_FONT_SIZE, Math.min(MAX_CLIENT_FONT_SIZE, n));
 }
 
+function computeCompactLineHeight(effectiveFontSize) {
+  const s = Math.max(10, Math.round(Number(effectiveFontSize) || DEFAULT_FONT_SIZE));
+  // 缩小字体（< 15px）采用紧凑贴合行高（几乎无多余行间距，一屏可看更多行）；默认/放大时保持清晰不重叠
+  if (s < DEFAULT_FONT_SIZE) {
+    return Math.max(12, Math.ceil(s * 1.15));
+  }
+  return Math.max(20, Math.ceil(s * 1.48));
+}
+
 // 动态注入局部字号 Monaco inlineClassName 样式，实现选中文字单独放大/缩小
 // 注意：支持客户端按本地阅读字号偏移量叠加缩放（最大可到 48px），且 line-height 继承自编辑器动态行高，避免大字上下裁切
 const injectedInlineSizeClasses = new Set();
@@ -772,7 +781,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.32';
+  let currentVersion = '1.0.33';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -3348,31 +3357,39 @@ export default function App() {
     boldMarksDecorations.current.set(decorations);
   };
 
-  // 根据文档当前最大有效字号 + 编辑器实际内容宽度，计算安全软换行基准：
-  // 客户端支持本地阅读字号缩放（clientFontSizeRef），导师标注的局部字号会随本地偏移量同步放大/缩小；
-  // 若存在局部比基础字号更大的片段，按最大字号换算安全 wordWrapColumn 并放宽 lineHeight，彻底杜绝大字体溢出右侧屏幕或上下重叠。
+  // 根据文档当前最大有效字号 + 编辑器实际内容宽度，计算紧凑行高与安全软换行基准：
+  // 1) 文档内若整篇都被缩小（或客户端按 ⌘- 缩小），maxSize 随实际显示字号同步下降，行高紧凑贴合（无多余行间距）；
+  // 2) 若存在局部比基础字号更大的片段，按最大字号换算安全 wordWrapColumn 并放宽 lineHeight，杜绝大字溢出或重叠。
   const syncEditorWrapForSizeMarks = (marks) => {
     const baseSize = isClientApp ? clientFontSizeRef.current : DEFAULT_FONT_SIZE;
     const localDelta = isClientApp ? (baseSize - DEFAULT_FONT_SIZE) : 0;
-    let maxSize = baseSize;
+    const editor = editorRef.current;
+    const model = editor?.getModel?.();
+    const docLen = model ? model.getValueLength() : (latestText.current?.length || 0);
+
+    // 检查是否有未被局部字号覆盖的“默认基础字号”文字；若全篇文字都被局部缩小，则按实际最大字号收紧行高
+    let coveredLen = 0;
+    let maxMarkedSize = 0;
     for (const m of marks || []) {
-      if (m && Number.isFinite(Number(m.size))) {
+      if (m && Number.isFinite(Number(m.size)) && m.end > m.start) {
         const eff = Math.max(10, Math.min(48, clampFontSize(m.size) + localDelta));
-        if (eff > maxSize) maxSize = eff;
+        if (eff > maxMarkedSize) maxMarkedSize = eff;
+        coveredLen += Math.max(0, Math.min(docLen, m.end) - Math.max(0, m.start));
       }
     }
+    const allCoveredByMarks = docLen > 0 && maxMarkedSize > 0 && coveredLen >= docLen;
+    const maxSize = allCoveredByMarks ? maxMarkedSize : Math.max(baseSize, maxMarkedSize);
     setEditorMaxFontSize(maxSize);
 
-    const editor = editorRef.current;
     if (!editor) return;
-    const safeLineHeight = Math.max(24, Math.ceil(maxSize * 1.52));
+    const targetLineHeight = computeCompactLineHeight(maxSize);
     if (maxSize <= baseSize) {
       setEditorWrapCols(0);
       try {
         editor.updateOptions({
           fontSize: baseSize,
           wordWrap: 'on',
-          lineHeight: Math.max(28, safeLineHeight),
+          lineHeight: targetLineHeight,
         });
       } catch {}
       return;
@@ -3394,7 +3411,7 @@ export default function App() {
         fontSize: baseSize,
         wordWrap: 'wordWrapColumn',
         wordWrapColumn: safeCols,
-        lineHeight: Math.max(28, safeLineHeight),
+        lineHeight: targetLineHeight,
       });
     } catch {}
   };
@@ -4489,7 +4506,7 @@ export default function App() {
             automaticLayout: true,
             fontFamily: codeFont,
             fontSize: isClientApp ? clientFontSize : DEFAULT_FONT_SIZE,
-            lineHeight: Math.max(28, Math.ceil(editorMaxFontSize * 1.52)),
+            lineHeight: computeCompactLineHeight(editorMaxFontSize),
             padding: { top: 8, bottom: 16 },
             lineNumbersMinChars: 4,
             glyphMargin: false,
