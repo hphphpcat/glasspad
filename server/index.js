@@ -93,9 +93,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.29';
+let pkgVersion = '1.0.30';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.29';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.30';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -125,7 +125,7 @@ let appRelease = {
   minNativeVersion: DEFAULT_MIN_NATIVE_VERSION,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 修复局部字体放大后网页端/客户端文字溢出右侧屏幕与上下行重叠问题：按文档最大字号与实时视口宽度动态重算软换行列数与行高，支持窗口缩放与分屏自适应\n2. 导师端顶栏右侧工具条支持自动换行，避免窄屏/浏览器放大时右侧控件溢出屏幕',
+  notes: process.env.RELEASE_NOTES || '1. 新增「导师实时查看候选人 Pad 阅读范围」：候选人滚动或缩放窗口时实时上报可视行区间，导师端编辑器内直接高亮候选人当前视野（左侧蓝青色发光竖条 + 上下边界线 + 悬浮行号标签 + 滚动条概览标尺）\n2. 导师端顶栏新增「👁 候选人：行 X–Y」一键定位胶囊与「跟随视角」开关，即使看不见候选人隐身悬浮窗，也能实时掌握其阅读位置',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -923,8 +923,9 @@ wss.on('connection', (ws, req) => {
     });
   };
 
-  // 下发当前房间文字内容、局部字体颜色标记、自身的 clientId、屏幕共享状态以及当前开麦导师列表
+  // 下发当前房间文字内容、局部字体颜色标记、自身的 clientId、屏幕共享状态、开麦导师列表以及候选人当前可视阅读范围
   if (!room.voiceSpeakers) room.voiceSpeakers = new Set();
+  if (!room.viewports) room.viewports = new Map();
   ws.send(JSON.stringify({
     type: 'INIT',
     payload: {
@@ -945,6 +946,7 @@ wss.on('connection', (ws, req) => {
         const info = targetWs ? room.clients.get(targetWs) : null;
         return { id, name: info?.name || '导师' };
       }),
+      viewports: Array.from(room.viewports.values()),
     },
   }));
   broadcastPresence();
@@ -1039,12 +1041,43 @@ wss.on('connection', (ws, req) => {
           c.send(outMsg);
         }
       });
+    } else if (msg.type === 'VIEWPORT_SYNC') {
+      // 候选人桌面端实时上报自己当前 Pad 的可视行范围（startLine..endLine），让看不见悬浮窗的导师清楚知道候选人正在看哪一段
+      const senderInfo = room.clients.get(ws) || { id: clientId, name: userName, color };
+      const startLine = Math.max(1, Math.floor(Number(msg.payload?.startLine) || 1));
+      const endLine = Math.max(startLine, Math.floor(Number(msg.payload?.endLine) || startLine));
+      const totalLines = Math.max(endLine, Math.floor(Number(msg.payload?.totalLines) || endLine));
+      const viewportInfo = {
+        clientId: senderInfo.id,
+        name: senderInfo.name,
+        color: senderInfo.color,
+        startLine,
+        endLine,
+        totalLines,
+        updatedAt: Date.now(),
+      };
+      if (!room.viewports) room.viewports = new Map();
+      room.viewports.set(senderInfo.id, viewportInfo);
+      const outMsg = JSON.stringify({ type: 'VIEWPORT_SYNC', payload: viewportInfo });
+      room.clients.forEach((_, c) => {
+        if (c !== ws && c.readyState === 1) {
+          c.send(outMsg);
+        }
+      });
     } else if (msg.type === 'NAME_SYNC') {
       const nextName = String(msg.payload?.name || '').trim().slice(0, 24);
       if (nextName) {
         const info = room.clients.get(ws);
         if (info) {
           info.name = nextName;
+          if (room.viewports?.has(info.id)) {
+            const vp = room.viewports.get(info.id);
+            vp.name = nextName;
+            const vpMsg = JSON.stringify({ type: 'VIEWPORT_SYNC', payload: vp });
+            room.clients.forEach((_, c) => {
+              if (c !== ws && c.readyState === 1) c.send(vpMsg);
+            });
+          }
           broadcastPresence();
         }
       }
@@ -1156,6 +1189,13 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     room.clients.delete(ws);
+    if (room.viewports?.has(clientId)) {
+      room.viewports.delete(clientId);
+      const leaveMsg = JSON.stringify({ type: 'VIEWPORT_LEAVE', payload: { clientId } });
+      room.clients.forEach((_, c) => {
+        if (c.readyState === 1) c.send(leaveMsg);
+      });
+    }
     if (room.voiceSpeakers?.has(clientId)) {
       room.voiceSpeakers.delete(clientId);
       broadcastVoiceState();

@@ -763,7 +763,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.29';
+  let currentVersion = '1.0.30';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -935,6 +935,16 @@ export default function App() {
   const [mentorMicError, setMentorMicError] = useState('');
   const [activeVoiceSpeakers, setActiveVoiceSpeakers] = useState([]); // [{ id, name }]
   const [mentorVoiceMuted, setMentorVoiceMuted] = useState(false); // 收听端是否静音导师语音
+
+  // ── 导师端实时查看候选人 Pad 可视阅读范围状态 ──
+  const [candidateViewports, setCandidateViewports] = useState([]); // [{ clientId, name, color, startLine, endLine, totalLines, updatedAt }]
+  const [followCandidateVp, setFollowCandidateVp] = useState(false); // 导师端一键跟随候选人滚动视角
+  const followCandidateVpRef = useRef(false);
+  const candidateViewportsRef = useRef(new Map()); // Map<clientId, viewportInfo>
+  const candidateVpDecorationsRef = useRef(null);
+  const candidateVpWidgetsRef = useRef(new Map()); // Map<clientId, IContentWidget>
+  const viewportSendTimerRef = useRef(null);
+  const lastSentViewportKeyRef = useRef('');
 
   // ── 客户端版本与检查更新状态 ──
   const [appVersion, setAppVersion] = useState('1.0.0');
@@ -2696,6 +2706,11 @@ export default function App() {
       ws.onopen = () => {
         lastPongAt = Date.now();
         setWsConnected(true);
+        // 客户端建连/重连后立刻补报一次当前 Pad 可视范围，让导师立刻看到候选人停在哪一段
+        if (isClientApp) {
+          lastSentViewportKeyRef.current = '';
+          requestAnimationFrame(() => reportClientViewport(true));
+        }
         // 若客户端本地正在共享屏幕（例如断线重连后），自动重新向服务端注册共享状态
         if (shareSessionRef.current && !shareSessionRef.current.stopped) {
           ws.send(JSON.stringify({
@@ -2733,6 +2748,15 @@ export default function App() {
           if (Array.isArray(payload.voiceSpeakers)) {
             setActiveVoiceSpeakers(payload.voiceSpeakers);
           }
+          if (type === 'INIT' && Array.isArray(payload.viewports) && !isClientApp) {
+            candidateViewportsRef.current.clear();
+            for (const vp of payload.viewports) {
+              if (vp?.clientId && vp.clientId !== payload.clientId) {
+                candidateViewportsRef.current.set(vp.clientId, vp);
+              }
+            }
+            syncCandidateViewportsUI();
+          }
           const clean = normalizeLF(payload.text);
           // 先增量写入编辑器（保留选区），再同步 React 状态
           latestText.current = clean;
@@ -2764,10 +2788,38 @@ export default function App() {
           setLanguage(payload.language);
         } else if (type === 'SEL_SYNC') {
           updateRemoteCursor(payload);
+        } else if (type === 'VIEWPORT_SYNC') {
+          if (!isClientApp && payload?.clientId && payload.clientId !== myClientIdRef.current) {
+            candidateViewportsRef.current.set(payload.clientId, payload);
+            syncCandidateViewportsUI();
+            if (followCandidateVpRef.current && editorRef.current) {
+              const s = Math.max(1, Number(payload.startLine) || 1);
+              const e = Math.max(s, Number(payload.endLine) || s);
+              try {
+                editorRef.current.revealLinesInCenterIfOutsideViewport(s, e, 1);
+              } catch {}
+            }
+          }
+        } else if (type === 'VIEWPORT_LEAVE') {
+          if (!isClientApp && payload?.clientId && candidateViewportsRef.current.has(payload.clientId)) {
+            candidateViewportsRef.current.delete(payload.clientId);
+            syncCandidateViewportsUI();
+          }
         } else if (type === 'PRESENCE') {
           const list = Array.isArray(payload) ? payload : [];
           setParticipants(list);
           syncRemoteCursorsWithPresence(list);
+          if (!isClientApp) {
+            const onlineIds = new Set(list.map((p) => p?.id).filter(Boolean));
+            let vpChanged = false;
+            candidateViewportsRef.current.forEach((_, cid) => {
+              if (!onlineIds.has(cid)) {
+                candidateViewportsRef.current.delete(cid);
+                vpChanged = true;
+              }
+            });
+            if (vpChanged) syncCandidateViewportsUI();
+          }
         } else if (type === 'SCREEN_SHARE_STATE') {
           setRemoteShareState(payload || { active: false, sharerId: null, micOn: false, systemAudio: false });
           if (!payload?.active) {
@@ -2838,6 +2890,10 @@ export default function App() {
       window.removeEventListener('online', handleOnline);
       clearInterval(heartbeat);
       clearTimeout(reconnectTimer);
+      if (viewportSendTimerRef.current) {
+        clearTimeout(viewportSendTimerRef.current);
+        viewportSendTimerRef.current = null;
+      }
       ws?.close();
     };
   }, [roomId, token, userName, wsBase]);
@@ -2981,6 +3037,176 @@ export default function App() {
     }
   };
 
+  // ── 候选人客户端：上报当前 Pad 可视行范围（100ms 节流 + 相同区间去重） ──
+  const reportClientViewport = (force = false) => {
+    if (!isClientApp) return;
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model || wsRef.current?.readyState !== 1) return;
+    const ranges = editor.getVisibleRanges?.() || [];
+    const totalLines = Math.max(1, model.getLineCount());
+    let startLine = 1;
+    let endLine = totalLines;
+    if (ranges.length > 0) {
+      startLine = Math.max(1, Math.min(totalLines, ranges[0].startLineNumber));
+      endLine = Math.max(startLine, Math.min(totalLines, ranges[ranges.length - 1].endLineNumber));
+    }
+    const key = `${startLine}:${endLine}:${totalLines}`;
+    if (!force && key === lastSentViewportKeyRef.current) return;
+    lastSentViewportKeyRef.current = key;
+    wsRef.current.send(JSON.stringify({
+      type: 'VIEWPORT_SYNC',
+      payload: { startLine, endLine, totalLines },
+    }));
+  };
+
+  const scheduleReportClientViewport = (force = false) => {
+    if (!isClientApp) return;
+    if (force) {
+      if (viewportSendTimerRef.current) {
+        clearTimeout(viewportSendTimerRef.current);
+        viewportSendTimerRef.current = null;
+      }
+      reportClientViewport(true);
+      return;
+    }
+    if (viewportSendTimerRef.current) return;
+    viewportSendTimerRef.current = setTimeout(() => {
+      viewportSendTimerRef.current = null;
+      reportClientViewport(false);
+    }, 100);
+  };
+
+  // ── 导师端：将候选人当前可视阅读范围渲染为编辑器蓝青色边界区 + 顶部浮动标签 + 滚动条概览标尺 ──
+  const renderCandidateViewports = () => {
+    if (isClientApp) return;
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+
+    if (!candidateVpDecorationsRef.current) {
+      candidateVpDecorationsRef.current = editor.createDecorationsCollection();
+    }
+
+    const totalLines = Math.max(1, model.getLineCount());
+    const decos = [];
+    const activeIds = new Set();
+
+    candidateViewportsRef.current.forEach((vp, cid) => {
+      if (!vp || !cid || cid === myClientIdRef.current) return;
+      const startLine = Math.max(1, Math.min(totalLines, Math.floor(Number(vp.startLine) || 1)));
+      const endLine = Math.max(startLine, Math.min(totalLines, Math.floor(Number(vp.endLine) || startLine)));
+      activeIds.add(cid);
+
+      if (startLine === endLine) {
+        decos.push({
+          range: { startLineNumber: startLine, startColumn: 1, endLineNumber: startLine, endColumn: 1 },
+          options: {
+            isWholeLine: true,
+            className: 'gp-candidate-vp-line gp-candidate-vp-single',
+            linesDecorationsClassName: 'gp-candidate-vp-margin',
+            overviewRuler: { color: 'rgba(56, 189, 248, 0.85)', position: 4 },
+            stickiness: 1,
+          },
+        });
+      } else {
+        // 顶行（带上边界线）
+        decos.push({
+          range: { startLineNumber: startLine, startColumn: 1, endLineNumber: startLine, endColumn: 1 },
+          options: {
+            isWholeLine: true,
+            className: 'gp-candidate-vp-line gp-candidate-vp-top',
+            linesDecorationsClassName: 'gp-candidate-vp-margin',
+            overviewRuler: { color: 'rgba(56, 189, 248, 0.85)', position: 4 },
+            stickiness: 1,
+          },
+        });
+        // 中间行
+        if (endLine - startLine > 1) {
+          decos.push({
+            range: { startLineNumber: startLine + 1, startColumn: 1, endLineNumber: endLine - 1, endColumn: 1 },
+            options: {
+              isWholeLine: true,
+              className: 'gp-candidate-vp-line',
+              linesDecorationsClassName: 'gp-candidate-vp-margin',
+              overviewRuler: { color: 'rgba(56, 189, 248, 0.7)', position: 4 },
+              stickiness: 1,
+            },
+          });
+        }
+        // 底行（带下边界线）
+        decos.push({
+          range: { startLineNumber: endLine, startColumn: 1, endLineNumber: endLine, endColumn: 1 },
+          options: {
+            isWholeLine: true,
+            className: 'gp-candidate-vp-line gp-candidate-vp-bottom',
+            linesDecorationsClassName: 'gp-candidate-vp-margin',
+            overviewRuler: { color: 'rgba(56, 189, 248, 0.85)', position: 4 },
+            stickiness: 1,
+          },
+        });
+      }
+
+      // 在可视区域首行右上/行首贴一个轻量悬浮胶囊：「👁 候选人正在看 L12–L28」
+      let widget = candidateVpWidgetsRef.current.get(cid);
+      if (!widget) {
+        const domNode = document.createElement('div');
+        domNode.className = 'gp-candidate-vp-tag';
+        widget = {
+          _domNode: domNode,
+          _position: { lineNumber: startLine, column: 1 },
+          getId: () => `gp.vp.${cid}`,
+          getDomNode: () => domNode,
+          getPosition: function () {
+            return { position: this._position, preference: [0] };
+          },
+        };
+        candidateVpWidgetsRef.current.set(cid, widget);
+        editor.addContentWidget(widget);
+      }
+      widget._domNode.textContent = `👁 ${vp.name || '候选人'} 可视区 L${startLine}–L${endLine}`;
+      const maxCol = model.getLineMaxColumn(startLine);
+      widget._position = { lineNumber: startLine, column: maxCol };
+      editor.layoutContentWidget(widget);
+    });
+
+    candidateVpWidgetsRef.current.forEach((widget, cid) => {
+      if (!activeIds.has(cid)) {
+        try { editor.removeContentWidget(widget); } catch {}
+        candidateVpWidgetsRef.current.delete(cid);
+      }
+    });
+
+    candidateVpDecorationsRef.current.set(decos);
+  };
+
+  const syncCandidateViewportsUI = () => {
+    const list = Array.from(candidateViewportsRef.current.values()).sort(
+      (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)
+    );
+    setCandidateViewports(list);
+    renderCandidateViewports();
+  };
+
+  const jumpToCandidateViewport = (vp) => {
+    if (!vp || !editorRef.current) return;
+    const s = Math.max(1, Number(vp.startLine) || 1);
+    const e = Math.max(s, Number(vp.endLine) || s);
+    try {
+      editorRef.current.revealLinesInCenter(s, e, 0);
+    } catch {}
+  };
+
+  const toggleFollowCandidateVp = () => {
+    const next = !followCandidateVpRef.current;
+    followCandidateVpRef.current = next;
+    setFollowCandidateVp(next);
+    if (next) {
+      const primary = Array.from(candidateViewportsRef.current.values())[0];
+      if (primary) jumpToCandidateViewport(primary);
+    }
+  };
+
   const syncRemoteCursorsWithPresence = (list) => {
     const onlineMap = new Map();
     for (const p of list || []) {
@@ -3114,6 +3340,7 @@ export default function App() {
       if (editorRef.current) {
         editorRef.current.layout();
         syncEditorWrapForSizeMarks(sizeMarksRef.current);
+        if (isClientApp) scheduleReportClientViewport(false);
       }
     });
     ro.observe(el);
@@ -3289,6 +3516,9 @@ export default function App() {
     isRemote.current = false;
     if (isClientApp && savedScrollTop !== null) {
       editor.setScrollPosition({ scrollTop: savedScrollTop, scrollLeft: savedScrollLeft });
+      scheduleReportClientViewport(false);
+    } else if (!isClientApp && candidateViewportsRef.current.size > 0) {
+      renderCandidateViewports();
     }
   };
 
@@ -3323,6 +3553,9 @@ export default function App() {
       const shiftedSize = shiftSizeMarksByChanges(sizeMarksRef.current, ev.changes);
       sizeMarksRef.current = shiftedSize;
       renderSizeMarks(shiftedSize);
+    }
+    if (candidateViewportsRef.current.size > 0) {
+      renderCandidateViewports();
     }
     setText(clean);
     sendText(clean, colorMarksRef.current, boldMarksRef.current, sizeMarksRef.current);
@@ -3708,6 +3941,44 @@ export default function App() {
               </span>
             )}
 
+            {/* 导师端：实时展示候选人 Pad 当前可视行范围（支持点击定位与一键跟随） */}
+            {candidateViewports.length > 0 && (
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                {candidateViewports.slice(0, 2).map((vp) => (
+                  <button
+                    key={vp.clientId}
+                    type="button"
+                    onClick={() => jumpToCandidateViewport(vp)}
+                    title={`点击立刻滚动到「${vp.name || '候选人'}」当前正在看的第 ${vp.startLine}–${vp.endLine} 行`}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: '5px',
+                      background: 'rgba(14, 165, 233, 0.16)', color: '#38bdf8',
+                      border: '1px solid rgba(56, 189, 248, 0.45)', borderRadius: '6px',
+                      padding: '4px 9px', fontSize: '11.5px', fontWeight: 600,
+                      cursor: 'pointer', whiteSpace: 'nowrap',
+                    }}
+                  >
+                    <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#38bdf8' }} />
+                    👁 {vp.name || '候选人'}：行 {vp.startLine}–{vp.endLine}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={toggleFollowCandidateVp}
+                  title={followCandidateVp ? '已开启自动跟随候选人滚动视角，点击关闭' : '点击开启：候选人滚动 Pad 时导师编辑器自动跟随定位'}
+                  style={{
+                    background: followCandidateVp ? 'rgba(56, 189, 248, 0.28)' : 'rgba(31, 41, 55, 0.85)',
+                    color: followCandidateVp ? '#e0f2fe' : '#94a3b8',
+                    border: `1px solid ${followCandidateVp ? '#38bdf8' : '#374151'}`,
+                    borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 600,
+                    cursor: 'pointer', whiteSpace: 'nowrap',
+                  }}
+                >
+                  {followCandidateVp ? '跟随中' : '跟随视角'}
+                </button>
+              </div>
+            )}
+
             <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', maxWidth: '100%' }}>
               {colorTip && (
                 <span style={{ color: '#f59e0b', fontSize: '11.5px', whiteSpace: 'nowrap' }}>
@@ -4007,12 +4278,19 @@ export default function App() {
             if (boldMarksRef.current.length > 0) renderBoldMarks(boldMarksRef.current);
             if (sizeMarksRef.current.length > 0) renderSizeMarks(sizeMarksRef.current);
             if (remoteCursorsRef.current.size > 0) renderAllRemoteCursors();
+            if (!isClientApp && candidateViewportsRef.current.size > 0) renderCandidateViewports();
             monaco.editor.setTheme('glasspad-transparent');
             editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
             requestAnimationFrame(() => {
               editor.layout();
               syncEditorWrapForSizeMarks(sizeMarksRef.current);
+              if (isClientApp) scheduleReportClientViewport(true);
             });
+            // 候选人桌面端：监听滚动与布局变更，实时把当前 Pad 可视行范围同步给导师
+            if (isClientApp) {
+              editor.onDidScrollChange(() => scheduleReportClientViewport(false));
+              editor.onDidLayoutChange(() => scheduleReportClientViewport(false));
+            }
             // 导师端注册加粗快捷键
             if (!isClientApp) {
               editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, handleToggleSelectionBold);
