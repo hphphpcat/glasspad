@@ -774,14 +774,19 @@ function compareSemverClient(remoteVer, localVer) {
 }
 
 // 统一的客户端更新检测函数：优先走 Electron 主进程 IPC，支持传入当前房间的 wsBase 或自定义 JSON 地址
+// 自动比对 (本地原生外壳 baseVersion, 最新版 latestVersion] 区间是否跨越原生底层改动，返回智能策略 updateStrategy: 'hot' | 'installer' | 'none'
 async function performUpdateCheck(customBase) {
   const savedEndpoint = localStorage.getItem('pad_update_endpoint') || '';
   const targetBase = (customBase || savedEndpoint || '').trim();
   if (window.electronAPI?.checkForUpdates) {
-    return window.electronAPI.checkForUpdates(targetBase);
+    const res = await window.electronAPI.checkForUpdates(targetBase);
+    if (res && !res.updateStrategy) {
+      res.updateStrategy = !res.hasUpdate ? 'none' : (res.requiresNativeUpdate ? 'installer' : 'hot');
+    }
+    return res;
   }
-  // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.33';
+  // 浏览器环境或老版本预加载回退路径
+  let currentVersion = '1.0.34';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -817,21 +822,31 @@ async function performUpdateCheck(customBase) {
         if (info?.baseVersion) baseVersion = info.baseVersion;
       } catch {}
     }
+    const breakingList = Array.isArray(data.nativeBreakingVersions) ? data.nativeBreakingVersions : [];
+    const missedNativeChanges = breakingList
+      .filter((item) => item?.version && compareSemverClient(item.version, baseVersion) > 0 && compareSemverClient(item.version, latestVersion) <= 0)
+      .map((item) => ({ version: String(item.version).replace(/^v/i, ''), reason: String(item.reason || '') }));
     const requiresNativeUpdate = Boolean(
-      isClientApp && minNativeVersion && compareSemverClient(minNativeVersion, baseVersion) > 0
+      isClientApp && (
+        missedNativeChanges.length > 0 ||
+        (minNativeVersion && compareSemverClient(minNativeVersion, baseVersion) > 0)
+      )
     );
     const hasUpdate = compareSemverClient(latestVersion, currentVersion) > 0 || requiresNativeUpdate;
+    const updateStrategy = !hasUpdate ? 'none' : (requiresNativeUpdate ? 'installer' : 'hot');
     const downloadUrl = isWindows
       ? (data.winUrl || data.downloadUrl || '')
       : (data.macUrl || data.downloadUrl || '');
     return {
       ok: true,
       hasUpdate,
+      updateStrategy,
       currentVersion,
       baseVersion,
       latestVersion,
       minNativeVersion,
       requiresNativeUpdate,
+      missedNativeChanges,
       downloadUrl,
       macUrl: data.macUrl || '',
       winUrl: data.winUrl || '',
@@ -842,8 +857,10 @@ async function performUpdateCheck(customBase) {
     return {
       ok: false,
       hasUpdate: false,
+      updateStrategy: 'none',
       currentVersion,
       latestVersion: currentVersion,
+      missedNativeChanges: [],
       error: e.message || '检查更新失败',
     };
   }
@@ -969,8 +986,9 @@ export default function App() {
   // ── 客户端版本与检查更新状态 ──
   const [appVersion, setAppVersion] = useState('1.0.0');
   const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState(null); // { ok, hasUpdate, currentVersion, latestVersion, downloadUrl, notes, forceUpdate, error }
+  const [updateInfo, setUpdateInfo] = useState(null); // { ok, hasUpdate, updateStrategy, currentVersion, baseVersion, latestVersion, missedNativeChanges, downloadUrl, notes, forceUpdate, error }
   const [showUpdateModal, setShowUpdateModal] = useState(false);
+  const [autoStartUpdate, setAutoStartUpdate] = useState(false);
   const [updateBannerText, setUpdateBannerText] = useState('');
 
   const wsRef = useRef(null);
@@ -1073,8 +1091,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 手动点击「检查更新」
-  const handleManualCheckUpdate = async () => {
+  // 手动点击「检查更新 / 一键更新」：
+  // 查到新版本时直接弹更新框并自动触发智能更新（根据当前外壳版本与最新版本之间是否跨越原生改动，自动走 1 秒热更新或安装包下载覆盖重启）
+  const handleManualCheckUpdate = async (autoTrigger = true) => {
     if (checkingUpdate) return;
     setCheckingUpdate(true);
     setUpdateBannerText('');
@@ -1086,6 +1105,7 @@ export default function App() {
         setUpdateBannerText(`检查失败: ${res?.error || '网络不可达'}`);
         setTimeout(() => setUpdateBannerText(''), 3500);
       } else if (res.hasUpdate) {
+        setAutoStartUpdate(Boolean(autoTrigger));
         setShowUpdateModal(true);
       } else {
         setUpdateBannerText(`当前已是最新版本 (v${res.currentVersion})`);
@@ -3685,8 +3705,8 @@ export default function App() {
           updateInfo={updateInfo}
           checkingUpdate={checkingUpdate}
           updateBannerText={updateBannerText}
-          onCheckUpdate={handleManualCheckUpdate}
-          onOpenUpdateModal={() => setShowUpdateModal(true)}
+          onCheckUpdate={() => handleManualCheckUpdate(true)}
+          onOpenUpdateModal={() => { setAutoStartUpdate(true); setShowUpdateModal(true); }}
           initialName={userName}
           onJoin={(room, tok, user, wsOrigin) => {
             setRoomId(room);
@@ -3701,7 +3721,8 @@ export default function App() {
         {showUpdateModal && updateInfo && (
           <UpdateModal
             updateInfo={updateInfo}
-            onClose={() => setShowUpdateModal(false)}
+            autoStart={autoStartUpdate}
+            onClose={() => { setAutoStartUpdate(false); setShowUpdateModal(false); }}
           />
         )}
       </>
@@ -3718,14 +3739,15 @@ export default function App() {
           updateInfo={updateInfo}
           checkingUpdate={checkingUpdate}
           updateBannerText={updateBannerText}
-          onCheckUpdate={handleManualCheckUpdate}
-          onOpenUpdateModal={() => setShowUpdateModal(true)}
+          onCheckUpdate={() => handleManualCheckUpdate(true)}
+          onOpenUpdateModal={() => { setAutoStartUpdate(true); setShowUpdateModal(true); }}
           onSubmit={(name) => commitNameChange(name)}
         />
         {showUpdateModal && updateInfo && (
           <UpdateModal
             updateInfo={updateInfo}
-            onClose={() => setShowUpdateModal(false)}
+            autoStart={autoStartUpdate}
+            onClose={() => { setAutoStartUpdate(false); setShowUpdateModal(false); }}
           />
         )}
       </>
@@ -3787,25 +3809,25 @@ export default function App() {
                 </span>
               )}
 
-              {/* 检查更新按钮（有新版本时高亮提示） */}
+              {/* 一键智能更新按钮：点击直接检查并按版本差自动选择热更新或完整安装包更新 */}
               <button
-                onClick={() => (updateInfo?.hasUpdate ? setShowUpdateModal(true) : handleManualCheckUpdate())}
+                onClick={() => (updateInfo?.hasUpdate ? (setAutoStartUpdate(true), setShowUpdateModal(true)) : handleManualCheckUpdate(true))}
                 style={{
                   display: 'inline-flex', alignItems: 'center', gap: '5px',
-                  background: updateInfo?.hasUpdate ? 'rgba(56, 189, 248, 0.2)' : 'rgba(31, 41, 55, 0.75)',
-                  color: updateInfo?.hasUpdate ? '#38bdf8' : '#cbd5e1',
-                  border: `1px solid ${updateInfo?.hasUpdate ? 'rgba(56, 189, 248, 0.5)' : '#374151'}`,
+                  background: updateInfo?.hasUpdate ? 'rgba(16, 185, 129, 0.2)' : 'rgba(31, 41, 55, 0.75)',
+                  color: updateInfo?.hasUpdate ? '#34d399' : '#cbd5e1',
+                  border: `1px solid ${updateInfo?.hasUpdate ? 'rgba(16, 185, 129, 0.5)' : '#374151'}`,
                   borderRadius: '6px', padding: '4px 9px', fontSize: '11.5px', fontWeight: 600,
                   cursor: 'pointer', whiteSpace: 'nowrap',
                 }}
               >
                 {updateInfo?.hasUpdate && (
-                  <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#38bdf8' }} />
+                  <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#34d399' }} />
                 )}
                 {checkingUpdate
                   ? '检查中…'
                   : updateInfo?.hasUpdate
-                    ? `新版本 v${updateInfo.latestVersion}`
+                    ? `一键更新 v${updateInfo.latestVersion}`
                     : '检查更新'}
               </button>
 
@@ -4604,11 +4626,12 @@ export default function App() {
         </div>
       </div>
 
-      {/* 客户端版本更新详情与下载弹窗 */}
+      {/* 客户端版本更新详情与智能更新弹窗 */}
       {showUpdateModal && updateInfo && (
         <UpdateModal
           updateInfo={updateInfo}
-          onClose={() => setShowUpdateModal(false)}
+          autoStart={autoStartUpdate}
+          onClose={() => { setAutoStartUpdate(false); setShowUpdateModal(false); }}
         />
       )}
     </div>
@@ -4772,18 +4795,21 @@ function SelectionColorPicker({ pickerColor, hasSelection, onApplyColor }) {
   );
 }
 
-// ── 更新详情弹窗：展示最新版本号、更新日志与智能更新（纯前端改动 1 秒热更新；含底层原生改动自动走完整安装包） ──
-function UpdateModal({ updateInfo, onClose }) {
+// ── 更新详情弹窗：展示最新版本号、更新日志与一键智能更新（自动判定纯前端 1 秒热更新 vs 跨原生底层改动完整安装包下载覆盖重启） ──
+function UpdateModal({ updateInfo, autoStart = false, onClose }) {
   const platformLabel = isWindows ? 'Windows (.exe)' : 'macOS (.dmg)';
   const primaryUrl = updateInfo.downloadUrl || (isWindows ? updateInfo.winUrl : updateInfo.macUrl) || '';
-  const requiresNativeUpdate = Boolean(updateInfo.requiresNativeUpdate);
-  // 若服务端声明本次更新需要新版原生外壳（如隐身/防节流/音频驱动升级），禁用 1 秒热更新，强制引导完整安装包更新
+  const requiresNativeUpdate = Boolean(updateInfo.requiresNativeUpdate || updateInfo.updateStrategy === 'installer');
+  const missedNativeChanges = Array.isArray(updateInfo.missedNativeChanges) ? updateInfo.missedNativeChanges : [];
+  // 自动决策：仅当 (本地原生外壳 baseVersion, 最新版] 之间没有任何原生改动时走 1 秒极速热更新，否则强制走完整安装包
   const canHotUpdate = Boolean(window.electronAPI?.applyHotUpdate && !requiresNativeUpdate);
   const canInAppUpdate = Boolean(window.electronAPI?.downloadAndInstallUpdate && primaryUrl);
+  const strategyMode = canHotUpdate ? 'hot' : 'installer';
 
   const [updating, setUpdating] = useState(false);
   const [progress, setProgress] = useState({ stage: '', percent: 0, message: '' });
   const [updateErr, setUpdateErr] = useState('');
+  const autoTriggeredRef = useRef(false);
 
   useEffect(() => {
     if (!window.electronAPI?.onUpdateProgress) return;
@@ -4796,19 +4822,19 @@ function UpdateModal({ updateInfo, onClose }) {
       });
       if (data.stage === 'error') {
         setUpdating(false);
-        setUpdateErr(data.message || '自动更新失败，请使用浏览器下载');
+        setUpdateErr(data.message || '自动更新失败，请点击下方重新尝试');
       }
     });
     return () => off?.();
   }, []);
 
-  // 1 秒极速热更新（直接走 Railway 高速节点同步最新前端代码，不走 GitHub 98MB 慢速整包下载）
-  const handleStartAutoUpdate = async () => {
+  // 一键智能更新：自动根据策略选择「1 秒极速热更新」或「应用内下载完整安装包并覆盖重启」
+  const handleStartSmartUpdate = async () => {
     if (updating) return;
-    if (canHotUpdate) {
+    if (strategyMode === 'hot') {
       setUpdating(true);
       setUpdateErr('');
-      setProgress({ stage: 'downloading', percent: 35, message: '正在从 Railway 高速节点极速热更新…' });
+      setProgress({ stage: 'downloading', percent: 35, message: '已自动选择极速热更新，正在同步前端增量包…' });
       localStorage.setItem('pad_hot_version', updateInfo.latestVersion || '');
       const res = await window.electronAPI.applyHotUpdate(updateInfo.latestVersion);
       if (res?.ok) {
@@ -4816,7 +4842,7 @@ function UpdateModal({ updateInfo, onClose }) {
         return;
       }
       setUpdating(false);
-      setUpdateErr(res?.error || '极速热更新失败，请点击下方安装包更新');
+      setUpdateErr(res?.error || '极速热更新失败，请重试或改用安装包更新');
       return;
     }
 
@@ -4827,31 +4853,23 @@ function UpdateModal({ updateInfo, onClose }) {
     }
     setUpdating(true);
     setUpdateErr('');
-    setProgress({ stage: 'downloading', percent: 0, message: '正在连接更新服务器…' });
+    setProgress({ stage: 'downloading', percent: 0, message: '检测到原生底层更新，正在自动下载完整安装包…' });
     const res = await window.electronAPI.downloadAndInstallUpdate(primaryUrl);
     if (!res?.ok) {
       setUpdating(false);
-      setUpdateErr(res?.error || '自动更新失败，请点击下方浏览器下载');
+      setUpdateErr(res?.error || '自动下载安装包失败，正在尝试通过浏览器下载…');
+      openDownloadUrl(primaryUrl);
     }
   };
 
-  // 完整安装包覆盖更新（仅当底层 Electron 壳变动或用户主动需要重装整包时使用）
-  const handleFullInstallerUpdate = async () => {
-    if (!primaryUrl || updating) return;
-    if (!canInAppUpdate) {
-      openDownloadUrl(primaryUrl);
-      return;
+  // 点击顶栏「一键更新 / 检查更新」进入弹窗时，立即按智能决策自动开跑，真正一键完成无需二次选择
+  useEffect(() => {
+    if (autoStart && !autoTriggeredRef.current && (canHotUpdate || primaryUrl)) {
+      autoTriggeredRef.current = true;
+      handleStartSmartUpdate();
     }
-    setUpdating(true);
-    setUpdateErr('');
-    setProgress({ stage: 'downloading', percent: 0, message: '正在下载完整安装包…' });
-    const res = await window.electronAPI.downloadAndInstallUpdate(primaryUrl);
-    if (!res?.ok) {
-      setUpdating(false);
-      setUpdateErr(res?.error || '完整包下载失败，正在打开浏览器下载…');
-      openDownloadUrl(primaryUrl);
-    }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoStart]);
 
   return (
     <div
@@ -4866,7 +4884,7 @@ function UpdateModal({ updateInfo, onClose }) {
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          width: '100%', maxWidth: '430px', background: '#121721',
+          width: '100%', maxWidth: '440px', background: '#121721',
           border: '1px solid rgba(56, 189, 248, 0.4)', borderRadius: '12px',
           padding: '20px', color: '#e2e8f0', boxShadow: '0 20px 50px rgba(0,0,0,0.6)',
           display: 'flex', flexDirection: 'column', gap: '14px',
@@ -4880,8 +4898,10 @@ function UpdateModal({ updateInfo, onClose }) {
                 发现 GlassPad 新版本 v{updateInfo.latestVersion}
               </div>
               <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '2px' }}>
-                当前版本 v{updateInfo.currentVersion} → 最新版本 v{updateInfo.latestVersion}
-                {requiresNativeUpdate && updateInfo.baseVersion ? `（底层外壳 v${updateInfo.baseVersion} 需升级）` : ''}
+                当前 v{updateInfo.currentVersion} → 最新 v{updateInfo.latestVersion}
+                {updateInfo.baseVersion && updateInfo.baseVersion !== updateInfo.currentVersion
+                  ? `（外壳 v${updateInfo.baseVersion}）`
+                  : ''}
               </div>
             </div>
           </div>
@@ -4898,14 +4918,26 @@ function UpdateModal({ updateInfo, onClose }) {
           )}
         </div>
 
-        {requiresNativeUpdate && (
-          <div style={{
-            background: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.4)',
-            borderRadius: '8px', padding: '8px 11px', fontSize: '12px', color: '#fcd34d', lineHeight: 1.5,
-          }}>
-            本次更新包含底层原生升级（隐身加固 / 音频引擎 / 防后台节流），需安装完整包至 v{updateInfo.minNativeVersion}+ 才能完整生效。
-          </div>
-        )}
+        {/* 智能更新模式判定提示卡：明确告诉用户为什么走热更新或完整安装包 */}
+        <div style={{
+          background: strategyMode === 'hot' ? 'rgba(16, 185, 129, 0.12)' : 'rgba(245, 158, 11, 0.12)',
+          border: `1px solid ${strategyMode === 'hot' ? 'rgba(16, 185, 129, 0.4)' : 'rgba(245, 158, 11, 0.4)'}`,
+          borderRadius: '8px', padding: '8px 11px', fontSize: '12px',
+          color: strategyMode === 'hot' ? '#6ee7b7' : '#fcd34d', lineHeight: 1.5,
+        }}>
+          {strategyMode === 'hot' ? (
+            <>智能判定：当前外壳 v{updateInfo.baseVersion || updateInfo.currentVersion} 已兼容最新版本，自动采用 <b>⚡ 1 秒极速热更新</b>（无需下载安装包、无需重启）。</>
+          ) : (
+            <>
+              智能判定：当前外壳 v{updateInfo.baseVersion || updateInfo.currentVersion} 到 v{updateInfo.latestVersion} 之间包含底层原生改动，自动采用 <b>📦 完整安装包覆盖更新并重启</b>。
+              {missedNativeChanges.length > 0 && (
+                <div style={{ marginTop: '4px', color: '#fde68a', fontSize: '11.5px' }}>
+                  {missedNativeChanges.map((item) => `· v${item.version}：${item.reason}`).join('\n')}
+                </div>
+              )}
+            </>
+          )}
+        </div>
 
         {updateInfo.notes ? (
           <div style={{
@@ -4928,7 +4960,7 @@ function UpdateModal({ updateInfo, onClose }) {
             padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '8px',
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#38bdf8' }}>
-              <span>{progress.message || '正在下载更新…'}</span>
+              <span>{progress.message || '正在智能更新…'}</span>
               <span style={{ fontFamily: codeFont }}>{progress.percent}%</span>
             </div>
             <div style={{
@@ -4963,36 +4995,25 @@ function UpdateModal({ updateInfo, onClose }) {
             </button>
           )}
 
-          {primaryUrl && canHotUpdate && canInAppUpdate && (
-            <button
-              onClick={handleFullInstallerUpdate}
-              disabled={updating}
-              style={{
-                background: 'transparent', color: '#94a3b8', border: '1px solid #334155',
-                borderRadius: '7px', padding: '8px 12px', fontSize: '12px', cursor: 'pointer',
-              }}
-            >
-              完整安装包更新
-            </button>
-          )}
-
           {(canHotUpdate || primaryUrl) ? (
             <button
-              onClick={handleStartAutoUpdate}
+              onClick={handleStartSmartUpdate}
               disabled={updating}
               style={{
                 background: updating ? '#065f46' : '#10b981',
                 color: updating ? '#a7f3d0' : '#032219',
                 border: 'none',
-                borderRadius: '7px', padding: '8px 16px', fontSize: '13px',
+                borderRadius: '7px', padding: '8px 18px', fontSize: '13px',
                 fontWeight: 700, cursor: updating ? 'default' : 'pointer',
               }}
             >
               {updating
-                ? (progress.stage === 'installing' ? '正在刷新生效…' : `正在更新 (${progress.percent}%)…`)
-                : (canHotUpdate
-                  ? '⚡ 1 秒极速热更新'
-                  : (canInAppUpdate ? '立即自动更新并重启' : `立即下载 ${platformLabel} ↗`))}
+                ? (progress.stage === 'installing'
+                  ? (strategyMode === 'hot' ? '正在刷新生效…' : '正在安装并重启…')
+                  : `正在更新 (${progress.percent}%)…`)
+                : (strategyMode === 'hot'
+                  ? '⚡ 一键智能更新（1 秒热更新）'
+                  : (canInAppUpdate ? '📦 一键智能更新（下载安装包并重启）' : `下载 ${platformLabel} 安装包 ↗`))}
             </button>
           ) : (
             <span style={{ fontSize: '12px', color: '#f59e0b', alignSelf: 'center' }}>
@@ -5084,7 +5105,7 @@ function NameGate({
             {checkingUpdate
               ? '检查中…'
               : updateInfo?.hasUpdate
-                ? `发现新版本 v${updateInfo.latestVersion}`
+                ? `一键更新 v${updateInfo.latestVersion}`
                 : '检查更新'}
           </button>
         </div>
@@ -5212,7 +5233,7 @@ function JoinGate({
             {checkingUpdate
               ? '检查中…'
               : updateInfo?.hasUpdate
-                ? `发现新版本 v${updateInfo.latestVersion}`
+                ? `一键更新 v${updateInfo.latestVersion}`
                 : '检查更新'}
           </button>
         </div>

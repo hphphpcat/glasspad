@@ -605,7 +605,7 @@ ipcMain.handle('GET_APP_VERSION', () => ({
   arch: process.arch,
 }));
 
-// 检查更新：向后端 /api/version 或自定义 JSON 接口拉取最新版本信息
+// 检查更新：向后端 /api/version 或自定义 JSON 接口拉取最新版本信息，并计算智能更新策略（热更新 vs 完整安装包）
 ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
   const currentVersion = getEffectiveAppVersion();
   const baseVersion = app.getVersion();
@@ -617,11 +617,17 @@ ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
       .trim()
       .replace(/^v/i, '');
     const minNativeVersion = String(data.minNativeVersion || '').trim().replace(/^v/i, '');
-    // 原生外壳版本低于服务端要求的最低原生版本时，必须下载完整安装包更新（不能仅靠前端热更新）
+    // 判断区间 (baseVersion, latestVersion] 内是否存在原生底层改动（支持 nativeBreakingVersions 明细与 minNativeVersion 兜底）
+    const breakingList = Array.isArray(data.nativeBreakingVersions) ? data.nativeBreakingVersions : [];
+    const missedNativeChanges = breakingList
+      .filter((item) => item?.version && compareSemver(item.version, baseVersion) > 0 && compareSemver(item.version, latestVersion) <= 0)
+      .map((item) => ({ version: String(item.version).replace(/^v/i, ''), reason: String(item.reason || '') }));
     const requiresNativeUpdate = Boolean(
-      minNativeVersion && compareSemver(minNativeVersion, baseVersion) > 0
+      missedNativeChanges.length > 0 ||
+      (minNativeVersion && compareSemver(minNativeVersion, baseVersion) > 0)
     );
     const hasUpdate = compareSemver(latestVersion, currentVersion) > 0 || requiresNativeUpdate;
+    const updateStrategy = !hasUpdate ? 'none' : (requiresNativeUpdate ? 'installer' : 'hot');
     const downloadUrl =
       process.platform === 'darwin'
         ? data.macUrl || data.dmgUrl || data.downloadUrl || ''
@@ -629,11 +635,13 @@ ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
     return {
       ok: true,
       hasUpdate,
+      updateStrategy,
       currentVersion,
       baseVersion,
       latestVersion,
       minNativeVersion,
       requiresNativeUpdate,
+      missedNativeChanges,
       downloadUrl,
       macUrl: data.macUrl || '',
       winUrl: data.winUrl || '',
@@ -645,11 +653,13 @@ ipcMain.handle('CHECK_FOR_UPDATES', async (_e, customBase) => {
     return {
       ok: false,
       hasUpdate: false,
+      updateStrategy: 'none',
       currentVersion,
       baseVersion,
       latestVersion: currentVersion,
       minNativeVersion: '',
       requiresNativeUpdate: false,
+      missedNativeChanges: [],
       error: err.message || '检查更新失败',
       checkUrl: baseUrl,
     };

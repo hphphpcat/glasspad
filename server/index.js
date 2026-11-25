@@ -93,9 +93,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.33';
+let pkgVersion = '1.0.34';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.33';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.34';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -118,14 +118,32 @@ const DEFAULT_MAC_DOWNLOAD_URL =
 const DEFAULT_WIN_DOWNLOAD_URL =
   `https://github.com/hphphpcat/glasspad/releases/download/glasspad/GlassPad-${pkgVersion}-portable.exe`;
 
-const DEFAULT_MIN_NATIVE_VERSION = process.env.MIN_NATIVE_VERSION || '1.0.28';
+const DEFAULT_MIN_NATIVE_VERSION = process.env.MIN_NATIVE_VERSION || '1.0.32';
+
+// 记录每个改动了底层原生外壳（electron/main.js、preload、原生二进制等）的版本号；
+// 只要客户端本地原生外壳版本 baseVersion < 其中任意一个 <= latestVersion 的版本，智能更新就会自动判定走「完整安装包更新」，否则走「1 秒极速热更新」。
+const NATIVE_BREAKING_VERSIONS = [
+  { version: '1.0.28', reason: '防后台节流、系统防休眠锁与隐身加固' },
+  { version: '1.0.32', reason: 'macOS 隐身态剪贴板/撤销快捷键原生桥接（⌘C/⌘V/⌘X/⌘A/⌘Z）' },
+];
+
+function computeLatestNativeBreakingVersion(latestVer) {
+  let highest = DEFAULT_MIN_NATIVE_VERSION;
+  for (const item of NATIVE_BREAKING_VERSIONS) {
+    if (compareSemver(item.version, latestVer) <= 0 && compareSemver(item.version, highest) > 0) {
+      highest = item.version;
+    }
+  }
+  return highest;
+}
 
 let appRelease = {
   version: process.env.LATEST_APP_VERSION || pkgVersion,
-  minNativeVersion: DEFAULT_MIN_NATIVE_VERSION,
+  minNativeVersion: computeLatestNativeBreakingVersion(process.env.LATEST_APP_VERSION || pkgVersion),
+  nativeBreakingVersions: NATIVE_BREAKING_VERSIONS,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 优化缩小文字时的行高计算：字号低于 15px 时移除固定 28px 下限，改为紧凑贴合行高（几乎无多余行间距，一屏显示更多行）\n2. 同步支持客户端 ⌘- 缩放与导师端局部缩小全篇两种场景，自动收紧行距',
+  notes: process.env.RELEASE_NOTES || '1. 升级一键智能更新：点击「一键更新」自动比对当前原生外壳版本与最新版之间是否跨越底层原生改动——无底层改动自动走 1 秒极速热更新，跨越底层改动自动下载安装包覆盖并重启\n2. 同步补齐 v1.0.32 原生快捷键桥接为原生基线，确保老版本客户端自动走完整包升级',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
@@ -152,11 +170,14 @@ function loadRelease() {
       return;
     }
     const savedMinNative = String(saved.minNativeVersion || '').trim();
+    const resolvedVer = savedVer || appRelease.version;
+    const computedMinNative = computeLatestNativeBreakingVersion(resolvedVer);
     appRelease = {
-      version: savedVer || appRelease.version,
-      minNativeVersion: (savedMinNative && compareSemver(savedMinNative, DEFAULT_MIN_NATIVE_VERSION) >= 0)
+      version: resolvedVer,
+      minNativeVersion: (savedMinNative && compareSemver(savedMinNative, computedMinNative) >= 0)
         ? savedMinNative
-        : DEFAULT_MIN_NATIVE_VERSION,
+        : computedMinNative,
+      nativeBreakingVersions: NATIVE_BREAKING_VERSIONS,
       macUrl: String(saved.macUrl || appRelease.macUrl).trim(),
       winUrl: String(saved.winUrl || appRelease.winUrl).trim(),
       notes: String(saved.notes ?? appRelease.notes).trim(),
@@ -636,12 +657,14 @@ const httpServer = http.createServer(async (req, res) => {
       if (!nextVersion) {
         return sendJSON(res, 400, { error: '版本号不能为空' });
       }
-      const nextMinNative = String(body.minNativeVersion ?? appRelease.minNativeVersion ?? DEFAULT_MIN_NATIVE_VERSION)
+      const cleanNextVer = nextVersion.replace(/^v/i, '');
+      const nextMinNative = String(body.minNativeVersion ?? appRelease.minNativeVersion ?? computeLatestNativeBreakingVersion(cleanNextVer))
         .trim()
         .replace(/^v/i, '');
       appRelease = {
-        version: nextVersion.replace(/^v/i, ''),
-        minNativeVersion: nextMinNative || DEFAULT_MIN_NATIVE_VERSION,
+        version: cleanNextVer,
+        minNativeVersion: nextMinNative || computeLatestNativeBreakingVersion(cleanNextVer),
+        nativeBreakingVersions: NATIVE_BREAKING_VERSIONS,
         macUrl: String(body.macUrl ?? '').trim(),
         winUrl: String(body.winUrl ?? '').trim(),
         notes: String(body.notes ?? '').trim().slice(0, 500),
