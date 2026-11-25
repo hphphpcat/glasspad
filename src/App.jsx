@@ -402,13 +402,22 @@ function clampFontSize(val) {
   return Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, n));
 }
 
+const MIN_CLIENT_FONT_SIZE = 11;
+const MAX_CLIENT_FONT_SIZE = 32;
+function clampClientFontSize(v) {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return DEFAULT_FONT_SIZE;
+  return Math.max(MIN_CLIENT_FONT_SIZE, Math.min(MAX_CLIENT_FONT_SIZE, n));
+}
+
 // 动态注入局部字号 Monaco inlineClassName 样式，实现选中文字单独放大/缩小
-// 注意：不写死 line-height: 28px，改为 inherit，由 Monaco 根据当前文档最大字号动态放宽行高，避免 24–28px 大字上下重叠裁切
+// 注意：支持客户端按本地阅读字号偏移量叠加缩放（最大可到 48px），且 line-height 继承自编辑器动态行高，避免大字上下裁切
 const injectedInlineSizeClasses = new Set();
-function getInlineSizeClassName(size) {
-  const s = clampFontSize(size);
-  if (s === DEFAULT_FONT_SIZE) return '';
-  const className = `gp-inline-size-${s}`;
+function getInlineSizeClassName(size, localDelta = 0, baseSize = DEFAULT_FONT_SIZE) {
+  const base = clampFontSize(size);
+  const effective = Math.max(10, Math.min(48, base + Math.round(Number(localDelta) || 0)));
+  if (effective === baseSize) return '';
+  const className = `gp-inline-size-${effective}`;
   if (!injectedInlineSizeClasses.has(className) && typeof document !== 'undefined') {
     let styleEl = document.getElementById('gp-inline-size-styles');
     if (!styleEl) {
@@ -416,7 +425,7 @@ function getInlineSizeClassName(size) {
       styleEl.id = 'gp-inline-size-styles';
       document.head.appendChild(styleEl);
     }
-    styleEl.textContent += `.monaco-editor .view-line span.${className}, .monaco-editor .view-line span.${className} span { font-size: ${s}px !important; line-height: inherit !important; }\n`;
+    styleEl.textContent += `.monaco-editor .view-line span.${className}, .monaco-editor .view-line span.${className} span { font-size: ${effective}px !important; line-height: inherit !important; }\n`;
     injectedInlineSizeClasses.add(className);
   }
   return className;
@@ -763,7 +772,7 @@ async function performUpdateCheck(customBase) {
     return window.electronAPI.checkForUpdates(targetBase);
   }
   // 浏览器环境或远端热加载模式：若当前已在 https://glasspad.up.railway.app 上运行，前端代码本身已是最新，优先以线上版本作为基准
-  let currentVersion = '1.0.30';
+  let currentVersion = '1.0.31';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -890,8 +899,10 @@ export default function App() {
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState('');
 
-  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）
+  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）/ 本地阅读字号（仅影响候选人自己观看，支持 ⌘+/⌘-/⌘0）
   const [opacity, setOpacity] = useState(() => Number(localStorage.getItem('pad_opacity')) || 0.78);
+  const [clientFontSize, setClientFontSize] = useState(() => clampClientFontSize(localStorage.getItem('pad_client_font_size') || DEFAULT_FONT_SIZE));
+  const clientFontSizeRef = useRef(clientFontSize);
   const [supportsFrost, setSupportsFrost] = useState(false);
   const [frostedGlass, setFrostedGlass] = useState(() => localStorage.getItem('pad_frost_v2') === 'true');
   // 导师端局部文字样式工具条状态（字号/加粗/颜色均仅作用于选中文本，客户端无修改入口）
@@ -1076,33 +1087,71 @@ export default function App() {
     }
   };
 
-  // 桌面端：透明度记忆 + ⌘[ / ⌘] 调节；导师端：⌘/Ctrl + +/-/0 对选中文字放大/缩小/重置
+  // 桌面端：透明度与本地阅读字号记忆 + ⌘[/⌘] 调透明度 + ⌘+/⌘-/⌘0 调本地字号；
+  // 导师端：⌘/Ctrl + +/-/0 对选中文字放大/缩小/重置
   useEffect(() => {
     localStorage.setItem('pad_opacity', String(opacity));
   }, [opacity]);
 
+  const adjustClientFontSize = (delta) => {
+    if (!isClientApp) return;
+    setClientFontSize((prev) => {
+      const next = delta === 0 ? DEFAULT_FONT_SIZE : clampClientFontSize(prev + delta);
+      clientFontSizeRef.current = next;
+      localStorage.setItem('pad_client_font_size', String(next));
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!isClientApp) return;
+    clientFontSizeRef.current = clientFontSize;
+    localStorage.setItem('pad_client_font_size', String(clientFontSize));
+    if (editorRef.current) {
+      renderSizeMarks(sizeMarksRef.current);
+      requestAnimationFrame(() => {
+        editorRef.current?.layout();
+        scheduleReportClientViewport(false);
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clientFontSize]);
+
   useEffect(() => {
     const onKey = (e) => {
       if (!(e.metaKey || e.ctrlKey)) return;
+      const isPlus = e.key === '=' || e.key === '+' || e.code === 'Equal' || e.code === 'NumpadAdd';
+      const isMinus = e.key === '-' || e.key === '_' || e.code === 'Minus' || e.code === 'NumpadSubtract';
+      const isZero = e.key === '0' || e.code === 'Digit0' || e.code === 'Numpad0';
+
       if (isClientApp && e.key === '[') {
         e.preventDefault();
         setOpacity((p) => Math.max(0.08, Number((p - 0.08).toFixed(2))));
       } else if (isClientApp && e.key === ']') {
         e.preventDefault();
         setOpacity((p) => Math.min(1, Number((p + 0.08).toFixed(2))));
-      } else if (!isClientApp && (e.key === '=' || e.key === '+')) {
+      } else if (isClientApp && isPlus) {
+        e.preventDefault();
+        adjustClientFontSize(2);
+      } else if (isClientApp && isMinus) {
+        e.preventDefault();
+        adjustClientFontSize(-2);
+      } else if (isClientApp && isZero) {
+        e.preventDefault();
+        adjustClientFontSize(0);
+      } else if (!isClientApp && isPlus) {
         e.preventDefault();
         handleAdjustSelectionSize(2);
-      } else if (!isClientApp && (e.key === '-' || e.key === '_')) {
+      } else if (!isClientApp && isMinus) {
         e.preventDefault();
         handleAdjustSelectionSize(-2);
-      } else if (!isClientApp && e.key === '0') {
+      } else if (!isClientApp && isZero) {
         e.preventDefault();
         handleAdjustSelectionSize(0);
       }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
   }, []);
 
   const toggleFrostedGlass = (enabled) => {
@@ -3291,24 +3340,31 @@ export default function App() {
     boldMarksDecorations.current.set(decorations);
   };
 
-  // 根据文档当前最大局部字号 + 编辑器实际内容宽度，计算安全软换行基准：
-  // Monaco 的 wordWrap 按全局 fontSize(15px) 测算单行字符数，用 inlineClassName 局部放大到 22-28px 后实际像素宽度会超出视口右侧。
-  // 动态计算按最大字号缩放后的 wordWrapColumn + 同步放宽 lineHeight，彻底杜绝网页端/客户端大字体溢出屏幕或上下重叠！
+  // 根据文档当前最大有效字号 + 编辑器实际内容宽度，计算安全软换行基准：
+  // 客户端支持本地阅读字号缩放（clientFontSizeRef），导师标注的局部字号会随本地偏移量同步放大/缩小；
+  // 若存在局部比基础字号更大的片段，按最大字号换算安全 wordWrapColumn 并放宽 lineHeight，彻底杜绝大字体溢出右侧屏幕或上下重叠。
   const syncEditorWrapForSizeMarks = (marks) => {
-    let maxSize = DEFAULT_FONT_SIZE;
+    const baseSize = isClientApp ? clientFontSizeRef.current : DEFAULT_FONT_SIZE;
+    const localDelta = isClientApp ? (baseSize - DEFAULT_FONT_SIZE) : 0;
+    let maxSize = baseSize;
     for (const m of marks || []) {
-      if (m && Number(m.size) > maxSize) maxSize = clampFontSize(m.size);
+      if (m && Number.isFinite(Number(m.size))) {
+        const eff = Math.max(10, Math.min(48, clampFontSize(m.size) + localDelta));
+        if (eff > maxSize) maxSize = eff;
+      }
     }
     setEditorMaxFontSize(maxSize);
 
     const editor = editorRef.current;
     if (!editor) return;
-    if (maxSize <= DEFAULT_FONT_SIZE) {
+    const safeLineHeight = Math.max(24, Math.ceil(maxSize * 1.52));
+    if (maxSize <= baseSize) {
       setEditorWrapCols(0);
       try {
         editor.updateOptions({
+          fontSize: baseSize,
           wordWrap: 'on',
-          lineHeight: 28,
+          lineHeight: Math.max(28, safeLineHeight),
         });
       } catch {}
       return;
@@ -3316,18 +3372,21 @@ export default function App() {
 
     const layoutInfo = editor.getLayoutInfo?.();
     const contentWidth = layoutInfo?.contentWidth || Math.max(240, (editorContainerRef.current?.clientWidth || 600) - 70);
-    // 等宽字体在 15px 下约 9px/半角字符；大字号按比例放大并预留 14% 保险余量（兼顾中英文混排与加粗）
-    const baseCharWidth = editor.getOption?.(50)?.typicalHalfwidthCharacterWidth || 9; // EditorOption.fontInfo = 50
-    const scaledCharWidth = baseCharWidth * (maxSize / DEFAULT_FONT_SIZE) * 1.12;
-    const safeCols = Math.max(12, Math.floor((contentWidth - 18) / Math.max(6, scaledCharWidth)));
-    const safeLineHeight = Math.max(28, Math.ceil(maxSize * 1.52));
+    // 先把基础 fontSize 同步到编辑器，再按 maxSize/baseSize 比例换算安全换行列数
+    try {
+      editor.updateOptions({ fontSize: baseSize });
+    } catch {}
+    const baseCharWidth = editor.getOption?.(50)?.typicalHalfwidthCharacterWidth || (baseSize * 0.6); // EditorOption.fontInfo = 50
+    const scaledCharWidth = baseCharWidth * (maxSize / baseSize) * 1.12;
+    const safeCols = Math.max(10, Math.floor((contentWidth - 18) / Math.max(6, scaledCharWidth)));
 
     setEditorWrapCols(safeCols);
     try {
       editor.updateOptions({
+        fontSize: baseSize,
         wordWrap: 'wordWrapColumn',
         wordWrapColumn: safeCols,
-        lineHeight: safeLineHeight,
+        lineHeight: Math.max(28, safeLineHeight),
       });
     } catch {}
   };
@@ -3356,13 +3415,15 @@ export default function App() {
     if (!sizeMarksDecorations.current) {
       sizeMarksDecorations.current = editor.createDecorationsCollection();
     }
+    const baseSize = isClientApp ? clientFontSizeRef.current : DEFAULT_FONT_SIZE;
+    const localDelta = isClientApp ? (baseSize - DEFAULT_FONT_SIZE) : 0;
     const maxLen = model.getValueLength();
     const decorations = [];
     for (const m of marks || []) {
       const start = Math.max(0, Math.min(maxLen, m.start));
       const end = Math.max(0, Math.min(maxLen, m.end));
       if (end <= start) continue;
-      const inlineClassName = getInlineSizeClassName(m.size);
+      const inlineClassName = getInlineSizeClassName(m.size, localDelta, baseSize);
       if (!inlineClassName) continue;
       const from = model.getPositionAt(start);
       const to = model.getPositionAt(end);
@@ -3681,7 +3742,7 @@ export default function App() {
               <span style={{ color: '#64748b', fontSize: '11px', fontFamily: codeFont }}>v{appVersion}</span>
               <span style={{ color: '#475569' }}>|</span>
               <span>
-                拖拽移动 · {modKey}方向键 移动 · {modKey}B 隐藏/显示 · {modKey}[ {modKey}] 透明度 · {modKey}R 刷新 · {modKey}Q 退出
+                拖拽移动 · {modKey}方向键 移动 · {modKey}B 隐藏/显示 · {modKey}+/- 字号 · {modKey}[ {modKey}] 透明度 · {modKey}R 刷新 · {modKey}Q 退出
               </span>
             </div>
 
@@ -3838,6 +3899,42 @@ export default function App() {
                         : '无声音'}
                 </span>
               )}
+
+              {/* 客户端本地阅读字号快捷调节（⌘+/⌘-/⌘0，仅影响本地阅读不影响导师） */}
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', background: 'rgba(31, 41, 55, 0.72)', border: '1px solid #374151', borderRadius: '6px', padding: '2px 4px' }}>
+                <button
+                  type="button"
+                  onClick={() => adjustClientFontSize(-2)}
+                  disabled={clientFontSize <= MIN_CLIENT_FONT_SIZE}
+                  style={{
+                    background: 'transparent', border: 'none', color: clientFontSize <= MIN_CLIENT_FONT_SIZE ? '#475569' : '#cbd5e1',
+                    fontSize: '11.5px', fontWeight: 700, cursor: clientFontSize <= MIN_CLIENT_FONT_SIZE ? 'default' : 'pointer', padding: '1px 5px',
+                  }}
+                >
+                  A-
+                </button>
+                <button
+                  type="button"
+                  onClick={() => adjustClientFontSize(0)}
+                  style={{
+                    background: 'transparent', border: 'none', color: clientFontSize === DEFAULT_FONT_SIZE ? '#94a3b8' : '#38bdf8',
+                    fontSize: '11px', fontFamily: codeFont, fontWeight: 600, cursor: 'pointer', padding: '1px 4px', minWidth: '28px',
+                  }}
+                >
+                  {clientFontSize}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => adjustClientFontSize(2)}
+                  disabled={clientFontSize >= MAX_CLIENT_FONT_SIZE}
+                  style={{
+                    background: 'transparent', border: 'none', color: clientFontSize >= MAX_CLIENT_FONT_SIZE ? '#475569' : '#cbd5e1',
+                    fontSize: '11.5px', fontWeight: 700, cursor: clientFontSize >= MAX_CLIENT_FONT_SIZE ? 'default' : 'pointer', padding: '1px 5px',
+                  }}
+                >
+                  A+
+                </button>
+              </div>
 
               <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#e2e8f0', fontWeight: 500 }}>
                 Opacity {Math.round(opacity * 100)}%
@@ -4365,7 +4462,7 @@ export default function App() {
             parameterHints: { enabled: !isClientApp },
             automaticLayout: true,
             fontFamily: codeFont,
-            fontSize: DEFAULT_FONT_SIZE,
+            fontSize: isClientApp ? clientFontSize : DEFAULT_FONT_SIZE,
             lineHeight: Math.max(28, Math.ceil(editorMaxFontSize * 1.52)),
             padding: { top: 8, bottom: 16 },
             lineNumbersMinChars: 4,

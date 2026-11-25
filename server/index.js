@@ -93,9 +93,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.30';
+let pkgVersion = '1.0.31';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.30';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.31';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -125,7 +125,7 @@ let appRelease = {
   minNativeVersion: DEFAULT_MIN_NATIVE_VERSION,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 新增「导师实时查看候选人 Pad 阅读范围」：候选人滚动或缩放窗口时实时上报可视行区间，导师端编辑器内直接高亮候选人当前视野（左侧蓝青色发光竖条 + 上下边界线 + 悬浮行号标签 + 滚动条概览标尺）\n2. 导师端顶栏新增「👁 候选人：行 X–Y」一键定位胶囊与「跟随视角」开关，即使看不见候选人隐身悬浮窗，也能实时掌握其阅读位置',
+  notes: process.env.RELEASE_NOTES || '1. 候选人桌面端支持 ⌘+/⌘-/⌘0（Win 为 Ctrl+/Ctrl-/Ctrl0）及顶栏 A-/A+ 实时放大/缩小/重置本地阅读字号（11–32px，记忆到本地不影响导师端）\n2. 候选人端缩放时自动按偏移量联动放大导师标注的局部大字，并同步重算安全软换行、行高与向导师上报的可视阅读行范围',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };
