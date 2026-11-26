@@ -93,9 +93,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.35';
+let pkgVersion = '1.0.36';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.35';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.36';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -144,7 +144,7 @@ let appRelease = {
   nativeBreakingVersions: NATIVE_BREAKING_VERSIONS,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 客户端体验全面精简全中文化：移除无效的 Frosted Glass 开关，快捷键速查收进顶栏 ? 按钮，底栏 Wss 升级为直观的「已连接/重连中」及顶部断线醒目提示\n2. 彻底修复全局快捷键误劫持 IDE/浏览器问题：窗口移动改为 ⌘⇧方向键（释放 ⌘←/→ 跳行首尾），⌘R/⌘Q 仅在 GlassPad 聚焦时生效，⌘⇧Q 紧急全局退出\n3. 新增客户端「鼠标穿透锁」（⌘⇧L）边看提词边直点底层代码、窗口位置与尺寸自动记忆、双端一键复制、导师端「清空」二次确认与 Alt+M 快捷开关麦',
+  notes: process.env.RELEASE_NOTES || '1. 客户端顶栏快捷键折叠按钮明确标注为「快捷键 ?」，一目了然方便候选人随时展开速查\n2. 纯前端优化：已升级至 v1.0.35 外壳的客户端自动走 1 秒极速热更新，老外壳自动走完整包升级',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };

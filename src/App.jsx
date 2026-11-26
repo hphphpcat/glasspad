@@ -786,7 +786,7 @@ async function performUpdateCheck(customBase) {
     return res;
   }
   // 浏览器环境或老版本预加载回退路径
-  let currentVersion = '1.0.35';
+  let currentVersion = '1.0.36';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -4124,13 +4124,13 @@ export default function App() {
                 onClick={() => setShowShortcutHelp((v) => !v)}
                 style={{
                   background: showShortcutHelp ? 'rgba(56, 189, 248, 0.2)' : 'rgba(31, 41, 55, 0.75)',
-                  color: showShortcutHelp ? '#38bdf8' : '#94a3b8',
+                  color: showShortcutHelp ? '#38bdf8' : '#cbd5e1',
                   border: `1px solid ${showShortcutHelp ? 'rgba(56, 189, 248, 0.5)' : '#374151'}`,
-                  borderRadius: '6px', padding: '4px 7px', fontSize: '11.5px', fontWeight: 700,
-                  cursor: 'pointer', lineHeight: 1.1,
+                  borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 600,
+                  cursor: 'pointer', whiteSpace: 'nowrap',
                 }}
               >
-                ?
+                快捷键 ?
               </button>
             </div>
           </>
