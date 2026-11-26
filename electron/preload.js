@@ -5,8 +5,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   platform: process.platform,
   getFrostSupport: () => ipcRenderer.invoke('GET_FROST_SUPPORT'),
   setFrostedGlass: (enabled) => ipcRenderer.send('SET_FROSTED_GLASS', enabled),
-  // 桌面端剪贴板读取（走主进程 IPC，避免渲染进程 sandbox 下 clipboard 为 undefined）
+  // 桌面端剪贴板读写（走主进程 IPC，避免渲染进程 sandbox 下 clipboard 不可用）
   readClipboardText: () => ipcRenderer.invoke('READ_CLIPBOARD_TEXT'),
+  writeClipboardText: (text) => ipcRenderer.invoke('WRITE_CLIPBOARD_TEXT', text),
+  // 鼠标穿透锁定（文字保持可见但鼠标直穿底层 IDE/网页，快捷键 ⌘/Ctrl+Shift+L）
+  getClickThrough: () => ipcRenderer.invoke('GET_CLICK_THROUGH'),
+  setClickThrough: (enabled) => ipcRenderer.invoke('SET_CLICK_THROUGH', Boolean(enabled)),
+  onClickThroughChanged: (cb) => {
+    const handler = (_e, enabled) => cb?.(Boolean(enabled));
+    ipcRenderer.on('CLICK_THROUGH_CHANGED', handler);
+    return () => ipcRenderer.removeListener('CLICK_THROUGH_CHANGED', handler);
+  },
   // 屏幕共享权限检测与系统设置跳转
   getMediaPermissionStatus: () => ipcRenderer.invoke('GET_MEDIA_PERMISSION_STATUS'),
   getScreenShareCaps: () => ipcRenderer.invoke('GET_SCREEN_SHARE_CAPS'),

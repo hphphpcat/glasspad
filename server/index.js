@@ -93,9 +93,9 @@ const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/tmp/codex-data') ? '/t
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 const VERSION_FILE = path.join(DATA_DIR, 'version.json');
 
-let pkgVersion = '1.0.34';
+let pkgVersion = '1.0.35';
 try {
-  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.34';
+  pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '1.0.35';
 } catch {}
 
 // 语义化版本对比：a > b 返回 1，相等返回 0，小于返回 -1
@@ -118,13 +118,14 @@ const DEFAULT_MAC_DOWNLOAD_URL =
 const DEFAULT_WIN_DOWNLOAD_URL =
   `https://github.com/hphphpcat/glasspad/releases/download/glasspad/GlassPad-${pkgVersion}-portable.exe`;
 
-const DEFAULT_MIN_NATIVE_VERSION = process.env.MIN_NATIVE_VERSION || '1.0.32';
+const DEFAULT_MIN_NATIVE_VERSION = process.env.MIN_NATIVE_VERSION || '1.0.35';
 
 // 记录每个改动了底层原生外壳（electron/main.js、preload、原生二进制等）的版本号；
 // 只要客户端本地原生外壳版本 baseVersion < 其中任意一个 <= latestVersion 的版本，智能更新就会自动判定走「完整安装包更新」，否则走「1 秒极速热更新」。
 const NATIVE_BREAKING_VERSIONS = [
   { version: '1.0.28', reason: '防后台节流、系统防休眠锁与隐身加固' },
   { version: '1.0.32', reason: 'macOS 隐身态剪贴板/撤销快捷键原生桥接（⌘C/⌘V/⌘X/⌘A/⌘Z）' },
+  { version: '1.0.35', reason: '防误劫持快捷键（⌘⇧方向键移动、聚焦生效⌘R/⌘Q）、鼠标穿透锁（⌘⇧L）与窗口位置尺寸记忆' },
 ];
 
 function computeLatestNativeBreakingVersion(latestVer) {
@@ -143,7 +144,7 @@ let appRelease = {
   nativeBreakingVersions: NATIVE_BREAKING_VERSIONS,
   macUrl: process.env.MAC_DOWNLOAD_URL || DEFAULT_MAC_DOWNLOAD_URL,
   winUrl: process.env.WIN_DOWNLOAD_URL || DEFAULT_WIN_DOWNLOAD_URL,
-  notes: process.env.RELEASE_NOTES || '1. 升级一键智能更新：点击「一键更新」自动比对当前原生外壳版本与最新版之间是否跨越底层原生改动——无底层改动自动走 1 秒极速热更新，跨越底层改动自动下载安装包覆盖并重启\n2. 同步补齐 v1.0.32 原生快捷键桥接为原生基线，确保老版本客户端自动走完整包升级',
+  notes: process.env.RELEASE_NOTES || '1. 客户端体验全面精简全中文化：移除无效的 Frosted Glass 开关，快捷键速查收进顶栏 ? 按钮，底栏 Wss 升级为直观的「已连接/重连中」及顶部断线醒目提示\n2. 彻底修复全局快捷键误劫持 IDE/浏览器问题：窗口移动改为 ⌘⇧方向键（释放 ⌘←/→ 跳行首尾），⌘R/⌘Q 仅在 GlassPad 聚焦时生效，⌘⇧Q 紧急全局退出\n3. 新增客户端「鼠标穿透锁」（⌘⇧L）边看提词边直点底层代码、窗口位置与尺寸自动记忆、双端一键复制、导师端「清空」二次确认与 Alt+M 快捷开关麦',
   forceUpdate: process.env.FORCE_UPDATE === 'true',
   updatedAt: Date.now(),
 };

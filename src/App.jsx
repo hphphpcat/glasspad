@@ -786,7 +786,7 @@ async function performUpdateCheck(customBase) {
     return res;
   }
   // 浏览器环境或老版本预加载回退路径
-  let currentVersion = '1.0.34';
+  let currentVersion = '1.0.35';
   if (window.electronAPI?.getAppVersion) {
     try {
       const info = await window.electronAPI.getAppVersion();
@@ -925,12 +925,16 @@ export default function App() {
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState('');
 
-  // 桌面端外观：透明度（调低可透视下方浏览器）/ 毛玻璃（默认关闭）/ 本地阅读字号（仅影响候选人自己观看，支持 ⌘+/⌘-/⌘0）
+  // 桌面端外观：透明度（调低可透视下方浏览器）/ 本地阅读字号（仅影响候选人自己观看，支持 ⌘+/⌘-/⌘0）/ 鼠标穿透锁（⌘⇧L）
   const [opacity, setOpacity] = useState(() => Number(localStorage.getItem('pad_opacity')) || 0.78);
   const [clientFontSize, setClientFontSize] = useState(() => clampClientFontSize(localStorage.getItem('pad_client_font_size') || DEFAULT_FONT_SIZE));
   const clientFontSizeRef = useRef(clientFontSize);
-  const [supportsFrost, setSupportsFrost] = useState(false);
-  const [frostedGlass, setFrostedGlass] = useState(() => localStorage.getItem('pad_frost_v2') === 'true');
+  const [clickThrough, setClickThrough] = useState(false);
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const confirmClearTimerRef = useRef(null);
+  const [hasEverConnected, setHasEverConnected] = useState(false);
   // 导师端局部文字样式工具条状态（字号/加粗/颜色均仅作用于选中文本，客户端无修改入口）
   const [selectionFontSize, setSelectionFontSize] = useState(String(DEFAULT_FONT_SIZE));
   const [editorMaxFontSize, setEditorMaxFontSize] = useState(DEFAULT_FONT_SIZE);
@@ -1027,17 +1031,18 @@ export default function App() {
   const mentorVoiceMutedRef = useRef(false);
   const mentorVoiceRmsRef = useRef(0); // 客户端当前正在播放的导师语音实时电平（供 Windows/BlackHole 防回环门控使用）
 
-  // 桌面端：检测系统是否支持毛玻璃 + 启动时获取版本号并静默检查更新
+  // 桌面端：启动时获取版本号、鼠标穿透状态，并静默检查更新
   useEffect(() => {
     const api = window.electronAPI;
     if (!api) return;
-    api.getFrostSupport?.().then((res) => {
-      const ok = Boolean(res?.supportsFrostedGlass);
-      setSupportsFrost(ok);
-      api.setFrostedGlass(ok && frostedGlass);
-    });
     api.getAppVersion?.().then((info) => {
       if (info?.version) setAppVersion(info.version);
+    });
+    api.getClickThrough?.().then((res) => {
+      if (typeof res?.enabled === 'boolean') setClickThrough(res.enabled);
+    }).catch(() => {});
+    const offClickThrough = api.onClickThroughChanged?.((enabled) => {
+      setClickThrough(Boolean(enabled));
     });
     // macOS：启动即读取 BlackHole 安装状态与本机物理扬声器当前音量，确保未开屏幕共享时顶栏也能随时调节音量
     if (api.platform === 'darwin' && api.getAudioSetupStatus) {
@@ -1087,7 +1092,10 @@ export default function App() {
         attributeFilter: ['title'],
       });
     }
-    return () => titleObserver.disconnect();
+    return () => {
+      titleObserver.disconnect();
+      offClickThrough?.();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1155,7 +1163,18 @@ export default function App() {
   }, [clientFontSize]);
 
   useEffect(() => {
+    if (wsConnected) setHasEverConnected(true);
+  }, [wsConnected]);
+
+  const toggleMentorMicRef = useRef(null);
+  useEffect(() => {
     const onKey = (e) => {
+      // 导师端 Alt+M 一键开关麦（无需切鼠标去点顶栏）
+      if (!isClientApp && e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey && String(e.code || '') === 'KeyM') {
+        e.preventDefault();
+        toggleMentorMicRef.current?.();
+        return;
+      }
       if (!(e.metaKey || e.ctrlKey)) return;
       const isPlus = e.key === '=' || e.key === '+' || e.code === 'Equal' || e.code === 'NumpadAdd';
       const isMinus = e.key === '-' || e.key === '_' || e.code === 'Minus' || e.code === 'NumpadSubtract';
@@ -1191,10 +1210,57 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey, true);
   }, []);
 
-  const toggleFrostedGlass = (enabled) => {
-    setFrostedGlass(enabled);
-    localStorage.setItem('pad_frost_v2', String(enabled));
-    window.electronAPI?.setFrostedGlass?.(enabled);
+  const handleToggleClickThrough = () => {
+    const next = !clickThrough;
+    setClickThrough(next);
+    window.electronAPI?.setClickThrough?.(next);
+  };
+
+  // 一键复制当前选中文字（无选中时复制全文）
+  const handleCopyContent = async () => {
+    const editor = editorRef.current;
+    const model = editor?.getModel?.();
+    let content = '';
+    if (editor && model) {
+      const sel = editor.getSelection?.();
+      if (sel && !sel.isEmpty()) {
+        content = model.getValueInRange(sel);
+      } else {
+        content = model.getValue();
+      }
+    } else {
+      content = latestText.current || text || '';
+    }
+    if (!content) return;
+    let ok = false;
+    if (window.electronAPI?.writeClipboardText) {
+      try {
+        const res = await window.electronAPI.writeClipboardText(content);
+        ok = Boolean(res?.ok);
+      } catch {}
+    }
+    if (!ok && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(content);
+        ok = true;
+      } catch {}
+    }
+    if (!ok) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = content;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch {}
+    }
+    if (ok) {
+      setCopyFeedback(true);
+      setTimeout(() => setCopyFeedback(false), 1600);
+    }
   };
 
   // 同步更新强制中继状态（同时写入 State 与 Ref，保证异步 WS/WebRTC 回调永远读到最新值）
@@ -2496,6 +2562,7 @@ export default function App() {
     if (mentorMicOn) stopMentorMic(true);
     else startMentorMic();
   };
+  toggleMentorMicRef.current = toggleMentorMic;
 
   const closeVoiceListener = (speakerId) => {
     const cur = voiceListenerPcsRef.current.get(speakerId);
@@ -3671,6 +3738,11 @@ export default function App() {
   };
 
   const clearPad = () => {
+    if (confirmClearTimerRef.current) {
+      clearTimeout(confirmClearTimerRef.current);
+      confirmClearTimerRef.current = null;
+    }
+    setConfirmClear(false);
     colorMarksRef.current = [];
     boldMarksRef.current = [];
     sizeMarksRef.current = [];
@@ -3682,6 +3754,20 @@ export default function App() {
     setSelectionFontSize(String(DEFAULT_FONT_SIZE));
     setText('');
     sendText('', [], [], []);
+  };
+
+  // 清空二次防误触：第一次点变「确认清空?」（3 秒自动复位），再点才真正清空
+  const handleClearClick = () => {
+    if (!confirmClear) {
+      setConfirmClear(true);
+      if (confirmClearTimerRef.current) clearTimeout(confirmClearTimerRef.current);
+      confirmClearTimerRef.current = setTimeout(() => {
+        confirmClearTimerRef.current = null;
+        setConfirmClear(false);
+      }, 3000);
+      return;
+    }
+    clearPad();
   };
 
   const commitNameChange = (raw) => {
@@ -3755,7 +3841,6 @@ export default function App() {
   }
 
   const bgAlpha = isClientApp ? opacity : 1;
-  const frost = isClientApp && supportsFrost && frostedGlass;
   const barBg = `rgba(20, 20, 20, ${Math.min(bgAlpha + 0.08, 1)})`;
 
   return (
@@ -3764,43 +3849,48 @@ export default function App() {
       width: '100%', height: '100dvh',
       boxSizing: 'border-box',
       background: `rgba(13, 13, 13, ${bgAlpha})`,
-      backdropFilter: frost ? 'blur(14px)' : 'none',
-      WebkitBackdropFilter: frost ? 'blur(14px)' : 'none',
       color: '#e5e5e5', fontFamily: uiFont,
-      border: isClientApp ? '1px solid rgba(255, 255, 255, 0.12)' : 'none',
+      border: isClientApp
+        ? `1px solid ${clickThrough ? 'rgba(56, 189, 248, 0.55)' : 'rgba(255, 255, 255, 0.12)'}`
+        : 'none',
       borderRadius: isClientApp ? '8px' : '0px', overflow: 'hidden',
     }}>
       {/* 顶部栏（桌面端整条可按住拖拽移动窗口，右侧控件除外） */}
       <div style={{
-        display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap',
-        padding: '8px 14px', background: barBg,
+        display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap',
+        padding: '7px 12px', background: barBg,
         borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
-        fontSize: '12.5px', color: '#d1d5db', flexShrink: 0,
+        fontSize: '12px', color: '#d1d5db', flexShrink: 0,
         WebkitAppRegion: isClientApp ? 'drag' : 'no-drag',
         cursor: isClientApp ? 'grab' : 'default',
       }}>
         {isClientApp ? (
           <>
-            {/* 品牌标识 + 拖拽手柄 + 清晰快捷键提示 */}
+            {/* 品牌标识 + 版本号（把长串快捷键收进右侧 ? 面板，给窄屏留足拖拽与操作空间） */}
             <div style={{
-              display: 'flex', alignItems: 'center', gap: '8px',
+              display: 'flex', alignItems: 'center', gap: '7px',
               userSelect: 'none', color: '#cbd5e1', fontSize: '12px', fontWeight: 500,
-              whiteSpace: 'nowrap', letterSpacing: '0.2px',
+              whiteSpace: 'nowrap',
             }}>
-              <BrandLogo size={18} />
-              <span style={{ color: '#f1f5f9', fontWeight: 600, marginRight: '2px' }}>GlassPad</span>
+              <BrandLogo size={17} />
+              <span style={{ color: '#f1f5f9', fontWeight: 600 }}>GlassPad</span>
               <span style={{ color: '#64748b', fontSize: '11px', fontFamily: codeFont }}>v{appVersion}</span>
-              <span style={{ color: '#475569' }}>|</span>
-              <span>
-                拖拽移动 · {modKey}方向键 移动 · {modKey}B 隐藏/显示 · {modKey}+/- 字号 · {modKey}[ {modKey}] 透明度 · {modKey}R 刷新 · {modKey}Q 退出
-              </span>
+              {clickThrough && (
+                <span style={{
+                  background: 'rgba(56, 189, 248, 0.18)', color: '#38bdf8',
+                  border: '1px solid rgba(56, 189, 248, 0.45)', borderRadius: '5px',
+                  padding: '1px 6px', fontSize: '11px', fontWeight: 600,
+                }}>
+                  穿透中 · {modKey}⇧L 解锁
+                </span>
+              )}
             </div>
 
             {/* 中间弹性拖拽区 */}
-            <div style={{ flex: 1, minWidth: '20px', alignSelf: 'stretch' }} />
+            <div style={{ flex: 1, minWidth: '18px', alignSelf: 'stretch' }} />
 
             <div style={{
-              marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '10px',
+              marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '7px', flexWrap: 'wrap',
               WebkitAppRegion: 'no-drag', cursor: 'default',
             }}>
               {updateBannerText && (
@@ -3808,28 +3898,6 @@ export default function App() {
                   {updateBannerText}
                 </span>
               )}
-
-              {/* 一键智能更新按钮：点击直接检查并按版本差自动选择热更新或完整安装包更新 */}
-              <button
-                onClick={() => (updateInfo?.hasUpdate ? (setAutoStartUpdate(true), setShowUpdateModal(true)) : handleManualCheckUpdate(true))}
-                style={{
-                  display: 'inline-flex', alignItems: 'center', gap: '5px',
-                  background: updateInfo?.hasUpdate ? 'rgba(16, 185, 129, 0.2)' : 'rgba(31, 41, 55, 0.75)',
-                  color: updateInfo?.hasUpdate ? '#34d399' : '#cbd5e1',
-                  border: `1px solid ${updateInfo?.hasUpdate ? 'rgba(16, 185, 129, 0.5)' : '#374151'}`,
-                  borderRadius: '6px', padding: '4px 9px', fontSize: '11.5px', fontWeight: 600,
-                  cursor: 'pointer', whiteSpace: 'nowrap',
-                }}
-              >
-                {updateInfo?.hasUpdate && (
-                  <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#34d399' }} />
-                )}
-                {checkingUpdate
-                  ? '检查中…'
-                  : updateInfo?.hasUpdate
-                    ? `一键更新 v${updateInfo.latestVersion}`
-                    : '检查更新'}
-              </button>
 
               {shareError && (
                 <span
@@ -3853,11 +3921,11 @@ export default function App() {
               <button
                 onClick={() => (isSharingScreen ? stopScreenShare(true) : startScreenShare())}
                 style={{
-                  display: 'inline-flex', alignItems: 'center', gap: '6px',
+                  display: 'inline-flex', alignItems: 'center', gap: '5px',
                   background: isSharingScreen ? 'rgba(16, 185, 129, 0.2)' : 'rgba(31, 41, 55, 0.85)',
                   color: isSharingScreen ? '#34d399' : '#e2e8f0',
                   border: `1px solid ${isSharingScreen ? 'rgba(16, 185, 129, 0.5)' : '#374151'}`,
-                  borderRadius: '6px', padding: '4px 10px', fontSize: '12px', fontWeight: 600,
+                  borderRadius: '6px', padding: '4px 9px', fontSize: '11.5px', fontWeight: 600,
                   cursor: 'pointer', whiteSpace: 'nowrap',
                 }}
               >
@@ -3865,10 +3933,10 @@ export default function App() {
                   width: '7px', height: '7px', borderRadius: '50%',
                   background: isSharingScreen ? '#10b981' : '#64748b',
                 }} />
-                {isSharingScreen ? 'Sharing Screen' : 'Share Screen'}
+                {isSharingScreen ? '共享中' : '共享屏幕'}
               </button>
 
-              {/* 麦克风开关：始终显示，含 ON / OFF / 无（不可用）三种状态 */}
+              {/* 麦克风开关：含 开 / 关 / 无权限 三种状态 */}
               {isSharingScreen && (
                 <button
                   onClick={shareHasMic ? toggleShareMic : () => window.electronAPI?.openPrivacySettings?.('microphone')}
@@ -3880,7 +3948,7 @@ export default function App() {
                     cursor: 'pointer', whiteSpace: 'nowrap',
                   }}
                 >
-                  Mic: {shareHasMic ? (shareMicOn ? 'ON' : 'OFF') : '无'}
+                  麦: {shareHasMic ? (shareMicOn ? '开' : '关') : '无权限'}
                 </button>
               )}
 
@@ -3900,12 +3968,12 @@ export default function App() {
                 </button>
               )}
 
-              {/* 物理扬声器音量（macOS 安装 BlackHole 后常驻显示）：聚合设备接管后系统音量键失效，这里绕过聚合设备直接实时调物理扬声器 */}
+              {/* 物理扬声器音量（macOS 安装 BlackHole 后常驻显示） */}
               {audioSetup.blackholeInstalled && (
                 <label
-                  style={{ display: 'flex', alignItems: 'center', gap: '5px', color: '#94a3b8', fontSize: '11px', whiteSpace: 'nowrap' }}
+                  style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#94a3b8', fontSize: '11px', whiteSpace: 'nowrap' }}
                 >
-                  <span>🔊 本机音量</span>
+                  <span>音量</span>
                   <input
                     type="range" min="0" max="100" step="1" value={speakerVolume}
                     onChange={(e) => {
@@ -3914,18 +3982,18 @@ export default function App() {
                       speakerDuckedRef.current = false;
                       window.electronAPI?.setSpeakerVolume?.(v);
                     }}
-                    style={{ width: '56px', cursor: 'pointer', accentColor: '#38bdf8' }}
+                    style={{ width: '52px', cursor: 'pointer', accentColor: '#38bdf8' }}
                   />
                   <span style={{ minWidth: '28px', textAlign: 'right' }}>{speakerVolume}%</span>
                 </label>
               )}
 
-              {/* 导师语音收听指示与一键静音（仅当有导师正在开麦时显示） */}
+              {/* 导师语音收听指示与一键静音 */}
               {activeVoiceSpeakers.filter((s) => s?.id !== myClientIdRef.current).length > 0 && (
                 <button
                   onClick={() => setMentorVoiceMuted((v) => !v)}
                   style={{
-                    display: 'inline-flex', alignItems: 'center', gap: '5px',
+                    display: 'inline-flex', alignItems: 'center', gap: '4px',
                     background: mentorVoiceMuted ? 'rgba(239, 68, 68, 0.16)' : 'rgba(16, 185, 129, 0.18)',
                     color: mentorVoiceMuted ? '#f87171' : '#34d399',
                     border: `1px solid ${mentorVoiceMuted ? 'rgba(239, 68, 68, 0.4)' : 'rgba(16, 185, 129, 0.45)'}`,
@@ -3933,24 +4001,26 @@ export default function App() {
                     cursor: 'pointer', whiteSpace: 'nowrap',
                   }}
                 >
-                  <span>{mentorVoiceMuted ? '🔇 导师已静音' : '🎙 导师语音中'}</span>
+                  <span>{mentorVoiceMuted ? '🔇 导师静音' : '🎙 导师语音中'}</span>
                 </button>
               )}
 
-              {/* 当前传给导师的音频来源提示 */}
-              {isSharingScreen && (
-                <span style={{ color: '#64748b', fontSize: '11px', whiteSpace: 'nowrap' }}>
-                  {shareSystemAudio && shareHasMic
-                    ? (audioSetup.blackholeInstalled ? '系统音(BlackHole) + 麦克风' : '系统音 + 麦克风')
-                    : shareSystemAudio
-                      ? (audioSetup.blackholeInstalled ? '系统音(BlackHole)' : '系统音')
-                      : shareHasMic
-                        ? (audioSetup.blackholeInstalled ? '仅麦克风（系统音未就绪）' : '麦克风拾音（系统音请开外放）')
-                        : '无声音'}
-                </span>
-              )}
+              {/* 一键复制（选中则复制选中，未选中复制全文） */}
+              <button
+                type="button"
+                onClick={handleCopyContent}
+                style={{
+                  background: copyFeedback ? 'rgba(16, 185, 129, 0.2)' : 'rgba(31, 41, 55, 0.75)',
+                  color: copyFeedback ? '#34d399' : '#cbd5e1',
+                  border: `1px solid ${copyFeedback ? 'rgba(16, 185, 129, 0.45)' : '#374151'}`,
+                  borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 600,
+                  cursor: 'pointer', whiteSpace: 'nowrap',
+                }}
+              >
+                {copyFeedback ? '已复制 ✓' : '复制'}
+              </button>
 
-              {/* 客户端编辑 / 只读锁定一键切换（默认可编辑并双向实时同步给导师） */}
+              {/* 客户端编辑 / 只读锁定一键切换 */}
               <button
                 type="button"
                 onClick={() => setClientReadOnly((v) => !v)}
@@ -3962,11 +4032,26 @@ export default function App() {
                   cursor: 'pointer', whiteSpace: 'nowrap',
                 }}
               >
-                {clientReadOnly ? '🔒 只读' : '✏️ 可编辑'}
+                {clientReadOnly ? '🔒 只读' : '✏️ 编辑'}
+              </button>
+
+              {/* 鼠标穿透锁（看提词同时直点底层 IDE/网页；快捷键 ⌘/Ctrl+Shift+L 解锁） */}
+              <button
+                type="button"
+                onClick={handleToggleClickThrough}
+                style={{
+                  background: clickThrough ? 'rgba(56, 189, 248, 0.2)' : 'rgba(31, 41, 55, 0.75)',
+                  color: clickThrough ? '#38bdf8' : '#cbd5e1',
+                  border: `1px solid ${clickThrough ? 'rgba(56, 189, 248, 0.5)' : '#374151'}`,
+                  borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 600,
+                  cursor: 'pointer', whiteSpace: 'nowrap',
+                }}
+              >
+                穿透
               </button>
 
               {/* 客户端本地阅读字号快捷调节（⌘+/⌘-/⌘0，仅影响本地阅读不影响导师） */}
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', background: 'rgba(31, 41, 55, 0.72)', border: '1px solid #374151', borderRadius: '6px', padding: '2px 4px' }}>
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '2px', background: 'rgba(31, 41, 55, 0.72)', border: '1px solid #374151', borderRadius: '6px', padding: '2px 4px' }}>
                 <button
                   type="button"
                   onClick={() => adjustClientFontSize(-2)}
@@ -3983,7 +4068,7 @@ export default function App() {
                   onClick={() => adjustClientFontSize(0)}
                   style={{
                     background: 'transparent', border: 'none', color: clientFontSize === DEFAULT_FONT_SIZE ? '#94a3b8' : '#38bdf8',
-                    fontSize: '11px', fontFamily: codeFont, fontWeight: 600, cursor: 'pointer', padding: '1px 4px', minWidth: '28px',
+                    fontSize: '11px', fontFamily: codeFont, fontWeight: 600, cursor: 'pointer', padding: '1px 4px', minWidth: '26px',
                   }}
                 >
                   {clientFontSize}
@@ -4001,25 +4086,52 @@ export default function App() {
                 </button>
               </div>
 
-              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#e2e8f0', fontWeight: 500 }}>
-                Opacity {Math.round(opacity * 100)}%
+              {/* 透明度滑块（全中文简洁展示，移除无效的 Frosted Glass 开关） */}
+              <label style={{ display: 'flex', alignItems: 'center', gap: '5px', color: '#cbd5e1', fontWeight: 500, fontSize: '11.5px', whiteSpace: 'nowrap' }}>
+                透明度 {Math.round(opacity * 100)}%
                 <input
                   type="range" min="0.08" max="1" step="0.04" value={opacity}
                   onChange={(e) => setOpacity(Number(e.target.value))}
-                  style={{ width: '64px', cursor: 'pointer', accentColor: '#10b981' }}
+                  style={{ width: '58px', cursor: 'pointer', accentColor: '#10b981' }}
                 />
               </label>
 
-              {supportsFrost && (
-                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontWeight: 500, color: frostedGlass ? '#10b981' : '#cbd5e1' }}>
-                  <input
-                    type="checkbox" checked={frostedGlass}
-                    onChange={(e) => toggleFrostedGlass(e.target.checked)}
-                    style={{ accentColor: '#10b981', cursor: 'pointer' }}
-                  />
-                  Frosted Glass
-                </label>
-              )}
+              {/* 一键智能更新按钮 */}
+              <button
+                onClick={() => (updateInfo?.hasUpdate ? (setAutoStartUpdate(true), setShowUpdateModal(true)) : handleManualCheckUpdate(true))}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: '5px',
+                  background: updateInfo?.hasUpdate ? 'rgba(16, 185, 129, 0.2)' : 'rgba(31, 41, 55, 0.75)',
+                  color: updateInfo?.hasUpdate ? '#34d399' : '#cbd5e1',
+                  border: `1px solid ${updateInfo?.hasUpdate ? 'rgba(16, 185, 129, 0.5)' : '#374151'}`,
+                  borderRadius: '6px', padding: '4px 8px', fontSize: '11.5px', fontWeight: 600,
+                  cursor: 'pointer', whiteSpace: 'nowrap',
+                }}
+              >
+                {updateInfo?.hasUpdate && (
+                  <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#34d399' }} />
+                )}
+                {checkingUpdate
+                  ? '检查中…'
+                  : updateInfo?.hasUpdate
+                    ? `更新 v${updateInfo.latestVersion}`
+                    : '检查更新'}
+              </button>
+
+              {/* 快捷键速查折叠按钮 */}
+              <button
+                type="button"
+                onClick={() => setShowShortcutHelp((v) => !v)}
+                style={{
+                  background: showShortcutHelp ? 'rgba(56, 189, 248, 0.2)' : 'rgba(31, 41, 55, 0.75)',
+                  color: showShortcutHelp ? '#38bdf8' : '#94a3b8',
+                  border: `1px solid ${showShortcutHelp ? 'rgba(56, 189, 248, 0.5)' : '#374151'}`,
+                  borderRadius: '6px', padding: '4px 7px', fontSize: '11.5px', fontWeight: 700,
+                  cursor: 'pointer', lineHeight: 1.1,
+                }}
+              >
+                ?
+              </button>
             </div>
           </>
         ) : (
@@ -4028,9 +4140,35 @@ export default function App() {
               <BrandLogo size={20} />
               <span style={{ color: '#f1f5f9', fontWeight: 600, fontSize: '13px' }}>GlassPad</span>
             </div>
-            <button onClick={clearPad} style={btn}>Clear</button>
+            {/* 清空二次防误触按钮 */}
+            <button
+              onClick={handleClearClick}
+              style={{
+                ...btn,
+                background: confirmClear ? 'rgba(239, 68, 68, 0.22)' : btn.background,
+                color: confirmClear ? '#fca5a5' : btn.color,
+                borderColor: confirmClear ? 'rgba(239, 68, 68, 0.6)' : '#333',
+                fontWeight: confirmClear ? 700 : 500,
+              }}
+              title={confirmClear ? '再次点击立即清空全部内容（3 秒后自动取消）' : '清空面板内容（需二次确认防误点）'}
+            >
+              {confirmClear ? '确认清空?' : '清空'}
+            </button>
 
-            {/* 导师端开麦按钮（独立 WebRTC 语音通道，直接传给房间内候选人/其他成员） */}
+            {/* 导师端一键复制 */}
+            <button
+              onClick={handleCopyContent}
+              style={{
+                ...btn,
+                color: copyFeedback ? '#34d399' : '#cbd5e1',
+                borderColor: copyFeedback ? 'rgba(16, 185, 129, 0.5)' : '#333',
+              }}
+              title="复制当前选中文字（未选中时复制全文）"
+            >
+              {copyFeedback ? '已复制 ✓' : '复制'}
+            </button>
+
+            {/* 导师端开麦按钮（独立 WebRTC 语音通道，支持 Alt+M 快速开关麦） */}
             <button
               onClick={toggleMentorMic}
               style={{
@@ -4041,13 +4179,13 @@ export default function App() {
                 borderRadius: '6px', padding: '4px 10px', fontSize: '12px', fontWeight: 600,
                 cursor: 'pointer', whiteSpace: 'nowrap',
               }}
-              title={mentorMicOn ? '点击关闭导师麦克风' : '点击开启导师麦克风，直接对候选人讲话'}
+              title={mentorMicOn ? '点击或按 Alt+M 关闭导师麦克风' : '点击或按 Alt+M 开启导师麦克风，直接对候选人讲话'}
             >
               <span style={{
                 width: '7px', height: '7px', borderRadius: '50%',
                 background: mentorMicOn ? '#10b981' : '#64748b',
               }} />
-              {mentorMicOn ? '🎙 导师开麦中' : '🎙 导师开麦'}
+              {mentorMicOn ? '🎙 导师开麦中 (Alt+M)' : '🎙 导师开麦 (Alt+M)'}
             </button>
             {mentorMicError && (
               <span style={{ color: '#f87171', fontSize: '11.5px', whiteSpace: 'nowrap' }}>
@@ -4194,6 +4332,51 @@ export default function App() {
           </>
         )}
       </div>
+
+      {/* 断线重连醒目提示条（曾连上后中途掉线时弹出，恢复连接立即自动消失） */}
+      {hasEverConnected && !wsConnected && !authFail && !destroyedMsg && (
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+          padding: '6px 14px',
+          background: 'rgba(239, 68, 68, 0.18)',
+          borderBottom: '1px solid rgba(239, 68, 68, 0.45)',
+          color: '#fca5a5', fontSize: '12px', fontWeight: 600,
+          flexShrink: 0, WebkitAppRegion: 'no-drag', cursor: 'default',
+        }}>
+          <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#ef4444' }} />
+          <span>网络连接已断开，正在自动重连房间…</span>
+        </div>
+      )}
+
+      {/* 客户端快捷键速查折叠条（点击顶栏 ? 展开/收起，不占平时顶栏宽度） */}
+      {isClientApp && showShortcutHelp && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap',
+          padding: '7px 14px',
+          background: 'rgba(15, 23, 42, 0.92)',
+          borderBottom: '1px solid rgba(56, 189, 248, 0.3)',
+          color: '#cbd5e1', fontSize: '11.5px',
+          flexShrink: 0, WebkitAppRegion: 'no-drag', cursor: 'default',
+        }}>
+          <span><b style={{ color: '#38bdf8' }}>{modKey}B</b> 隐身/显形</span>
+          <span><b style={{ color: '#38bdf8' }}>{modKey}⇧L</b> 鼠标穿透/解锁</span>
+          <span><b style={{ color: '#38bdf8' }}>{modKey}⇧方向键</b> 移动窗口</span>
+          <span><b style={{ color: '#38bdf8' }}>{modKey}+ / {modKey}- / {modKey}0</b> 调字号/重置</span>
+          <span><b style={{ color: '#38bdf8' }}>{modKey}[ / {modKey}]</b> 调透明度</span>
+          <span><b style={{ color: '#38bdf8' }}>{modKey}R / {modKey}Q</b> 聚焦时刷新/退出</span>
+          <span><b style={{ color: '#38bdf8' }}>{modKey}⇧Q</b> 全局紧急退出</span>
+          <button
+            type="button"
+            onClick={() => setShowShortcutHelp(false)}
+            style={{
+              marginLeft: 'auto', background: 'transparent', border: 'none',
+              color: '#94a3b8', fontSize: '12px', cursor: 'pointer', padding: '0 4px',
+            }}
+          >
+            收起 ✕
+          </button>
+        </div>
+      )}
 
       {/* 客户端提醒横幅：未装 BlackHole 时，靠麦克风拾取外放兜底，提醒候选人打开扬声器 */}
       {isClientApp && isSharingScreen && !shareSystemAudio && !audioSetup.blackholeInstalled && !speakerTipDismissed && (
@@ -4565,11 +4748,27 @@ export default function App() {
       }}>
         <div style={{
           display: 'flex', alignItems: 'center', gap: '6px',
-          background: 'rgba(34, 34, 34, 0.7)', padding: '3px 10px', borderRadius: '14px', fontSize: '12px', color: '#aaa',
+          background: wsConnected ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.18)',
+          border: `1px solid ${wsConnected ? 'rgba(16, 185, 129, 0.35)' : 'rgba(239, 68, 68, 0.4)'}`,
+          padding: '3px 10px', borderRadius: '14px', fontSize: '12px',
+          color: wsConnected ? '#6ee7b7' : '#fca5a5', fontWeight: 500,
         }}>
-          <span>Wss:</span>
-          <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: wsConnected ? '#10b981' : '#ef4444' }} />
+          <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: wsConnected ? '#10b981' : '#ef4444' }} />
+          <span>{wsConnected ? '已连接' : '重连中…'}</span>
         </div>
+
+        {/* 客户端共享音频来源简短状态放到低干扰的底栏，腾出顶栏空间 */}
+        {isClientApp && isSharingScreen && (
+          <span style={{ color: '#94a3b8', fontSize: '11.5px', whiteSpace: 'nowrap' }}>
+            音频：{shareSystemAudio && shareHasMic
+              ? (audioSetup.blackholeInstalled ? '系统音(BlackHole) + 麦克风' : '系统音 + 麦克风')
+              : shareSystemAudio
+                ? (audioSetup.blackholeInstalled ? '系统音(BlackHole)' : '系统音')
+                : shareHasMic
+                  ? (audioSetup.blackholeInstalled ? '仅麦克风' : '麦克风（请开外放）')
+                  : '无声音'}
+          </span>
+        )}
 
         {authFail && <span style={{ color: '#ef4444', fontSize: '12px' }}>房间凭证无效</span>}
         {destroyedMsg && <span style={{ color: '#ef4444', fontSize: '12px' }}>{destroyedMsg}</span>}

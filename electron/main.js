@@ -32,9 +32,73 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 
 let mainWindow;
 let isStealthHidden = false; // ⌘+B 零重建隐身状态（用 setOpacity(0)+鼠标穿透代替 hide/show，彻底杜绝唤醒时单帧闪现）
+let isClickThrough = false; // ⌘+Shift+L 鼠标穿透锁定状态（窗口保持可见，点击/滚轮直穿底层 IDE/网页）
 let sharePowerBlockerId = null; // 共享期间系统防休眠/防挂起锁 ID
+let saveBoundsTimer = null;
 const MOVE_STEP = 40;
 const DEFAULT_UPDATE_BASE = 'https://glasspad.up.railway.app';
+
+function getWindowBoundsFile() {
+  return path.join(app.getPath('userData'), 'window-bounds.json');
+}
+
+// 读取上次保存的窗口位置与尺寸，并校验仍在当前某块可用显示器内，避免换外接屏后窗口飞出可视区
+function loadSavedWindowBounds() {
+  const fallback = { width: 1120, height: 640 };
+  try {
+    const file = getWindowBoundsFile();
+    if (!fs.existsSync(file)) return fallback;
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const width = Math.max(460, Math.min(2600, Math.round(Number(saved?.width) || fallback.width)));
+    const height = Math.max(260, Math.min(1800, Math.round(Number(saved?.height) || fallback.height)));
+    if (Number.isFinite(Number(saved?.x)) && Number.isFinite(Number(saved?.y))) {
+      const x = Math.round(Number(saved.x));
+      const y = Math.round(Number(saved.y));
+      const displays = screen.getAllDisplays();
+      const visible = displays.some((d) => {
+        const wa = d.workArea;
+        return x + width > wa.x + 60 && x < wa.x + wa.width - 60 && y + height > wa.y + 40 && y < wa.y + wa.height - 40;
+      });
+      if (visible) return { x, y, width, height };
+    }
+    return { width, height };
+  } catch {
+    return fallback;
+  }
+}
+
+function scheduleSaveWindowBounds() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (saveBoundsTimer) clearTimeout(saveBoundsTimer);
+  saveBoundsTimer = setTimeout(() => {
+    saveBoundsTimer = null;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    try {
+      const b = mainWindow.getBounds();
+      if (b.width >= 300 && b.height >= 200) {
+        fs.writeFileSync(getWindowBoundsFile(), JSON.stringify(b));
+      }
+    } catch {}
+  }, 350);
+}
+
+function setClickThroughState(next) {
+  isClickThrough = Boolean(next);
+  if (!mainWindow || mainWindow.isDestroyed()) return isClickThrough;
+  enforceStealthProtection(mainWindow);
+  if (!isStealthHidden) {
+    if (isClickThrough) {
+      mainWindow.setIgnoreMouseEvents(true, { forward: true });
+    } else {
+      mainWindow.setIgnoreMouseEvents(false);
+    }
+  }
+  enforceStealthProtection(mainWindow);
+  try {
+    mainWindow.webContents.send('CLICK_THROUGH_CHANGED', isClickThrough);
+  } catch {}
+  return isClickThrough;
+}
 
 // 语义化版本对比：remote > local 返回 1，相等返回 0，小于返回 -1
 function compareSemver(remoteVer, localVer) {
@@ -208,9 +272,15 @@ function applyNativeFrostedGlass(win, _enabled) {
 }
 
 function createWindow() {
+  const savedBounds = loadSavedWindowBounds();
   mainWindow = new BrowserWindow({
-    width: 1160,
-    height: 680,
+    width: savedBounds.width,
+    height: savedBounds.height,
+    ...(typeof savedBounds.x === 'number' && typeof savedBounds.y === 'number'
+      ? { x: savedBounds.x, y: savedBounds.y }
+      : {}),
+    minWidth: 460,
+    minHeight: 260,
     frame: false,
     transparent: true,            // 必须为 true：开启原生透明通道
     backgroundColor: '#00000000', // 必须为全透明色值
@@ -248,33 +318,63 @@ function createWindow() {
     e.preventDefault();
   });
 
-  // 2b. macOS 隐身模式关闭了原生应用菜单（Menu.setApplicationMenu(null)），但 AppKit 的 ⌘C/⌘V/⌘X/⌘A/⌘Z 依赖编辑菜单；
-  //     通过 before-input-event 手动桥接标准剪贴板与撤销快捷键，既保持零菜单栏暴露，又确保客户端编辑区复制/粘贴/全选/撤销完全正常
-  if (process.platform === 'darwin') {
-    mainWindow.webContents.on('before-input-event', (event, input) => {
-      if (input.type !== 'keyDown' || !input.meta || input.alt || input.control) return;
-      const k = String(input.key || '').toLowerCase();
+  // 2b. 仅当 GlassPad 处于聚焦状态时，通过 before-input-event 处理：
+  //     - macOS 剪贴板与撤销快捷键（Menu.setApplicationMenu(null) 导致 AppKit 默认菜单不可用，这里无感桥接）
+  //     - ⌘/Ctrl + R（聚焦刷新）与 ⌘/Ctrl + Q（聚焦退出）：不再注册为全局快捷键，杜绝在浏览器/IDE 中按 ⌘R/⌘Q 时误刷新或误退出 GlassPad
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown' || input.alt) return;
+    const isMod = process.platform === 'darwin'
+      ? (input.meta && !input.control)
+      : (input.control && !input.meta);
+    if (!isMod) return;
+    const k = String(input.key || '').toLowerCase();
+    if (process.platform === 'darwin') {
       if (k === 'c' && !input.shift) {
         event.preventDefault();
         mainWindow.webContents.copy();
-      } else if (k === 'v' && !input.shift) {
+        return;
+      }
+      if (k === 'v' && !input.shift) {
         event.preventDefault();
         mainWindow.webContents.paste();
-      } else if (k === 'x' && !input.shift) {
+        return;
+      }
+      if (k === 'x' && !input.shift) {
         event.preventDefault();
         mainWindow.webContents.cut();
-      } else if (k === 'a' && !input.shift) {
+        return;
+      }
+      if (k === 'a' && !input.shift) {
         event.preventDefault();
         mainWindow.webContents.selectAll();
-      } else if (k === 'z' && !input.shift) {
+        return;
+      }
+      if (k === 'z' && !input.shift) {
         event.preventDefault();
         mainWindow.webContents.undo();
-      } else if (k === 'z' && input.shift) {
+        return;
+      }
+      if (k === 'z' && input.shift) {
         event.preventDefault();
         mainWindow.webContents.redo();
+        return;
       }
-    });
-  }
+    }
+    if (k === 'r' && !input.shift) {
+      event.preventDefault();
+      enforceStealthProtection(mainWindow);
+      mainWindow.webContents.reload();
+      return;
+    }
+    if (k === 'q' && !input.shift) {
+      event.preventDefault();
+      app.quit();
+    }
+  });
+
+  // 2c. 自动记住窗口拖动位置与缩放大小，下次打开直接原位恢复
+  mainWindow.on('move', scheduleSaveWindowBounds);
+  mainWindow.on('resize', scheduleSaveWindowBounds);
 
   // 3. 在所有可能触发 DWM / WindowServer 刷新窗口属性的生命周期事件上同步重申防截屏保护
   const stealthEvents = [
@@ -358,8 +458,22 @@ ipcMain.handle('GET_FROST_SUPPORT', () => ({
   supportsFrostedGlass,
 }));
 
-// 主进程读取剪贴板（兼容 Electron 20+ 默认开启的 sandbox 渲染进程）
+// 主进程读写剪贴板（兼容 Electron 20+ 默认开启的 sandbox 渲染进程）
 ipcMain.handle('READ_CLIPBOARD_TEXT', () => clipboard.readText());
+ipcMain.handle('WRITE_CLIPBOARD_TEXT', (_e, text) => {
+  try {
+    clipboard.writeText(String(text ?? ''));
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err?.message || 'write clipboard failed' };
+  }
+});
+
+// 鼠标穿透模式查询与切换（允许窗口半透明悬浮可读的同时，点击/滚轮直穿底层 IDE/浏览器）
+ipcMain.handle('GET_CLICK_THROUGH', () => ({ enabled: isClickThrough }));
+ipcMain.handle('SET_CLICK_THROUGH', (_e, enabled) => ({
+  enabled: setClickThroughState(Boolean(enabled)),
+}));
 
 // 媒体权限检测（macOS 需检测屏幕录制与麦克风权限，Windows 直接返回 granted）
 ipcMain.handle('GET_MEDIA_PERMISSION_STATUS', () => {
@@ -996,7 +1110,7 @@ ipcMain.on('SET_FROSTED_GLASS', (_e, enabled) => {
 });
 
 function registerShortcuts() {
-  // 1. ⌘ + B : 零 Surface 重建的隐身切换（用 setOpacity(0) + 鼠标穿透代替 hide()/showInactive()，
+  // 1. ⌘/Ctrl + B : 零 Surface 重建的隐身切换（用 setOpacity(0) + 鼠标穿透代替 hide()/showInactive()，
   //    避免窗口重新 show 时 DWM / WindowServer 合成第 1 帧早于 setContentProtection 导致单帧闪现，且不触发焦点变化）
   globalShortcut.register('CommandOrControl+B', () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -1012,12 +1126,20 @@ function registerShortcuts() {
         mainWindow.showInactive();
       }
       mainWindow.setOpacity(1);
-      mainWindow.setIgnoreMouseEvents(false);
+      // 恢复可见时保留用户之前的鼠标穿透锁定态（未锁定则恢复正常交互）
+      mainWindow.setIgnoreMouseEvents(isClickThrough, isClickThrough ? { forward: true } : undefined);
     }
     enforceStealthProtection(mainWindow);
   });
 
-  // 2. ⌘/Ctrl + ↑ ↓ ← → : 无鼠移动窗口位置
+  // 2. ⌘/Ctrl + Shift + L : 切换「鼠标穿透锁定」（文字继续可见，鼠标点击和滚轮直穿底层 IDE/网页；再按一次解锁）
+  globalShortcut.register('CommandOrControl+Shift+L', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    setClickThroughState(!isClickThrough);
+  });
+
+  // 3. ⌘/Ctrl + Shift + ↑ ↓ ← → : 无鼠移动窗口位置
+  //    加上 Shift 后不再劫持程序员在 IDE/编辑器里高频使用的 ⌘← / ⌘→（跳行首/行尾）与 ⌘↑ / ⌘↓（跳文件头/尾）
   const moveDirections = {
     Up: [0, -MOVE_STEP],
     Down: [0, MOVE_STEP],
@@ -1025,7 +1147,7 @@ function registerShortcuts() {
     Right: [MOVE_STEP, 0],
   };
   Object.entries(moveDirections).forEach(([dir, [dx, dy]]) => {
-    globalShortcut.register(`CommandOrControl+${dir}`, () => {
+    globalShortcut.register(`CommandOrControl+Shift+${dir}`, () => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
       enforceStealthProtection(mainWindow);
       const [x, y] = mainWindow.getPosition();
@@ -1034,15 +1156,8 @@ function registerShortcuts() {
     });
   });
 
-  // 3. ⌘ + R : 刷新窗口
-  globalShortcut.register('CommandOrControl+R', () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    enforceStealthProtection(mainWindow);
-    mainWindow.webContents.reload();
-  });
-
-  // 4. ⌘ + Q : 快速退出
-  globalShortcut.register('CommandOrControl+Q', () => app.quit());
+  // 4. ⌘/Ctrl + Shift + Q : 紧急全局退出（原 ⌘Q/⌘R 已改为仅 GlassPad 聚焦时生效，彻底避免在浏览器/IDE 中误刷断共享或误退软件）
+  globalShortcut.register('CommandOrControl+Shift+Q', () => app.quit());
 }
 
 // macOS 启动时自动清除当前 App Bundle 与 /Applications/GlassPad.app 的 com.apple.quarantine 隔离属性
